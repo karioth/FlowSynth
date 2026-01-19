@@ -11,7 +11,7 @@ from audiotools import AudioSignal
 
 
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
-DEFAULT_WEIGHTS_REL_PATH = os.path.join("pretrained_models", "dacvae_watermarked.pth")
+DEFAULT_WEIGHTS = "facebook/dacvae-watermarked"
 
 
 class AudioFileDataset(Dataset):
@@ -22,14 +22,32 @@ class AudioFileDataset(Dataset):
             raise RuntimeError(f"No audio files found under: {self.root}")
 
     @staticmethod
+    def _fast_scandir(root, exts):
+        exts = {e if e.startswith(".") else f".{e}" for e in exts}
+        subdirs, files = [], []
+        try:
+            for entry in os.scandir(root):
+                try:
+                    if entry.is_dir():
+                        subdirs.append(entry.path)
+                    elif entry.is_file():
+                        name = entry.name
+                        if not name.startswith(".") and Path(name).suffix.lower() in exts:
+                            files.append(entry.path)
+                except:
+                    pass
+        except:
+            pass
+        for d in list(subdirs):
+            sd, f = AudioFileDataset._fast_scandir(d, exts)
+            subdirs.extend(sd)
+            files.extend(f)
+        return subdirs, files
+
+    @staticmethod
     def _list_audio_files(root: Path):
-        files = []
-        for dirpath, _, filenames in os.walk(root):
-            for name in filenames:
-                if name.startswith("."):
-                    continue
-                if Path(name).suffix.lower() in AUDIO_EXTS:
-                    files.append(Path(dirpath) / name)
+        _, files = AudioFileDataset._fast_scandir(str(root), AUDIO_EXTS)
+        files = [Path(p) for p in files]
         files.sort()
         return files
 
@@ -63,7 +81,7 @@ def get_args_parser():
     parser.add_argument("--cached_path", default=None, type=str,
                         help="Output path for cached latents (default: data_dir + '_cached').")
     parser.add_argument("--weights", default=None, type=str,
-                        help="Path to DACVAE weights (defaults to pretrained_models/dacvae_watermarked.pth).")
+                        help="Path or HF id for DACVAE weights (default: facebook/dacvae-watermarked).")
     parser.add_argument("--device", default="cuda", type=str,
                         help="Device to use for caching.")
     parser.add_argument("--batch_size", default=1, type=int,
@@ -89,8 +107,7 @@ def get_args_parser():
 def resolve_weights_path(args):
     if args.weights:
         return args.weights
-    default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_WEIGHTS_REL_PATH)
-    return default_path
+    return DEFAULT_WEIGHTS
 
 
 def _configure_determinism(device: str):
@@ -115,9 +132,13 @@ def main(args):
     cached_path = os.path.normpath(args.cached_path or f"{data_dir}_cached")
     os.makedirs(cached_path, exist_ok=True)
 
-    weights_path = resolve_weights_path(args)
-    if not os.path.exists(weights_path):
-        raise FileNotFoundError(f"Missing weights: {weights_path}")
+    weights_ref = resolve_weights_path(args)
+    if os.path.exists(weights_ref):
+        weights_path = weights_ref
+    elif weights_ref.startswith("facebook/"):
+        weights_path = weights_ref
+    else:
+        raise FileNotFoundError(f"Missing weights: {weights_ref}")
 
     from src.audio_utils import encode_audio_latents
     import dacvae
@@ -162,7 +183,7 @@ def main(args):
                 continue
 
             audio = AudioSignal(wav.unsqueeze(0), sr)
-            posterior_params, _ = encode_audio_latents(
+            posterior_params, metadata = encode_audio_latents(
                 model,
                 audio,
                 chunked=True,
@@ -170,10 +191,15 @@ def main(args):
                 overlap_latents=args.overlap_latents,
             )
             tensor = posterior_params[0].to(torch.float32).cpu()
+            latent_length = int(metadata.get("latent_length", tensor.shape[-1]))
+            payload = {
+                "posterior_params": tensor,
+                "latent_length": latent_length,
+            }
 
             os.makedirs(out_path.parent, exist_ok=True)
             tmp = str(out_path) + ".tmp"
-            torch.save(tensor, tmp)
+            torch.save(payload, tmp)
             os.replace(tmp, out_path)
 
         if device.startswith("cuda"):
