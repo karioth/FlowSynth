@@ -6,7 +6,7 @@ import torchaudio
 import dacvae
 
 
-IN_PATH = "/share/users/student/f/friverossego/jamendo_cached/1000306.pt"
+IN_PATH = "/share/users/student/f/friverossego/jamendo_cached/131470.pt"
 OUT_DIR = "/share/users/student/f/friverossego/LatentLM/smoketest"
 
 
