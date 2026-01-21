@@ -174,10 +174,6 @@ def main(args):
                 moments_flip=moments_flip[i].cpu().numpy(),
             )
 
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
-
-
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     if rank == 0:

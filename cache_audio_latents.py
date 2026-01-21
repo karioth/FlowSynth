@@ -1,9 +1,12 @@
 import argparse
+import io
 import os
 from pathlib import Path
 
+import soundfile as sf
 import torch
 import torchaudio
+from datasets import load_dataset, Audio
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
@@ -61,6 +64,43 @@ class AudioFileDataset(Dataset):
         return str(path), wav, int(sr)
 
 
+class HFParquetAudioDataset(Dataset):
+    """
+    Loads decoded waveforms from HF parquet shards (no MP3 extraction).
+    Returns (uid, wav[C,T], sr) - same format as AudioFileDataset.
+    """
+    def __init__(self, hf_name: str, split: str = "train", data_dir: str = "data", cache_dir: str | None = None):
+        self.ds = load_dataset(hf_name, data_dir=data_dir, split=split, cache_dir=cache_dir)
+        # CRITICAL: Disable automatic decoding to avoid torchcodec
+        self.ds = self.ds.cast_column("audio", Audio(decode=False))
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        ex = self.ds[idx]
+        a = ex["audio"]  # dict with "bytes" and "path"
+
+        # Decode MP3 bytes with soundfile (not torchcodec)
+        arr, sr = sf.read(io.BytesIO(a["bytes"]))  # arr is (T, C) numpy array
+
+        # Convert to torch tensor [C, T] to match torchaudio.load() format
+        x = torch.from_numpy(arr).to(torch.float32)
+
+        # soundfile returns (T,) for mono, (T, C) for stereo
+        # Convert to [C, T] to match AudioFileDataset format
+        if x.ndim == 1:
+            x = x.unsqueeze(0)  # (T,) -> (1, T)
+        elif x.ndim == 2:
+            x = x.transpose(0, 1)  # (T, C) -> (C, T)
+
+        x = x.clamp_(-1, 1)
+        uid = a.get("path", f"{idx:09d}")
+
+        # Return same format as AudioFileDataset: (str, tensor[C,T], int)
+        return str(uid), x, int(sr)
+
+
 def init_distributed_mode(device: str):
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
@@ -78,6 +118,14 @@ def get_args_parser():
     parser = argparse.ArgumentParser("Cache DACVAE audio latents", add_help=True)
     parser.add_argument("--data_dir", required=True, type=str,
                         help="Root directory to scan for audio files.")
+    parser.add_argument("--hf_dataset", default=None, type=str,
+                        help="If set, load audio from this HF dataset id instead of scanning --data_dir.")
+    parser.add_argument("--hf_split", default="train", type=str,
+                        help="HF dataset split to use (default: train).")
+    parser.add_argument("--hf_data_dir", default="data", type=str,
+                        help="Subdir inside the HF dataset repo that contains parquet shards (JamendoMaxCaps uses 'data').")
+    parser.add_argument("--hf_cache_dir", default=None, type=str,
+                        help="Cache directory for HF datasets.")
     parser.add_argument("--cached_path", default=None, type=str,
                         help="Output path for cached latents (default: data_dir + '_cached').")
     parser.add_argument("--weights", default=None, type=str,
@@ -145,9 +193,18 @@ def main(args):
 
     model = dacvae.DACVAE.load(weights_path).eval().to(device)
 
-    dataset = AudioFileDataset(data_dir)
-    if rank == 0:
-        print(f"Found {len(dataset)} files. Cache output: {cached_path}")
+    if args.hf_dataset:
+        dataset = HFParquetAudioDataset(
+            args.hf_dataset, split=args.hf_split, data_dir=args.hf_data_dir, cache_dir=args.hf_cache_dir
+        )
+        input_root = None
+        if rank == 0:
+            print(f"HF dataset: {args.hf_dataset} ({args.hf_split}), n={len(dataset)}. Cache output: {cached_path}")
+    else:
+        dataset = AudioFileDataset(data_dir)
+        input_root = Path(data_dir).resolve()
+        if rank == 0:
+            print(f"Found {len(dataset)} files. Cache output: {cached_path}")
 
     sampler = None
     if distributed:
@@ -171,14 +228,20 @@ def main(args):
     if use_tqdm:
         data_iter = tqdm(loader, total=len(loader), desc="Caching", unit="batch")
 
-    input_root = Path(data_dir).resolve()
     out_root = Path(cached_path).resolve()
 
     for batch in data_iter:
         for path_str, wav, sr in batch:
-            path = Path(path_str).resolve()
-            rel = path.relative_to(input_root)
-            out_path = (out_root / rel).with_suffix(".pt")
+            if input_root is None:
+                # HF dataset: flat structure for easy training access
+                stem = Path(path_str).stem
+                out_path = out_root / f"{stem}.pt"
+            else:
+                # Local files: preserve directory structure
+                path = Path(path_str).resolve()
+                rel = path.relative_to(input_root)
+                out_path = (out_root / rel).with_suffix(".pt")
+
             if out_path.exists():
                 continue
 
@@ -201,10 +264,6 @@ def main(args):
             tmp = str(out_path) + ".tmp"
             torch.save(payload, tmp)
             os.replace(tmp, out_path)
-
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
-
 
 if __name__ == "__main__":
     args = get_args_parser().parse_args()
