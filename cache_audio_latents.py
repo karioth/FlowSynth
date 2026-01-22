@@ -82,7 +82,13 @@ class HFParquetAudioDataset(Dataset):
         a = ex["audio"]  # dict with "bytes" and "path"
 
         # Decode MP3 bytes with soundfile (not torchcodec)
-        arr, sr = sf.read(io.BytesIO(a["bytes"]))  # arr is (T, C) numpy array
+        try:
+            arr, sr = sf.read(io.BytesIO(a["bytes"]))  # arr is (T, C) numpy array
+        except Exception as e:
+            uid = a.get("path", f"{idx:09d}")
+            print(f"[WARNING] Skipping corrupted audio {uid}: {e}")
+            # Return next valid item (wrap around if needed)
+            return self.__getitem__((idx + 1) % len(self))
 
         # Convert to torch tensor [C, T] to match torchaudio.load() format
         x = torch.from_numpy(arr).to(torch.float32)
@@ -206,6 +212,8 @@ def main(args):
         if rank == 0:
             print(f"Found {len(dataset)} files. Cache output: {cached_path}")
 
+    out_root = Path(cached_path).resolve()
+
     sampler = None
     if distributed:
         sampler = DistributedSampler(
@@ -227,8 +235,6 @@ def main(args):
     data_iter = loader
     if use_tqdm:
         data_iter = tqdm(loader, total=len(loader), desc="Caching", unit="batch")
-
-    out_root = Path(cached_path).resolve()
 
     for batch in data_iter:
         for path_str, wav, sr in batch:
