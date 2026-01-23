@@ -103,6 +103,14 @@ class HFParquetAudioDataset(Dataset):
         x = x.clamp_(-1, 1)
         uid = a.get("path", f"{idx:09d}")
 
+        # Skip audio shorter than 10 seconds
+        MIN_DURATION_SECONDS = 10
+        min_samples = MIN_DURATION_SECONDS * sr
+        if x.shape[-1] < min_samples:
+            duration = x.shape[-1] / sr
+            print(f"[WARNING] Skipping too-short audio {uid}: {duration:.2f}s (< {MIN_DURATION_SECONDS}s)")
+            return self.__getitem__((idx + 1) % len(self))
+
         # Return same format as AudioFileDataset: (str, tensor[C,T], int)
         return str(uid), x, int(sr)
 
@@ -199,6 +207,8 @@ def main(args):
 
     model = dacvae.DACVAE.load(weights_path).eval().to(device)
 
+    out_root = Path(cached_path).resolve()
+
     if args.hf_dataset:
         dataset = HFParquetAudioDataset(
             args.hf_dataset, split=args.hf_split, data_dir=args.hf_data_dir, cache_dir=args.hf_cache_dir
@@ -211,8 +221,6 @@ def main(args):
         input_root = Path(data_dir).resolve()
         if rank == 0:
             print(f"Found {len(dataset)} files. Cache output: {cached_path}")
-
-    out_root = Path(cached_path).resolve()
 
     sampler = None
     if distributed:
