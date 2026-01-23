@@ -488,3 +488,82 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
             sample[:, valid_s:valid_e, ...] = x_slice
 
         return sample
+
+
+class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
+    """
+    Scheduler for MaskedARTransformer.
+
+    Handles mask creation and computes loss only at masked positions.
+    Similar to FlowMatchingSchedulerTransformer but with masking.
+    """
+
+    def __init__(
+        self,
+        *args,
+        mask_prob_min: float = 0.3,
+        mask_prob_max: float = 0.7,
+        batch_mul: int = 1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.mask_prob_min = mask_prob_min
+        self.mask_prob_max = mask_prob_max
+        self.batch_mul = batch_mul
+
+    def get_losses(self, model, x0_seq, labels) -> torch.Tensor:
+        bsz, seq_len, latent_size = x0_seq.shape
+        total_tokens = bsz * seq_len
+
+        # 1. Sample mask ratio, compute num_masked across entire batch
+        p = (
+            torch.rand(1, device=x0_seq.device, dtype=x0_seq.dtype)
+            * (self.mask_prob_max - self.mask_prob_min)
+            + self.mask_prob_min
+        )
+        num_masked = max(1, round(p.item() * total_tokens))
+
+        # 2. Select num_masked random positions from flattened B*L
+        rand_scores = torch.rand(total_tokens, device=x0_seq.device)
+        flat_mask_indices = rand_scores.argsort()[:num_masked]  # (num_masked,)
+
+        # 3. Create boolean mask for backbone (reshape to B, L)
+        mask_flat = torch.zeros(total_tokens, dtype=torch.bool, device=x0_seq.device)
+        mask_flat[flat_mask_indices] = True
+        mask = mask_flat.view(bsz, seq_len)  # (B, L)
+
+        # 4. Gather x0 at masked positions only
+        x0_flat = x0_seq.reshape(total_tokens, latent_size)  # (B*L, C)
+        x0_masked = x0_flat[flat_mask_indices]  # (num_masked, C)
+
+        # 5. Create noise and timesteps only for num_masked * batch_mul
+        noise = torch.randn(
+            num_masked * self.batch_mul,
+            latent_size,
+            device=x0_seq.device,
+            dtype=x0_seq.dtype,
+        )
+        timesteps = self.sample_timesteps(
+            num_masked * self.batch_mul,
+            device=x0_seq.device,
+            dtype=x0_seq.dtype,
+        )
+
+        # 6. Create noisy tokens and velocity targets
+        x0_rep = x0_masked.repeat_interleave(self.batch_mul, dim=0)  # (num_masked * batch_mul, C)
+        x_noisy = self.add_noise(x0_rep, noise, timesteps)
+        velocity = self.get_velocity(x0_rep, noise, timesteps)
+
+        # 7. Forward pass - model returns (num_masked * batch_mul, C)
+        model_output = model(
+            x_noisy,
+            timesteps,
+            x_start=x0_seq,
+            labels=labels,
+            mask=mask,
+            flat_mask_indices=flat_mask_indices,
+            batch_mul=self.batch_mul,
+        )
+
+        # 8. Loss on all outputs (all are masked positions)
+        return F.mse_loss(model_output.float(), velocity.float())

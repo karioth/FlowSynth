@@ -4,11 +4,12 @@ import lightning as L
 
 from diffusers.optimization import get_scheduler
 
-from .models import All_models, DiT, Transformer, AR_DiT
+from .models import All_models, DiT, Transformer, AR_DiT, MaskedARTransformer
 from .flow_matching import (
     FlowMatchingSchedulerDiT,
     FlowMatchingSchedulerTransformer,
     FlowMatchingSchedulerARDiff,
+    FlowMatchingSchedulerMaskedAR,
 )
 from .models.modules.vae import DiagonalGaussianDistribution
 from .utils import image_to_sequence
@@ -25,6 +26,8 @@ class LitModule(L.LightningModule):
         t_m: float = 0.0,
         t_s: float = 1.0,
         batch_mul: int = 4,
+        mask_prob_min: float = 0.5,
+        mask_prob_max: float = 0.5,
         lr: float = 1e-4,
         weight_decay: float = 0.01,
         lr_scheduler: str = "cosine",
@@ -58,6 +61,15 @@ class LitModule(L.LightningModule):
                 prediction_type=prediction_type,
                 t_m=t_m,
                 t_s=t_s,
+            )
+        elif isinstance(self.model, MaskedARTransformer):
+            self.noise_scheduler = FlowMatchingSchedulerMaskedAR(
+                prediction_type=prediction_type,
+                t_m=t_m,
+                t_s=t_s,
+                mask_prob_min=mask_prob_min,
+                mask_prob_max=mask_prob_max,
+                batch_mul=batch_mul,
             )
         else:
             raise NotImplementedError("Unsupported model type.")
