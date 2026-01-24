@@ -38,19 +38,41 @@ class AudioSetDataset(Dataset):
 
     def __getitem__(self, idx):
         """Returns (uid, wav, sr, caption) or None if sample should be skipped."""
-        ex = self.ds[idx]
+        try:
+            ex = self.ds[idx]
+        except Exception as e:
+            print(f"[WARNING] Failed to load example {idx}: {e}")
+            return None
 
         # Get audio bytes
-        audio_data = ex["mp3"]  # dict with "bytes" and "path"
-        uid = ex.get("__key__", audio_data.get("path", f"{idx:09d}"))
+        audio_data = ex.get("mp3")  # dict with "bytes" and "path"
+        uid = ex.get("__key__", f"{idx:09d}")
+        if not isinstance(audio_data, dict):
+            print(f"[WARNING] Missing mp3 for {uid}, skipping")
+            return None
+        if audio_data.get("path"):
+            uid = audio_data.get("path", uid)
         uid = Path(uid).stem  # Remove any extension
 
         # Decode MP3 bytes with soundfile
-        try:
-            arr, sr = sf.read(io.BytesIO(audio_data["bytes"]))
-        except Exception as e:
-            print(f"[WARNING] Skipping corrupted audio {uid}: {e}")
-            return None
+        audio_bytes = audio_data.get("bytes")
+        if audio_bytes is None:
+            path = audio_data.get("path")
+            if path and os.path.isfile(path):
+                try:
+                    arr, sr = sf.read(path)
+                except Exception as e:
+                    print(f"[WARNING] Skipping unreadable audio {uid}: {e}")
+                    return None
+            else:
+                print(f"[WARNING] Missing audio bytes for {uid}, skipping")
+                return None
+        else:
+            try:
+                arr, sr = sf.read(io.BytesIO(audio_bytes))
+            except Exception as e:
+                print(f"[WARNING] Skipping corrupted audio {uid}: {e}")
+                return None
 
         # Convert to torch tensor [C, T]
         x = torch.from_numpy(arr).to(torch.float32)
@@ -69,10 +91,23 @@ class AudioSetDataset(Dataset):
 
         # Extract caption from JSON metadata
         json_data = ex.get("json", {})
+        if isinstance(json_data, (bytes, bytearray)):
+            try:
+                json_data = json.loads(json_data.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                json_data = {}
+        elif isinstance(json_data, str):
+            try:
+                json_data = json.loads(json_data)
+            except json.JSONDecodeError:
+                json_data = {}
+        elif not isinstance(json_data, dict):
+            json_data = {}
         caption = json_data.get("comprehensive_caption", "")
         if not caption:
             # Fallback to other caption fields
             caption = json_data.get("caption", "")
+            print(f"[WARNING] falling to simpler caption found for {uid}")
         if not caption:
             print(f"[WARNING] No caption found for {uid}, skipping")
             return None
