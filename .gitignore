@@ -20,7 +20,7 @@ results*/
 samples*/
 pretrained_models/
 visuals*/
-
+smoke*/
 # Docs
 *.md
 !README.md
