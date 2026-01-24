@@ -285,7 +285,7 @@ class MaskedARTransformer(nn.Module):
         for block in self.blocks:
             hidden_states = block(hidden_states, inference_params=inference_params)
 
-        return hidden_states[:, -1:]
+        return hidden_states#[:, -1:]
 
     def forward_diffusion(
         self,
