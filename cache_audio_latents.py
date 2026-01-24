@@ -64,10 +64,13 @@ class AudioFileDataset(Dataset):
         return str(path), wav, int(sr)
 
 
+MIN_DURATION_SECONDS = 10
+
+
 class HFParquetAudioDataset(Dataset):
     """
     Loads decoded waveforms from HF parquet shards (no MP3 extraction).
-    Returns (uid, wav[C,T], sr) - same format as AudioFileDataset.
+    Returns (uid, wav[C,T], sr) - same format as AudioFileDataset, or None for skipped samples.
     """
     def __init__(self, hf_name: str, split: str = "train", data_dir: str = "data", cache_dir: str | None = None):
         self.ds = load_dataset(hf_name, data_dir=data_dir, split=split, cache_dir=cache_dir)
@@ -78,17 +81,17 @@ class HFParquetAudioDataset(Dataset):
         return len(self.ds)
 
     def __getitem__(self, idx):
+        """Returns (uid, wav, sr) or None if sample should be skipped."""
         ex = self.ds[idx]
         a = ex["audio"]  # dict with "bytes" and "path"
+        uid = a.get("path", f"{idx:09d}")
 
         # Decode MP3 bytes with soundfile (not torchcodec)
         try:
             arr, sr = sf.read(io.BytesIO(a["bytes"]))  # arr is (T, C) numpy array
         except Exception as e:
-            uid = a.get("path", f"{idx:09d}")
             print(f"[WARNING] Skipping corrupted audio {uid}: {e}")
-            # Return next valid item (wrap around if needed)
-            return self.__getitem__((idx + 1) % len(self))
+            return None
 
         # Convert to torch tensor [C, T] to match torchaudio.load() format
         x = torch.from_numpy(arr).to(torch.float32)
@@ -101,15 +104,13 @@ class HFParquetAudioDataset(Dataset):
             x = x.transpose(0, 1)  # (T, C) -> (C, T)
 
         x = x.clamp_(-1, 1)
-        uid = a.get("path", f"{idx:09d}")
 
-        # Skip audio shorter than 10 seconds
-        MIN_DURATION_SECONDS = 10
+        # Skip audio shorter than minimum duration
         min_samples = MIN_DURATION_SECONDS * sr
         if x.shape[-1] < min_samples:
             duration = x.shape[-1] / sr
             print(f"[WARNING] Skipping too-short audio {uid}: {duration:.2f}s (< {MIN_DURATION_SECONDS}s)")
-            return self.__getitem__((idx + 1) % len(self))
+            return None
 
         # Return same format as AudioFileDataset: (str, tensor[C,T], int)
         return str(uid), x, int(sr)
@@ -245,7 +246,10 @@ def main(args):
         data_iter = tqdm(loader, total=len(loader), desc="Caching", unit="batch")
 
     for batch in data_iter:
-        for path_str, wav, sr in batch:
+        for item in batch:
+            if item is None:
+                continue
+            path_str, wav, sr = item
             if input_root is None:
                 # HF dataset: flat structure for easy training access
                 stem = Path(path_str).stem
