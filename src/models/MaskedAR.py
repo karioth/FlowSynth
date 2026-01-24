@@ -255,6 +255,7 @@ class MaskedARTransformer(nn.Module):
         hidden_states: torch.Tensor | None,
         start_pos: int = 0,
         inference_params: InferenceParams | None = None,
+        append_mask: bool = False,
     ) -> torch.Tensor:
         """
         Recurrent forward for inference with KV caching.
@@ -263,6 +264,7 @@ class MaskedARTransformer(nn.Module):
             hidden_states: Either labels (at start_pos=0), predicted tokens, or None to use mask_token
             start_pos: Current position in sequence
             inference_params: KV cache container
+            append_mask: If True, append a [MASK] token to query the next position in the same pass
         """
         start_pos = int(start_pos)
         if start_pos == 0:
@@ -279,13 +281,19 @@ class MaskedARTransformer(nn.Module):
                 hidden_states = hidden_states.unsqueeze(1)
             hidden_states = self.input_embedder(hidden_states)
 
+        if append_mask:
+            # Append [MASK] in hidden space to get the next-position readout in one pass.
+            batch_size = hidden_states.shape[0]
+            mask_token = self.mask_token.expand(batch_size, 1, -1)
+            hidden_states = torch.cat((hidden_states, mask_token), dim=1)
+
         if inference_params is not None:
             inference_params.seqlen_offset = start_pos
 
         for block in self.blocks:
             hidden_states = block(hidden_states, inference_params=inference_params)
 
-        return hidden_states#[:, -1:]
+        return hidden_states
 
     def forward_diffusion(
         self,
@@ -318,9 +326,14 @@ class MaskedARTransformer(nn.Module):
         AR sampling with classifier-free guidance.
 
         For each position:
-        1. Pass [MASK] through backbone to get conditioning
-        2. Denoise via diffusion head
-        3. Cache the predicted token for next iteration
+          1) Pass [MASK] through backbone to get conditioning.
+          2) Denoise via diffusion head.
+          3) Cache the predicted token for the next iteration.
+
+        TODO: Currently, code writes the mask into KV at `i+1` and overwrites it on the next step.
+        To avoid that extra cache write, add a only cache first token passed in
+        `Attention._update_kv_cache` (e.g., a `cache_write_len` or boolean mask) so only
+        the generated token updates KV while the MASK tokens are only used for queries.
         """
         batch_size = labels.shape[0]
         inference_params = InferenceParams(max_seqlen=self.seq_len + 1, max_batch_size=batch_size)
@@ -337,28 +350,21 @@ class MaskedARTransformer(nn.Module):
             )
 
             if i == 0:
-                # First iteration: pass labels (already [real, null] from caller)
-                conditioning = self.forward_recurrent(
-                    labels,
-                    start_pos=0,
-                    inference_params=inference_params,
-                )
+                # First iteration: pass labels (already [real, null] from caller).
+                recurrent_input = labels
             else:
-                # Cache the previous predicted token
-                prev_token_cfg = torch.cat([prev_token, prev_token], dim=0)
-                _ = self.forward_recurrent(
-                    prev_token_cfg,
-                    start_pos=i,
-                    inference_params=inference_params,
-                )
+                # Cache the previous predicted token (CFG: duplicate batch).
+                recurrent_input = torch.cat([prev_token, prev_token], dim=0)
 
-            # Query with [MASK] to get conditioning for current position
-            # Pass None to use learned mask_token (matches training)
+            # Single pass: write token_i to KV and append [MASK] at i+1; the mask KV
+            # is overwritten by the generated token on the next step.
             conditioning = self.forward_recurrent(
-                None,
-                start_pos=i + 1,
+                recurrent_input,
+                start_pos=i,
                 inference_params=inference_params,
+                append_mask=True,
             )
+            conditioning = conditioning[:, -1:]  # Mask position readout.
 
             # Denoise
             prev_token = sample_func(
