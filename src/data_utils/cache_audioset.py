@@ -206,7 +206,7 @@ def main(args):
     if rank == 0:
         print(f"Loading DACVAE model: {dacvae_weights}")
 
-    from src.audio_utils import encode_audio_latents
+    from src.data_utils.audio_utils import encode_audio_latents
     import dacvae
 
     dacvae_model = dacvae.DACVAE.load(dacvae_weights).eval().to(device)

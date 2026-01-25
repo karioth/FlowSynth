@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import sys
 import random
 
 import torch
@@ -67,8 +66,7 @@ def main() -> None:
                         help="Optional path to caption .json sidecar")
     args = parser.parse_args()
 
-    sys.path.insert(0, "/share/users/student/f/friverossego/LatentLM/src")
-    from audio_utils import decode_audio_latents
+    from src.data_utils.audio_utils import decode_audio_latents
 
     os.makedirs(args.out_dir, exist_ok=True)
 

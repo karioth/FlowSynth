@@ -264,7 +264,7 @@ def main() -> None:
     parser.add_argument("audio_path", type=str, help="Path to an input audio file.")
     args = parser.parse_args()
 
-    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     weights_path = os.path.join(root, "pretrained_models", "dacvae_watermarked.pth")
     if not os.path.exists(weights_path):
         raise FileNotFoundError(f"Missing weights: {weights_path}")

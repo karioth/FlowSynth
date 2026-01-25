@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from torch.utils.data import DataLoader, DistributedSampler
 
-from src.utils import center_crop_arr, load_vae
+from src.data_utils.img_utils import center_crop_arr, load_vae
 
 DEFAULT_VAE_URL = "https://www.dropbox.com/scl/fi/hhmuvaiacrarfg28qxhwz/kl16.ckpt?rlkey=l44xipsezc8atcffdp4q7mwmh&dl=0"
 DEFAULT_VAE_REL_PATH = os.path.join("pretrained_models", "kl16.ckpt")
@@ -91,7 +91,8 @@ def download_vae(target_path):
 def resolve_vae_path(args):
     if args.vae:
         return args.vae
-    default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_VAE_REL_PATH)
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    default_path = os.path.join(root_dir, DEFAULT_VAE_REL_PATH)
     if os.path.exists(default_path):
         print(f"Using default VAE: {default_path}")
         return default_path

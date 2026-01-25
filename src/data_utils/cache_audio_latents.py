@@ -203,7 +203,7 @@ def main(args):
     else:
         raise FileNotFoundError(f"Missing weights: {weights_ref}")
 
-    from src.audio_utils import encode_audio_latents
+    from src.data_utils.audio_utils import encode_audio_latents
     import dacvae
 
     model = dacvae.DACVAE.load(weights_path).eval().to(device)

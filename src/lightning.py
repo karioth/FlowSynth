@@ -1,6 +1,8 @@
 import torch
 import torch.distributed as dist
 import lightning as L
+from lightning.pytorch.callbacks import WeightAveraging
+from torch.optim.swa_utils import get_ema_avg_fn
 
 from diffusers.optimization import get_scheduler
 
@@ -12,7 +14,7 @@ from .flow_matching import (
     FlowMatchingSchedulerMaskedAR,
 )
 from .models.modules.vae import DiagonalGaussianDistribution
-from .utils import image_to_sequence
+from .data_utils.img_utils import image_to_sequence
 
 
 class LitModule(L.LightningModule):
@@ -191,3 +193,14 @@ class LitModule(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
         }
+
+
+class EMAWeightAveraging(WeightAveraging):
+    """
+    Matches Lightning's stable-doc example (starts after 100 optimizer steps).
+    """
+    def __init__(self):
+        super().__init__(avg_fn=get_ema_avg_fn(decay=0.9999))
+
+    def should_update(self, step_idx=None, epoch_idx=None):
+        return (step_idx is not None) and (step_idx >= 100)

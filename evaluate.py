@@ -16,7 +16,7 @@ from src.metrics import (
     get_inception_model,
     mean_covar_numpy,
 )
-from src.utils import center_crop_arr, safe_blob_dump
+from src.data_utils.img_utils import center_crop_arr, safe_blob_dump
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 

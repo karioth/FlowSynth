@@ -3,9 +3,7 @@ import numpy as np
 import json
 import torch
 import os
-from lightning.pytorch.callbacks import WeightAveraging
-from torch.optim.swa_utils import get_ema_avg_fn
-from .models.modules.vae import AutoencoderKL
+from ..models.modules.vae import AutoencoderKL
 
 def center_crop_arr(pil_image, image_size):
     """
@@ -63,13 +61,3 @@ def sequence_to_image(x: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"seq_len must be a perfect square, got {seq_len}")
     return x.reshape(bsz, grid_size, grid_size, channels).permute(0, 3, 1, 2)
 
-
-class EMAWeightAveraging(WeightAveraging):
-    """
-    Matches Lightning's stable-doc example (starts after 100 optimizer steps).
-    """
-    def __init__(self):
-        super().__init__(avg_fn=get_ema_avg_fn(decay=0.9999))
-
-    def should_update(self, step_idx=None, epoch_idx=None):
-        return (step_idx is not None) and (step_idx >= 100)

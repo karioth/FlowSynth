@@ -8,9 +8,8 @@ from lightning.pytorch import seed_everything
 
 from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
 
-from src.lightning import LitModule
+from src.lightning import LitModule, EMAWeightAveraging
 from src.datamodule import CachedLatentsDataModule
-from src.utils import EMAWeightAveraging
 
 
 def main(args):
