@@ -9,7 +9,7 @@ from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
 
 from src.lightning import LitModule, EMAWeightAveraging
-from src.datamodule import CachedLatentsDataModule
+from src.data_utils.datamodule import CachedLatentsDataModule
 
 
 def main(args):
@@ -18,15 +18,17 @@ def main(args):
 
     seed_everything(args.global_seed, workers=True)
 
+    seq_len = args.input_size * args.input_size
     dm = CachedLatentsDataModule(
         data_path=args.data_path,
         batch_size=args.batch_size,
+        seq_len=seq_len,
         num_workers=args.num_workers,
     )
 
     lit = LitModule(
         model_name=args.model,
-        input_size=args.input_size,
+        seq_len=seq_len,
         latent_size=args.latent_size,
         num_classes=args.num_classes,
         prediction_type=args.prediction_type,

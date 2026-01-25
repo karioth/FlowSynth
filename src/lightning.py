@@ -13,15 +13,14 @@ from .flow_matching import (
     FlowMatchingSchedulerARDiff,
     FlowMatchingSchedulerMaskedAR,
 )
-from .models.modules.vae import DiagonalGaussianDistribution
-from .data_utils.img_utils import image_to_sequence
+from .models.modules.distributions import SequenceDiagonalGaussianDistribution
 
 
 class LitModule(L.LightningModule):
     def __init__(
         self,
         model_name: str = "Transformer-L",
-        input_size: int = 32,
+        seq_len: int = 1024,
         latent_size: int = 16,
         num_classes: int = 1000,
         prediction_type: str = "flow",
@@ -38,7 +37,6 @@ class LitModule(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        seq_len = input_size * input_size
         self.model = All_models[model_name](
             seq_len=seq_len,
             in_channels=latent_size,
@@ -82,16 +80,14 @@ class LitModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         moments, labels = batch
-        posterior = DiagonalGaussianDistribution(moments)
+        posterior = SequenceDiagonalGaussianDistribution(moments)
         x0 = posterior.sample()
 
         if not self.has_scaling.item():
             self._init_scaling(x0)
 
         x0 = self._normalize(x0)
-        x0_seq = image_to_sequence(x0)
-
-        loss = self.noise_scheduler.get_losses(self.model, x0_seq, labels)
+        loss = self.noise_scheduler.get_losses(self.model, x0, labels)
 
         self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         return loss

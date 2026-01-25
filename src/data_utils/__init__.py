@@ -1,3 +1,3 @@
-from .dataloaders import CachedImageFolder
+from .datamodule import CachedImageFolder, CachedLatentsDataModule
 
-__all__ = ["CachedImageFolder"]
+__all__ = ["CachedImageFolder", "CachedLatentsDataModule"]
