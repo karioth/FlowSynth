@@ -20,7 +20,8 @@ class LitModule(L.LightningModule):
     def __init__(
         self,
         model_name: str = "Transformer-L",
-        seq_len: int = 1024,
+        seq_len: int | None = None,
+        input_size: int | None = None,
         latent_size: int = 16,
         num_classes: int = 1000,
         prediction_type: str = "flow",
@@ -35,6 +36,11 @@ class LitModule(L.LightningModule):
         lr_warmup_steps: int = 1000,
     ):
         super().__init__()
+        if seq_len is None:
+            if input_size is None:
+                seq_len = 1024
+            else:
+                seq_len = input_size * input_size
         self.save_hyperparameters()
 
         self.model = All_models[model_name](
@@ -153,6 +159,14 @@ class LitModule(L.LightningModule):
         scheduler.set_timesteps(num_inference_steps, device=self.device)
         latents = self.model.sample_with_cfg(prompt, cfg_scale, scheduler)
         return self.unnormalize_latents(latents)
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        remapped = {}
+        for key, value in state_dict.items():
+            if "model.label_embedder." in key:
+                key = key.replace("model.label_embedder.", "model.prompt_embedder.")
+            remapped[key] = value
+        return super().load_state_dict(remapped, strict=strict)
 
     def configure_optimizers(self):
         decay, no_decay = [], []

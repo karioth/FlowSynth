@@ -96,7 +96,7 @@ class DiT(nn.Module):
 
         self.input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.time_embedder = TimestepEmbedder(hidden_size)
-        self.label_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
 
         self.blocks = nn.ModuleList(
             [
@@ -143,7 +143,7 @@ class DiT(nn.Module):
         del kwargs
         hidden_states = self.input_embedder(hidden_states)
         time_emb = self.time_embedder(timesteps)
-        label_emb = self.label_embedder(prompt, self.training)
+        label_emb = self.prompt_embedder(prompt, self.training)
         conditioning = (time_emb + label_emb).unsqueeze(1)
 
         for block in self.blocks:
@@ -157,7 +157,7 @@ class DiT(nn.Module):
         else:
             prompt = prompt.to(device=self.device, dtype=torch.long)
         # Build [cond, uncond] prompt batch for classifier-free guidance.
-        y_null = torch.full_like(prompt, self.label_embedder.num_classes, device=self.device)
+        y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
         prompt = torch.cat([prompt, y_null], dim=0)
 
         batch_size = prompt.shape[0]

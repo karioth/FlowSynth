@@ -137,7 +137,7 @@ class Transformer(nn.Module):
         self.input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.noisy_input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.time_embedder = TimestepEmbedder(hidden_size)
-        self.label_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
 
         self.blocks = nn.ModuleList(
             [
@@ -204,7 +204,7 @@ class Transformer(nn.Module):
 
     def forward_parallel(self, hidden_states: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
         hidden_states = self.input_embedder(hidden_states)
-        label_emb = self.label_embedder(prompt, self.training)
+        label_emb = self.prompt_embedder(prompt, self.training)
         hidden_states = torch.cat((label_emb.unsqueeze(1), hidden_states[:, :-1]), dim=1)
         for block in self.blocks:
             hidden_states = block(hidden_states)
@@ -219,7 +219,7 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         start_pos = int(start_pos)
         if start_pos == 0:
-            hidden_states = self.label_embedder(hidden_states, self.training).unsqueeze(1)
+            hidden_states = self.prompt_embedder(hidden_states, self.training).unsqueeze(1)
         else:
             hidden_states = self.input_embedder(hidden_states)
 
@@ -255,7 +255,7 @@ class Transformer(nn.Module):
         else:
             prompt = prompt.to(device=self.device, dtype=torch.long)
         # Build [cond, uncond] prompt batch for classifier-free guidance.
-        y_null = torch.full_like(prompt, self.label_embedder.num_classes, device=self.device)
+        y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
         prompt = torch.cat([prompt, y_null], dim=0)
 
         batch_size = prompt.shape[0]

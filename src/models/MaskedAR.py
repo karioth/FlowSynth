@@ -127,7 +127,7 @@ class MaskedARTransformer(nn.Module):
         self.input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.noisy_input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.time_embedder = TimestepEmbedder(hidden_size)
-        self.label_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
 
         # Learnable [MASK] token
         self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
@@ -240,7 +240,7 @@ class MaskedARTransformer(nn.Module):
         )
 
         # Prepend prompt embedding (no shift needed - same position readout)
-        label_emb = self.label_embedder(prompt, self.training)
+        label_emb = self.prompt_embedder(prompt, self.training)
         hidden_states = torch.cat((label_emb.unsqueeze(1), hidden_states), dim=1)
 
         for block in self.blocks:
@@ -269,7 +269,7 @@ class MaskedARTransformer(nn.Module):
         start_pos = int(start_pos)
         if start_pos == 0:
             # First position: embed the prompt
-            hidden_states = self.label_embedder(hidden_states, self.training).unsqueeze(1)
+            hidden_states = self.prompt_embedder(hidden_states, self.training).unsqueeze(1)
         elif hidden_states is None:
             # Query with mask token (matches training)
             batch_size = inference_params.max_batch_size
@@ -340,7 +340,7 @@ class MaskedARTransformer(nn.Module):
         else:
             prompt = prompt.to(device=self.device, dtype=torch.long)
         # Build [cond, uncond] prompt batch for classifier-free guidance.
-        y_null = torch.full_like(prompt, self.label_embedder.num_classes, device=self.device)
+        y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
         prompt = torch.cat([prompt, y_null], dim=0)
 
         batch_size = prompt.shape[0]

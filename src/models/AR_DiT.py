@@ -108,7 +108,7 @@ class AR_DiT(nn.Module):
 
         self.input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.time_embedder = TimestepEmbedder(hidden_size)
-        self.label_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         self.time_modulation = AdaLNzero(hidden_size=hidden_size, out_mult=6)
 
         self.blocks = nn.ModuleList(
@@ -163,7 +163,7 @@ class AR_DiT(nn.Module):
         assert timesteps.dim() == 2, "AR_DiT expects tokenwise timesteps with shape (B, T)"
 
         hidden_states = self.input_embedder(hidden_states)  # (B, T, D)
-        label_emb = self.label_embedder(prompt, self.training)   # (B, D)
+        label_emb = self.prompt_embedder(prompt, self.training)   # (B, D)
         timesteps = timesteps.contiguous()
         time_emb = self.time_embedder(timesteps.view(-1)).view(
             hidden_states.size(0),
@@ -203,7 +203,7 @@ class AR_DiT(nn.Module):
         else:
             prompt = prompt.to(device=self.device, dtype=torch.long)
         # Build [cond, uncond] prompt batch for classifier-free guidance.
-        y_null = torch.full_like(prompt, self.label_embedder.num_classes, device=self.device)
+        y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
         prompt = torch.cat([prompt, y_null], dim=0)
 
         batch_size = prompt.shape[0]
