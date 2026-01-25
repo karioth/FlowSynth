@@ -105,3 +105,56 @@ class LabelEmbedder(nn.Module):
             # CUDA autocast dtype (bf16/fp16 depending on your autocast context)
             embeddings = embeddings.to(torch.get_autocast_gpu_dtype())
         return embeddings
+
+
+class ContinuousEmbedder(nn.Module):
+    """
+    Projects continuous embeddings (e.g., CLAP) to model hidden size with CFG dropout.
+
+    During training, randomly replaces samples with a learnable null embedding
+    to enable classifier-free guidance at inference time.
+    """
+
+    def __init__(self, input_dim: int, hidden_size: int, dropout_prob: float = 0.1) -> None:
+        super().__init__()
+        self.proj = nn.Linear(input_dim, hidden_size, bias=False)
+        self.null_embedding = nn.Parameter(torch.zeros(hidden_size))
+        self.dropout_prob = dropout_prob
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.proj.weight, std=0.02)
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        train: bool,
+        force_drop_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            embeddings: [B, D] continuous embeddings (e.g., CLAP vectors)
+            train: whether in training mode
+            force_drop_ids: optional [B] tensor, 1 means force drop to null
+
+        Returns:
+            [B, hidden_size] projected embeddings
+        """
+        projected = self.proj(embeddings)
+
+        # CFG dropout: replace random samples with null embedding
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            if force_drop_ids is None:
+                drop_ids = torch.rand(embeddings.shape[0], device=embeddings.device) < self.dropout_prob
+            else:
+                drop_ids = force_drop_ids == 1
+            projected = torch.where(
+                drop_ids.unsqueeze(-1),
+                self.null_embedding.unsqueeze(0).expand(projected.shape[0], -1),
+                projected,
+            )
+
+        if torch.is_autocast_enabled():
+            projected = projected.to(torch.get_autocast_gpu_dtype())
+        return projected

@@ -24,6 +24,8 @@ class LitModule(L.LightningModule):
         input_size: int | None = None,
         latent_size: int = 16,
         num_classes: int = 1000,
+        conditioning_type: str = "class",
+        conditioning_dim: int | None = None,
         prediction_type: str = "flow",
         t_m: float = 0.0,
         t_s: float = 1.0,
@@ -47,6 +49,8 @@ class LitModule(L.LightningModule):
             seq_len=seq_len,
             in_channels=latent_size,
             num_classes=num_classes,
+            conditioning_type=conditioning_type,
+            conditioning_dim=conditioning_dim,
         )
 
         if isinstance(self.model, Transformer):

@@ -7,7 +7,7 @@ from flash_attn.utils.generation import InferenceParams
 from .modules.attention import Attention
 from .modules.norms import RMSNorm
 from .modules.adaln import AdaLNzero, modulate, gate, FinalLayer
-from .modules.embeddings import TimestepEmbedder, LabelEmbedder
+from .modules.embeddings import TimestepEmbedder, LabelEmbedder, ContinuousEmbedder
 from .modules.ffn import SwiGLU
 
 
@@ -115,6 +115,8 @@ class Transformer(nn.Module):
         diffusion_intermediate_size: int | None = None,
         class_dropout_prob: float = 0.1,
         num_classes: int = 1000,
+        conditioning_type: str = "class",
+        conditioning_dim: int | None = None,
         is_gated: bool = False,
         rope_theta: float = 10000.0,
         rope_interleaved: bool = False,
@@ -128,6 +130,7 @@ class Transformer(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.hidden_size = hidden_size
         self.seq_len = seq_len
+        self.conditioning_type = conditioning_type
 
         if intermediate_size is None:
             intermediate_size = int(hidden_size * 10 / 3 / 64) * 64
@@ -137,7 +140,14 @@ class Transformer(nn.Module):
         self.input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.noisy_input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.time_embedder = TimestepEmbedder(hidden_size)
-        self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+
+        if conditioning_type == "class":
+            self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        elif conditioning_type == "continuous":
+            assert conditioning_dim is not None, "conditioning_dim required for continuous conditioning"
+            self.prompt_embedder = ContinuousEmbedder(conditioning_dim, hidden_size, class_dropout_prob)
+        else:
+            raise ValueError(f"Unknown conditioning_type: {conditioning_type}")
 
         self.blocks = nn.ModuleList(
             [
@@ -202,9 +212,18 @@ class Transformer(nn.Module):
         conditioning = conditioning.repeat_interleave(batch_mul, dim=0)
         return self.forward_diffusion(hidden_states, timesteps, conditioning)
 
-    def forward_parallel(self, hidden_states: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
+    def forward_parallel(
+        self,
+        hidden_states: torch.Tensor,
+        prompt: torch.Tensor,
+        prompt_drop_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         hidden_states = self.input_embedder(hidden_states)
-        label_emb = self.prompt_embedder(prompt, self.training)
+        label_emb = self.prompt_embedder(
+            prompt,
+            self.training,
+            force_drop_ids=prompt_drop_ids,
+        )
         hidden_states = torch.cat((label_emb.unsqueeze(1), hidden_states[:, :-1]), dim=1)
         for block in self.blocks:
             hidden_states = block(hidden_states)
@@ -216,10 +235,15 @@ class Transformer(nn.Module):
         hidden_states: torch.Tensor,
         start_pos: int = 0,
         inference_params: InferenceParams | None = None,
+        prompt_drop_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         start_pos = int(start_pos)
         if start_pos == 0:
-            hidden_states = self.prompt_embedder(hidden_states, self.training).unsqueeze(1)
+            hidden_states = self.prompt_embedder(
+                hidden_states,
+                self.training,
+                force_drop_ids=prompt_drop_ids,
+            ).unsqueeze(1)
         else:
             hidden_states = self.input_embedder(hidden_states)
 
@@ -250,13 +274,24 @@ class Transformer(nn.Module):
         return hidden_states
 
     def sample_with_cfg(self, prompt: torch.Tensor, cfg_scale: float, sample_func) -> torch.Tensor:
-        if not torch.is_tensor(prompt):
-            prompt = torch.tensor(prompt, device=self.device, dtype=torch.long)
-        else:
-            prompt = prompt.to(device=self.device, dtype=torch.long)
         # Build [cond, uncond] prompt batch for classifier-free guidance.
-        y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
-        prompt = torch.cat([prompt, y_null], dim=0)
+        prompt_drop_ids = None
+        if self.conditioning_type == "class":
+            if not torch.is_tensor(prompt):
+                prompt = torch.tensor(prompt, device=self.device, dtype=torch.long)
+            else:
+                prompt = prompt.to(device=self.device, dtype=torch.long)
+            y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
+            prompt = torch.cat([prompt, y_null], dim=0)
+        else:
+            # continuous conditioning: prompt is [B, D] embedding
+            if not torch.is_tensor(prompt):
+                prompt = torch.tensor(prompt, device=self.device, dtype=self.dtype)
+            else:
+                prompt = prompt.to(device=self.device, dtype=self.dtype)
+            prompt = torch.cat([prompt, prompt], dim=0)
+            prompt_drop_ids = torch.zeros(prompt.shape[0], device=self.device, dtype=torch.long)
+            prompt_drop_ids[prompt.shape[0] // 2:] = 1
 
         batch_size = prompt.shape[0]
         inference_params = InferenceParams(max_seqlen=self.seq_len, max_batch_size=batch_size)
@@ -275,6 +310,7 @@ class Transformer(nn.Module):
                 recurrent_input,
                 start_pos=i,
                 inference_params=inference_params,
+                prompt_drop_ids=prompt_drop_ids,
             )
             prev_token = sample_func(
                 functools.partial(self.forward_with_cfg, conditioning=conditioning, cfg_scale=cfg_scale),

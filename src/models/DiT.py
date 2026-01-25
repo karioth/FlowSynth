@@ -6,7 +6,7 @@ import torch.nn as nn
 from .modules.attention import Attention
 from .modules.norms import RMSNorm
 from .modules.adaln import AdaLNzero, modulate, gate, FinalLayer
-from .modules.embeddings import TimestepEmbedder, LabelEmbedder
+from .modules.embeddings import TimestepEmbedder, LabelEmbedder, ContinuousEmbedder
 from .modules.ffn import SwiGLU
 
 class DiTBlock(nn.Module):
@@ -79,6 +79,8 @@ class DiT(nn.Module):
         intermediate_size: int | None = None,
         class_dropout_prob: float = 0.1,
         num_classes: int = 1000,
+        conditioning_type: str = "class",
+        conditioning_dim: int | None = None,
         is_gated: bool = False,
         rope_theta: float = 10000.0,
         rope_interleaved: bool = False,
@@ -90,13 +92,21 @@ class DiT(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.seq_len = seq_len
+        self.conditioning_type = conditioning_type
 
         if intermediate_size is None:
             intermediate_size = int(hidden_size * 7 / 3 / 64) * 64 # 4x ratio in regular MLP but 2.6ish for swiglu
 
         self.input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.time_embedder = TimestepEmbedder(hidden_size)
-        self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+
+        if conditioning_type == "class":
+            self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        elif conditioning_type == "continuous":
+            assert conditioning_dim is not None, "conditioning_dim required for continuous conditioning"
+            self.prompt_embedder = ContinuousEmbedder(conditioning_dim, hidden_size, class_dropout_prob)
+        else:
+            raise ValueError(f"Unknown conditioning_type: {conditioning_type}")
 
         self.blocks = nn.ModuleList(
             [
@@ -138,12 +148,17 @@ class DiT(nn.Module):
         hidden_states: torch.Tensor,
         timesteps: torch.Tensor,
         prompt: torch.Tensor,
+        prompt_drop_ids: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del kwargs
         hidden_states = self.input_embedder(hidden_states)
         time_emb = self.time_embedder(timesteps)
-        label_emb = self.prompt_embedder(prompt, self.training)
+        label_emb = self.prompt_embedder(
+            prompt,
+            self.training,
+            force_drop_ids=prompt_drop_ids,
+        )
         conditioning = (time_emb + label_emb).unsqueeze(1)
 
         for block in self.blocks:
@@ -152,13 +167,24 @@ class DiT(nn.Module):
         return hidden_states
 
     def sample_with_cfg(self, prompt: torch.Tensor, cfg_scale: float, sample_func) -> torch.Tensor:
-        if not torch.is_tensor(prompt):
-            prompt = torch.tensor(prompt, device=self.device, dtype=torch.long)
-        else:
-            prompt = prompt.to(device=self.device, dtype=torch.long)
         # Build [cond, uncond] prompt batch for classifier-free guidance.
-        y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
-        prompt = torch.cat([prompt, y_null], dim=0)
+        prompt_drop_ids = None
+        if self.conditioning_type == "class":
+            if not torch.is_tensor(prompt):
+                prompt = torch.tensor(prompt, device=self.device, dtype=torch.long)
+            else:
+                prompt = prompt.to(device=self.device, dtype=torch.long)
+            y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
+            prompt = torch.cat([prompt, y_null], dim=0)
+        else:
+            # continuous conditioning: prompt is [B, D] embedding
+            if not torch.is_tensor(prompt):
+                prompt = torch.tensor(prompt, device=self.device, dtype=self.dtype)
+            else:
+                prompt = prompt.to(device=self.device, dtype=self.dtype)
+            prompt = torch.cat([prompt, prompt], dim=0)
+            prompt_drop_ids = torch.zeros(prompt.shape[0], device=self.device, dtype=torch.long)
+            prompt_drop_ids[prompt.shape[0] // 2:] = 1
 
         batch_size = prompt.shape[0]
         noise = torch.randn(
@@ -169,7 +195,12 @@ class DiT(nn.Module):
             dtype=self.dtype,
         )
         samples = sample_func(
-            functools.partial(self.forward_with_cfg, prompt=prompt, cfg_scale=cfg_scale),
+            functools.partial(
+                self.forward_with_cfg,
+                prompt=prompt,
+                cfg_scale=cfg_scale,
+                prompt_drop_ids=prompt_drop_ids,
+            ),
             noise,
         )
         samples, _ = samples.chunk(2, dim=0)
@@ -181,13 +212,14 @@ class DiT(nn.Module):
         timesteps: torch.Tensor,
         prompt: torch.Tensor,
         cfg_scale: float,
+        prompt_drop_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass with classifier-free guidance by duplicating the conditional noise.
         """
         half = hidden_states[: len(hidden_states) // 2]
         combined = torch.cat([half, half], dim=0)
-        eps = self.forward(combined, timesteps, prompt)
+        eps = self.forward(combined, timesteps, prompt, prompt_drop_ids=prompt_drop_ids)
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         guided_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         return torch.cat([guided_eps, guided_eps], dim=0)

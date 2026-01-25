@@ -7,7 +7,7 @@ from flash_attn.utils.generation import InferenceParams
 from .modules.attention import Attention
 from .modules.norms import RMSNorm
 from .modules.adaln import AdaLNzero, modulate, gate, FinalLayer
-from .modules.embeddings import TimestepEmbedder, LabelEmbedder
+from .modules.embeddings import TimestepEmbedder, LabelEmbedder, ContinuousEmbedder
 from .modules.ffn import SwiGLU
 
 
@@ -105,6 +105,8 @@ class MaskedARTransformer(nn.Module):
         diffusion_intermediate_size: int | None = None,
         class_dropout_prob: float = 0.1,
         num_classes: int = 1000,
+        conditioning_type: str = "class",
+        conditioning_dim: int | None = None,
         is_gated: bool = False,
         rope_theta: float = 10000.0,
         rope_interleaved: bool = False,
@@ -118,6 +120,7 @@ class MaskedARTransformer(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.hidden_size = hidden_size
         self.seq_len = seq_len
+        self.conditioning_type = conditioning_type
 
         if intermediate_size is None:
             intermediate_size = int(hidden_size * 10 / 3 / 64) * 64
@@ -127,7 +130,14 @@ class MaskedARTransformer(nn.Module):
         self.input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.noisy_input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.time_embedder = TimestepEmbedder(hidden_size)
-        self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+
+        if conditioning_type == "class":
+            self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        elif conditioning_type == "continuous":
+            assert conditioning_dim is not None, "conditioning_dim required for continuous conditioning"
+            self.prompt_embedder = ContinuousEmbedder(conditioning_dim, hidden_size, class_dropout_prob)
+        else:
+            raise ValueError(f"Unknown conditioning_type: {conditioning_type}")
 
         # Learnable [MASK] token
         self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
@@ -256,12 +266,13 @@ class MaskedARTransformer(nn.Module):
         start_pos: int = 0,
         inference_params: InferenceParams | None = None,
         append_mask: bool = False,
+        prompt_drop_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Recurrent forward for inference with KV caching.
 
         Args:
-            hidden_states: Either prompt ids (at start_pos=0), predicted tokens, or None to use mask_token
+            hidden_states: Either prompt ids/embeddings (at start_pos=0), predicted tokens, or None to use mask_token
             start_pos: Current position in sequence
             inference_params: KV cache container
             append_mask: If True, append a [MASK] token to query the next position in the same pass
@@ -269,7 +280,11 @@ class MaskedARTransformer(nn.Module):
         start_pos = int(start_pos)
         if start_pos == 0:
             # First position: embed the prompt
-            hidden_states = self.prompt_embedder(hidden_states, self.training).unsqueeze(1)
+            hidden_states = self.prompt_embedder(
+                hidden_states,
+                self.training,
+                force_drop_ids=prompt_drop_ids,
+            ).unsqueeze(1)
         elif hidden_states is None:
             # Query with mask token (matches training)
             batch_size = inference_params.max_batch_size
@@ -335,13 +350,24 @@ class MaskedARTransformer(nn.Module):
         `Attention._update_kv_cache` (e.g., a `cache_write_len` or boolean mask) so only
         the generated token updates KV while the MASK tokens are only used for queries.
         """
-        if not torch.is_tensor(prompt):
-            prompt = torch.tensor(prompt, device=self.device, dtype=torch.long)
-        else:
-            prompt = prompt.to(device=self.device, dtype=torch.long)
         # Build [cond, uncond] prompt batch for classifier-free guidance.
-        y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
-        prompt = torch.cat([prompt, y_null], dim=0)
+        prompt_drop_ids = None
+        if self.conditioning_type == "class":
+            if not torch.is_tensor(prompt):
+                prompt = torch.tensor(prompt, device=self.device, dtype=torch.long)
+            else:
+                prompt = prompt.to(device=self.device, dtype=torch.long)
+            y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
+            prompt = torch.cat([prompt, y_null], dim=0)
+        else:
+            # continuous conditioning: prompt is [B, D] embedding
+            if not torch.is_tensor(prompt):
+                prompt = torch.tensor(prompt, device=self.device, dtype=self.dtype)
+            else:
+                prompt = prompt.to(device=self.device, dtype=self.dtype)
+            prompt = torch.cat([prompt, prompt], dim=0)
+            prompt_drop_ids = torch.zeros(prompt.shape[0], device=self.device, dtype=torch.long)
+            prompt_drop_ids[prompt.shape[0] // 2:] = 1
 
         batch_size = prompt.shape[0]
         inference_params = InferenceParams(max_seqlen=self.seq_len + 1, max_batch_size=batch_size)
@@ -371,6 +397,7 @@ class MaskedARTransformer(nn.Module):
                 start_pos=i,
                 inference_params=inference_params,
                 append_mask=True,
+                prompt_drop_ids=prompt_drop_ids,
             )
             conditioning = conditioning[:, -1:]  # Mask position readout.
 
