@@ -186,7 +186,7 @@ class Transformer(nn.Module):
         hidden_states: torch.Tensor,
         timesteps: torch.Tensor,
         x_start: torch.Tensor,
-        labels: torch.Tensor,
+        prompt: torch.Tensor,
         batch_mul: int = 1,
         **kwargs,
     ) -> torch.Tensor:
@@ -195,16 +195,16 @@ class Transformer(nn.Module):
         hidden_states: (B, T, C) tensor of noisy latent tokens
         x_start: (B, T, C) tensor of clean latent tokens
         timesteps: (B, T) or (B,) tensor of diffusion timesteps
-        labels: (B,) tensor of class labels
+        prompt: (B,) tensor of class prompts
         """
         del kwargs
-        conditioning = self.forward_parallel(x_start, labels)
+        conditioning = self.forward_parallel(x_start, prompt)
         conditioning = conditioning.repeat_interleave(batch_mul, dim=0)
         return self.forward_diffusion(hidden_states, timesteps, conditioning)
 
-    def forward_parallel(self, hidden_states: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def forward_parallel(self, hidden_states: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
         hidden_states = self.input_embedder(hidden_states)
-        label_emb = self.label_embedder(labels, self.training)
+        label_emb = self.label_embedder(prompt, self.training)
         hidden_states = torch.cat((label_emb.unsqueeze(1), hidden_states[:, :-1]), dim=1)
         for block in self.blocks:
             hidden_states = block(hidden_states)
@@ -249,10 +249,18 @@ class Transformer(nn.Module):
         hidden_states = self.final_layer(hidden_states, conditioning)
         return hidden_states
 
-    def sample_with_cfg(self, labels: torch.Tensor, cfg_scale: float, sample_func) -> torch.Tensor:
-        batch_size = labels.shape[0]
+    def sample_with_cfg(self, prompt: torch.Tensor, cfg_scale: float, sample_func) -> torch.Tensor:
+        if not torch.is_tensor(prompt):
+            prompt = torch.tensor(prompt, device=self.device, dtype=torch.long)
+        else:
+            prompt = prompt.to(device=self.device, dtype=torch.long)
+        # Build [cond, uncond] prompt batch for classifier-free guidance.
+        y_null = torch.full_like(prompt, self.label_embedder.num_classes, device=self.device)
+        prompt = torch.cat([prompt, y_null], dim=0)
+
+        batch_size = prompt.shape[0]
         inference_params = InferenceParams(max_seqlen=self.seq_len, max_batch_size=batch_size)
-        prev_token = labels
+        prev_token = prompt
         samples = []
         for i in range(self.seq_len):
             noise = torch.randn(

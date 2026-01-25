@@ -179,7 +179,7 @@ class MaskedARTransformer(nn.Module):
         hidden_states: torch.Tensor,
         timesteps: torch.Tensor,
         x_start: torch.Tensor,
-        labels: torch.Tensor,
+        prompt: torch.Tensor,
         mask: torch.Tensor,
         flat_mask_indices: torch.Tensor,
         batch_mul: int = 1,
@@ -192,7 +192,7 @@ class MaskedARTransformer(nn.Module):
             hidden_states: (num_masked * batch_mul, C) noisy tokens at masked positions
             timesteps: (num_masked * batch_mul,) diffusion timesteps
             x_start: (B, T, C) clean latent tokens (full sequences for backbone)
-            labels: (B,) class labels
+            prompt: (B,) class prompts
             mask: (B, T) boolean tensor, True = masked position
             flat_mask_indices: (num_masked,) indices into flattened B*T
             batch_mul: batch multiplier for multiple timestep samples
@@ -201,7 +201,7 @@ class MaskedARTransformer(nn.Module):
         bsz, seq_len, _ = x_start.shape
 
         # 1. Run backbone on full sequences
-        conditioning = self.forward_backbone(x_start, labels, mask)  # (B, T, hidden)
+        conditioning = self.forward_backbone(x_start, prompt, mask)  # (B, T, hidden)
 
         # 2. Gather conditioning at masked positions
         cond_flat = conditioning.reshape(bsz * seq_len, -1)  # (B*T, hidden)
@@ -220,7 +220,7 @@ class MaskedARTransformer(nn.Module):
     def forward_backbone(
         self,
         hidden_states: torch.Tensor,
-        labels: torch.Tensor,
+        prompt: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
         """
@@ -239,8 +239,8 @@ class MaskedARTransformer(nn.Module):
             hidden_states,
         )
 
-        # Prepend label embedding (no shift needed - same position readout)
-        label_emb = self.label_embedder(labels, self.training)
+        # Prepend prompt embedding (no shift needed - same position readout)
+        label_emb = self.label_embedder(prompt, self.training)
         hidden_states = torch.cat((label_emb.unsqueeze(1), hidden_states), dim=1)
 
         for block in self.blocks:
@@ -261,14 +261,14 @@ class MaskedARTransformer(nn.Module):
         Recurrent forward for inference with KV caching.
 
         Args:
-            hidden_states: Either labels (at start_pos=0), predicted tokens, or None to use mask_token
+            hidden_states: Either prompt ids (at start_pos=0), predicted tokens, or None to use mask_token
             start_pos: Current position in sequence
             inference_params: KV cache container
             append_mask: If True, append a [MASK] token to query the next position in the same pass
         """
         start_pos = int(start_pos)
         if start_pos == 0:
-            # First position: embed the label
+            # First position: embed the prompt
             hidden_states = self.label_embedder(hidden_states, self.training).unsqueeze(1)
         elif hidden_states is None:
             # Query with mask token (matches training)
@@ -318,7 +318,7 @@ class MaskedARTransformer(nn.Module):
 
     def sample_with_cfg(
         self,
-        labels: torch.Tensor,
+        prompt: torch.Tensor,
         cfg_scale: float,
         sample_func,
     ) -> torch.Tensor:
@@ -335,7 +335,15 @@ class MaskedARTransformer(nn.Module):
         `Attention._update_kv_cache` (e.g., a `cache_write_len` or boolean mask) so only
         the generated token updates KV while the MASK tokens are only used for queries.
         """
-        batch_size = labels.shape[0]
+        if not torch.is_tensor(prompt):
+            prompt = torch.tensor(prompt, device=self.device, dtype=torch.long)
+        else:
+            prompt = prompt.to(device=self.device, dtype=torch.long)
+        # Build [cond, uncond] prompt batch for classifier-free guidance.
+        y_null = torch.full_like(prompt, self.label_embedder.num_classes, device=self.device)
+        prompt = torch.cat([prompt, y_null], dim=0)
+
+        batch_size = prompt.shape[0]
         inference_params = InferenceParams(max_seqlen=self.seq_len + 1, max_batch_size=batch_size)
 
         samples = []
@@ -350,8 +358,8 @@ class MaskedARTransformer(nn.Module):
             )
 
             if i == 0:
-                # First iteration: pass labels (already [real, null] from caller).
-                recurrent_input = labels
+                # First iteration: pass prompts for both conditional and unconditional batches.
+                recurrent_input = prompt
             else:
                 # Cache the previous predicted token (CFG: duplicate batch).
                 recurrent_input = torch.cat([prev_token, prev_token], dim=0)

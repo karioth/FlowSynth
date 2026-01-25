@@ -79,7 +79,7 @@ class LitModule(L.LightningModule):
         self.register_buffer("has_scaling", torch.tensor(False, dtype=torch.bool))
 
     def training_step(self, batch, batch_idx):
-        moments, labels = batch
+        moments, prompts = batch
         posterior = SequenceDiagonalGaussianDistribution(moments)
         x0 = posterior.sample()
 
@@ -87,7 +87,7 @@ class LitModule(L.LightningModule):
             self._init_scaling(x0)
 
         x0 = self._normalize(x0)
-        loss = self.noise_scheduler.get_losses(self.model, x0, labels)
+        loss = self.noise_scheduler.get_losses(self.model, x0, prompts)
 
         self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         return loss
@@ -135,7 +135,7 @@ class LitModule(L.LightningModule):
     @torch.no_grad()
     def sample_latents(
         self,
-        class_labels,
+        prompt,
         cfg_scale: float = 4.0,
         num_inference_steps: int = 250,
         scheduler=None,
@@ -146,20 +146,12 @@ class LitModule(L.LightningModule):
         if scheduler is None:
             scheduler = self.noise_scheduler
 
-        if not torch.is_tensor(class_labels):
-            class_labels = torch.tensor(class_labels, device=self.device, dtype=torch.long)
-        else:
-            class_labels = class_labels.to(device=self.device, dtype=torch.long)
-
-        y_null = torch.full_like(class_labels, self.hparams.num_classes, device=self.device)
-        y = torch.cat([class_labels, y_null], 0)
-
         scheduler.configure_sampling(
             ardiff_step=ardiff_step,
             base_num_frames=base_num_frames,
         )
         scheduler.set_timesteps(num_inference_steps, device=self.device)
-        latents = self.model.sample_with_cfg(y, cfg_scale, scheduler)
+        latents = self.model.sample_with_cfg(prompt, cfg_scale, scheduler)
         return self.unnormalize_latents(latents)
 
     def configure_optimizers(self):

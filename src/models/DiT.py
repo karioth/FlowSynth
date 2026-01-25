@@ -137,13 +137,13 @@ class DiT(nn.Module):
         self,
         hidden_states: torch.Tensor,
         timesteps: torch.Tensor,
-        labels: torch.Tensor,
+        prompt: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         del kwargs
         hidden_states = self.input_embedder(hidden_states)
         time_emb = self.time_embedder(timesteps)
-        label_emb = self.label_embedder(labels, self.training)
+        label_emb = self.label_embedder(prompt, self.training)
         conditioning = (time_emb + label_emb).unsqueeze(1)
 
         for block in self.blocks:
@@ -151,8 +151,16 @@ class DiT(nn.Module):
         hidden_states = self.final_layer(hidden_states, conditioning)
         return hidden_states
 
-    def sample_with_cfg(self, labels: torch.Tensor, cfg_scale: float, sample_func) -> torch.Tensor:
-        batch_size = labels.shape[0]
+    def sample_with_cfg(self, prompt: torch.Tensor, cfg_scale: float, sample_func) -> torch.Tensor:
+        if not torch.is_tensor(prompt):
+            prompt = torch.tensor(prompt, device=self.device, dtype=torch.long)
+        else:
+            prompt = prompt.to(device=self.device, dtype=torch.long)
+        # Build [cond, uncond] prompt batch for classifier-free guidance.
+        y_null = torch.full_like(prompt, self.label_embedder.num_classes, device=self.device)
+        prompt = torch.cat([prompt, y_null], dim=0)
+
+        batch_size = prompt.shape[0]
         noise = torch.randn(
             batch_size,
             self.seq_len,
@@ -161,7 +169,7 @@ class DiT(nn.Module):
             dtype=self.dtype,
         )
         samples = sample_func(
-            functools.partial(self.forward_with_cfg, labels=labels, cfg_scale=cfg_scale),
+            functools.partial(self.forward_with_cfg, prompt=prompt, cfg_scale=cfg_scale),
             noise,
         )
         samples, _ = samples.chunk(2, dim=0)
@@ -171,7 +179,7 @@ class DiT(nn.Module):
         self,
         hidden_states: torch.Tensor,
         timesteps: torch.Tensor,
-        labels: torch.Tensor,
+        prompt: torch.Tensor,
         cfg_scale: float,
     ) -> torch.Tensor:
         """
@@ -179,7 +187,7 @@ class DiT(nn.Module):
         """
         half = hidden_states[: len(hidden_states) // 2]
         combined = torch.cat([half, half], dim=0)
-        eps = self.forward(combined, timesteps, labels)
+        eps = self.forward(combined, timesteps, prompt)
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         guided_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         return torch.cat([guided_eps, guided_eps], dim=0)

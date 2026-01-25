@@ -186,14 +186,14 @@ class FlowMatchingBase(nn.Module):
 
 
 class FlowMatchingSchedulerDiT(FlowMatchingBase):
-    def get_losses(self, model, x0_seq, labels) -> torch.Tensor:
+    def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
         bsz = x0_seq.shape[0]
         noise = torch.randn_like(x0_seq)
         timesteps = self.sample_timesteps(bsz, device=x0_seq.device, dtype=x0_seq.dtype)
 
         x_noisy = self.add_noise(x0_seq, noise, timesteps)
         velocity = self.get_velocity(x0_seq, noise, timesteps)
-        model_output = model(x_noisy, timesteps, labels=labels)
+        model_output = model(x_noisy, timesteps, prompt=prompt)
         return F.mse_loss(model_output.float(), velocity.float())
 
 
@@ -202,7 +202,7 @@ class FlowMatchingSchedulerTransformer(FlowMatchingBase):
         super().__init__(*args, **kwargs)
         self.batch_mul = batch_mul
 
-    def get_losses(self, model, x0_seq, labels) -> torch.Tensor:
+    def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
         bsz, seq_len, latent_size = x0_seq.shape
         noise = torch.randn(
             (bsz * self.batch_mul * seq_len, latent_size),
@@ -228,7 +228,7 @@ class FlowMatchingSchedulerTransformer(FlowMatchingBase):
             x_noisy,
             timesteps,
             x_start=x0_seq,
-            labels=labels,
+            prompt=prompt,
             batch_mul=self.batch_mul,
         )
         return F.mse_loss(model_output.float(), velocity.float())
@@ -325,7 +325,7 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
         
         return u
 
-    def get_losses(self, model, x0_seq, labels) -> torch.Tensor:
+    def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
         bsz, seq_len = x0_seq.shape[:2]
         noise = torch.randn_like(x0_seq)
         t_vec = self.sample_monotone_anchor_times(
@@ -334,7 +334,7 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
 
         x_noisy = self.add_noise(x0_seq, noise, t_vec)
         velocity = self.get_velocity(x0_seq, noise, t_vec)
-        model_output = model(x_noisy, t_vec, labels=labels)
+        model_output = model(x_noisy, t_vec, prompt=prompt)
         return F.mse_loss(model_output.float(), velocity.float())
 
     def set_timesteps(
@@ -511,7 +511,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         self.mask_prob_max = mask_prob_max
         self.batch_mul = batch_mul
 
-    def get_losses(self, model, x0_seq, labels) -> torch.Tensor:
+    def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
         bsz, seq_len, latent_size = x0_seq.shape
         total_tokens = bsz * seq_len
 
@@ -559,7 +559,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
             x_noisy,
             timesteps,
             x_start=x0_seq,
-            labels=labels,
+            prompt=prompt,
             mask=mask,
             flat_mask_indices=flat_mask_indices,
             batch_mul=self.batch_mul,
