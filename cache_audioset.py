@@ -15,7 +15,10 @@ from audiotools import AudioSignal
 
 DEFAULT_DACVAE_WEIGHTS = "facebook/dacvae-watermarked"
 DEFAULT_CLAP_MODEL = "laion/larger_clap_music"
-MIN_DURATION_SECONDS = 9
+# DACVAE (sample_rate=48000, hop_length=1920):
+# latent_length = ceil((duration_seconds * sample_rate) / hop_length)
+# Require latent_length >= 251 => duration_seconds >= (250 * hop_length + 1) / sample_rate
+MIN_DURATION_SECONDS = (250 * 1920 + 1) / 48000
 
 
 class AudioSetDataset(Dataset):

@@ -2,13 +2,14 @@ import argparse
 import json
 import os
 import sys
+import random
 
 import torch
 import torchaudio
 import dacvae
 
 
-DEFAULT_IN_PATH = "/share/users/student/f/friverossego/audioset_FBdacvae/4875DncHORw_66899.pt"
+DEFAULT_IN_DIR = "/share/users/student/f/friverossego/audioset_FBdacvae"
 DEFAULT_OUT_DIR = "/share/users/student/f/friverossego/LatentLM/smoketest"
 
 
@@ -34,10 +35,32 @@ def _read_caption(sidecar_path: str) -> str | None:
     return None
 
 
+def _sample_pt_from_dir(dir_path: str) -> str:
+    choice = None
+    count = 0
+    try:
+        with os.scandir(dir_path) as it:
+            for entry in it:
+                if not entry.is_file():
+                    continue
+                if not entry.name.endswith(".pt"):
+                    continue
+                count += 1
+                if random.randrange(count) == 0:
+                    choice = entry.path
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Input dir not found: {dir_path}") from exc
+    if choice is None:
+        raise FileNotFoundError(f"No .pt files found in: {dir_path}")
+    return choice
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Decode cached DACVAE latents to audio.")
-    parser.add_argument("--in_path", default=DEFAULT_IN_PATH, type=str,
-                        help="Path to cached .pt file")
+    parser.add_argument("--in_path", default=None, type=str,
+                        help="Path to cached .pt file (if omitted, sample from --in_dir)")
+    parser.add_argument("--in_dir", default=DEFAULT_IN_DIR, type=str,
+                        help="Directory to sample a .pt file from when --in_path is omitted")
     parser.add_argument("--out_dir", default=DEFAULT_OUT_DIR, type=str,
                         help="Output directory for decoded audio")
     parser.add_argument("--sidecar_path", default=None, type=str,
@@ -48,6 +71,9 @@ def main() -> None:
     from audio_utils import decode_audio_latents
 
     os.makedirs(args.out_dir, exist_ok=True)
+
+    if not args.in_path:
+        args.in_path = _sample_pt_from_dir(args.in_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = dacvae.DACVAE.load("facebook/dacvae-watermarked").eval().to(device)
