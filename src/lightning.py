@@ -1,5 +1,4 @@
 import torch
-import torch.distributed as dist
 import lightning as L
 from lightning.pytorch.callbacks import WeightAveraging
 from torch.optim.swa_utils import get_ema_avg_fn
@@ -32,6 +31,8 @@ class LitModule(L.LightningModule):
         batch_mul: int = 4,
         mask_prob_min: float = 0.5,
         mask_prob_max: float = 0.5,
+        data_scale: float = 1.0,
+        data_bias: float = 0.0,
         lr: float = 1e-4,
         weight_decay: float = 0.01,
         lr_scheduler: str = "cosine",
@@ -84,51 +85,20 @@ class LitModule(L.LightningModule):
         else:
             raise NotImplementedError("Unsupported model type.")
 
-        self.register_buffer("scaling_factor", torch.tensor(1.0, dtype=torch.float32))
-        self.register_buffer("bias_factor", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("has_scaling", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("scaling_factor", torch.tensor(data_scale, dtype=torch.float32))
+        self.register_buffer("bias_factor", torch.tensor(data_bias, dtype=torch.float32))
+        self.register_buffer("has_scaling", torch.tensor(True, dtype=torch.bool))
 
     def training_step(self, batch, batch_idx):
         moments, prompts = batch
         posterior = SequenceDiagonalGaussianDistribution(moments)
         x0 = posterior.sample()
 
-        if not self.has_scaling.item():
-            self._init_scaling(x0)
-
         x0 = self._normalize(x0)
         loss = self.noise_scheduler.get_losses(self.model, x0, prompts)
 
         self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         return loss
-
-    @torch.no_grad()
-    def _init_scaling(self, x0):
-        x0_float = x0.float()
-        scaling = 1.0 / x0_float.flatten().std()
-        bias = -x0_float.flatten().mean()
-
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(scaling, op=dist.ReduceOp.SUM)
-            dist.all_reduce(bias, op=dist.ReduceOp.SUM)
-            world_size = dist.get_world_size()
-            scaling /= world_size
-            bias /= world_size
-
-        mu = -bias
-        std = 1.0 / scaling
-        self.set_data_stats(mu, std)
-        self.print(
-            f"Scaling factor: {self.scaling_factor.item()}, Bias factor: {self.bias_factor.item()}"
-        )
-
-    def set_data_stats(self, mu: torch.Tensor, std: torch.Tensor):
-        assert mu.shape == self.bias_factor.shape
-        assert std.shape == self.scaling_factor.shape
-        std = std.clamp_min(1e-8)
-        self.bias_factor.copy_(-mu)
-        self.scaling_factor.copy_(1.0 / std)
-        self.has_scaling.fill_(True)
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
         bias = self.bias_factor.to(dtype=x.dtype)

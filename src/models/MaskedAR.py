@@ -140,7 +140,7 @@ class MaskedARTransformer(nn.Module):
             raise ValueError(f"Unknown conditioning_type: {conditioning_type}")
 
         # Learnable [MASK] token
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.mask_token = nn.Parameter(torch.empty(1, 1, hidden_size))
 
         self.blocks = nn.ModuleList(
             [
@@ -182,7 +182,7 @@ class MaskedARTransformer(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
-        # mask_token is already zeros from initialization
+        nn.init.normal_(self.mask_token, std=0.02)
 
     def forward(
         self,

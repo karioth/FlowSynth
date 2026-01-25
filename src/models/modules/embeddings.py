@@ -118,12 +118,13 @@ class ContinuousEmbedder(nn.Module):
     def __init__(self, input_dim: int, hidden_size: int, dropout_prob: float = 0.1) -> None:
         super().__init__()
         self.proj = nn.Linear(input_dim, hidden_size, bias=False)
-        self.null_embedding = nn.Parameter(torch.zeros(hidden_size))
+        self.null_embedding = nn.Parameter(torch.empty(hidden_size))
         self.dropout_prob = dropout_prob
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.proj.weight, std=0.02)
+        nn.init.normal_(self.null_embedding, std=0.02) ## aparently super important! starting null as zeros leads to nan grads
 
     def forward(
         self,

@@ -33,6 +33,8 @@ def main(args):
         num_classes=args.num_classes,
         prediction_type=args.prediction_type,
         batch_mul=args.batch_mul,
+        data_scale=0.2331244945526123,
+        data_bias=-0.07858214527368546,
         lr=args.lr,
         weight_decay=args.weight_decay,
         lr_scheduler=args.lr_scheduler,
