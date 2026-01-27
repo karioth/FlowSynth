@@ -25,3 +25,4 @@ smoke*/
 *.md
 !README.md
 ardit_animation.py
+audio_samples/

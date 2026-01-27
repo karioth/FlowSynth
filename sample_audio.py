@@ -14,10 +14,10 @@ from src.data_utils.audio_utils import decode_audio_latents
 
 
 DEFAULT_PROMPTS = [
-    "Electronic music with heavy bass and synths",
-    "Acoustic guitar playing a gentle melody",
-    "Jazz piano with smooth chords",
-    "Orchestral music with strings and brass",
+    "The audio contains multiple rapid bursts of sound, which sound like a series of gunshots. The individual shots are sharp, loud, and closely spaced together, suggesting automatic gunfire or rapid semi-automatic weapon use. The sound clearly represents gunfire, confirming the hint. The rapid succession of shots suggests a conflict or target practice.",
+    "Birds singing in clear and loud chirps to each other",
+    "Loud rock music from concert playing with fast drums and electric guitars",
+    "Metal bar clanking with sharp loud noises as it repeateadly falls on the floor ",
 ]
 
 
