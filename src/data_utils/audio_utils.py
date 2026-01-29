@@ -11,6 +11,9 @@ import tqdm
 from audiotools import AudioSignal
 
 
+AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
+
+
 @torch.no_grad()
 def encode_audio_latents(
     model: torch.nn.Module,
@@ -257,48 +260,45 @@ def _save_audio(path: str, wav: torch.Tensor, sample_rate: int) -> None:
     torchaudio.save(path, wav[0], sample_rate=sample_rate, format="mp3")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Smoke test for DACVAE watermarked using audio_utils helpers."
-    )
-    parser.add_argument("audio_path", type=str, help="Path to an input audio file.")
-    args = parser.parse_args()
-
-    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    weights_path = os.path.join(root, "pretrained_models", "dacvae_watermarked.pth")
-    if not os.path.exists(weights_path):
-        raise FileNotFoundError(f"Missing weights: {weights_path}")
-
-    import dacvae
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = dacvae.DACVAE.load(weights_path).eval().to(device)
-
-    posterior_params, metadata = encode_audio_latents(model, args.audio_path)
-    mean, logvar = torch.chunk(posterior_params, 2, dim=1)
-    std = torch.exp(0.5 * logvar)
-    sample = mean + std * torch.randn_like(std)
-
-    mean_audio = decode_audio_latents(model, mean, metadata)
-    sample_audio = decode_audio_latents(model, sample, metadata)
-
-    out_dir = os.path.join(root, "smoketest")
-    os.makedirs(out_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(args.audio_path))[0]
-    input_path = os.path.join(out_dir, f"{base}_dacvae_watermarked_input.mp3")
-    mean_path = os.path.join(out_dir, f"{base}_dacvae_watermarked_mean.mp3")
-    sample_path = os.path.join(out_dir, f"{base}_dacvae_watermarked_sample.mp3")
-
-    sample_rate = metadata["sample_rate"]
-    wav_raw, wav_sr = torchaudio.load(args.audio_path)
-    wav_mono = wav_raw.mean(dim=0, keepdim=True).unsqueeze(0)
-    _save_audio(input_path, wav_mono, wav_sr)
-    _save_audio(mean_path, mean_audio, sample_rate)
-    _save_audio(sample_path, sample_audio, sample_rate)
-
-    print(f"Saved input audio: {input_path}")
-    print(f"Saved mean audio: {mean_path}")
-    print(f"Saved sample audio: {sample_path}")
+def fast_scandir(root, exts):
+    exts = {e if e.startswith(".") else f".{e}" for e in exts}
+    subdirs, files = [], []
+    try:
+        for entry in os.scandir(root):
+            try:
+                if entry.is_dir():
+                    subdirs.append(entry.path)
+                elif entry.is_file():
+                    name = entry.name
+                    if not name.startswith(".") and Path(name).suffix.lower() in exts:
+                        files.append(entry.path)
+            except:
+                pass
+    except:
+        pass
+    for d in list(subdirs):
+        sd, f = fast_scandir(d, exts)
+        subdirs.extend(sd)
+        files.extend(f)
+    return subdirs, files
 
 
-if __name__ == "__main__":
-    main()
+def list_audio_files(root: Path, exts=None):
+    exts = AUDIO_EXTS if exts is None else exts
+    _, files = fast_scandir(str(root), exts)
+    files = [Path(p) for p in files]
+    files.sort()
+    return files
+
+
+def scan_cached_outputs(out_root: Path) -> set[str]:
+    out_root = out_root.resolve()
+    _, files = fast_scandir(str(out_root), {".pt"})
+    done = set()
+    for path in files:
+        try:
+            rel = Path(path).resolve().relative_to(out_root)
+        except ValueError:
+            continue
+        done.add(rel.as_posix())
+    return done
