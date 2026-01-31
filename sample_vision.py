@@ -10,7 +10,7 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 
 from src.lightning import LitModule
-from src.data_utils.img_utils import load_vae, sequence_to_image
+from src.data_utils.preprocess.img_items import load_vae, sequence_to_image
 
 DEFAULT_CLASS_LABELS = [281, 282, 283, 284, 285, 4, 7, 963]
 

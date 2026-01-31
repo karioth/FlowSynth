@@ -7,7 +7,7 @@ sequences (B, T, C) rather than pixels or waveforms.
 
 ### 1) Cache image latents
 ```bash
-python -m src.data_utils.cache_image_latents \
+python preprocess_vision.py \
   --vae pretrained_models/kl16.ckpt \
   --data_dir /path/to/imagenet/train \
   --batch_size 256 \

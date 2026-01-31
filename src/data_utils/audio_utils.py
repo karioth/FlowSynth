@@ -1,6 +1,12 @@
-import argparse
-import os
-import sys
+"""
+Core audio VAE utilities for encoding and decoding.
+
+For preprocessing utilities (file scanning, duration filtering, etc.),
+see src.data_utils.preprocess.
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Union
 
@@ -9,9 +15,6 @@ import torch.nn.functional as F
 import torchaudio
 import tqdm
 from audiotools import AudioSignal
-
-
-AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
 
 
 @torch.no_grad()
@@ -253,52 +256,18 @@ def decode_audio_latents(
     return recons
 
 
-def _save_audio(path: str, wav: torch.Tensor, sample_rate: int) -> None:
+def save_audio(path: str, wav: torch.Tensor, sample_rate: int) -> None:
+    """
+    Save audio tensor to file.
+
+    Args:
+        path: Output file path
+        wav: Audio tensor of shape (1, 1, T) or (1, T)
+        sample_rate: Sample rate
+    """
     wav = wav.detach().cpu()
-    if wav.dim() != 3 or wav.size(0) != 1:
-        raise ValueError(f"Expected shape (1, 1, T), got {tuple(wav.shape)}")
-    torchaudio.save(path, wav[0], sample_rate=sample_rate, format="mp3")
-
-
-def fast_scandir(root, exts):
-    exts = {e if e.startswith(".") else f".{e}" for e in exts}
-    subdirs, files = [], []
-    try:
-        for entry in os.scandir(root):
-            try:
-                if entry.is_dir():
-                    subdirs.append(entry.path)
-                elif entry.is_file():
-                    name = entry.name
-                    if not name.startswith(".") and Path(name).suffix.lower() in exts:
-                        files.append(entry.path)
-            except:
-                pass
-    except:
-        pass
-    for d in list(subdirs):
-        sd, f = fast_scandir(d, exts)
-        subdirs.extend(sd)
-        files.extend(f)
-    return subdirs, files
-
-
-def list_audio_files(root: Path, exts=None):
-    exts = AUDIO_EXTS if exts is None else exts
-    _, files = fast_scandir(str(root), exts)
-    files = [Path(p) for p in files]
-    files.sort()
-    return files
-
-
-def scan_cached_outputs(out_root: Path) -> set[str]:
-    out_root = out_root.resolve()
-    _, files = fast_scandir(str(out_root), {".pt"})
-    done = set()
-    for path in files:
-        try:
-            rel = Path(path).resolve().relative_to(out_root)
-        except ValueError:
-            continue
-        done.add(rel.as_posix())
-    return done
+    if wav.dim() == 3:
+        if wav.size(0) != 1:
+            raise ValueError(f"Expected batch size 1, got {wav.size(0)}")
+        wav = wav[0]
+    torchaudio.save(path, wav, sample_rate=sample_rate, format="mp3")

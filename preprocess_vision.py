@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from torch.utils.data import DataLoader, DistributedSampler
 
-from src.data_utils.img_utils import center_crop_arr, load_vae
+from src.data_utils.preprocess.img_items import center_crop_arr, load_vae
 
 DEFAULT_VAE_URL = "https://www.dropbox.com/scl/fi/hhmuvaiacrarfg28qxhwz/kl16.ckpt?rlkey=l44xipsezc8atcffdp4q7mwmh&dl=0"
 DEFAULT_VAE_REL_PATH = os.path.join("pretrained_models", "kl16.ckpt")
