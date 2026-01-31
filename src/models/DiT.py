@@ -159,10 +159,12 @@ class DiT(nn.Module):
             self.training,
             force_drop_ids=prompt_drop_ids,
         )
-        conditioning = (time_emb + label_emb).unsqueeze(1)
+        hidden_states = torch.cat([label_emb.unsqueeze(1), hidden_states], dim=1)
+        conditioning = time_emb.unsqueeze(1)
 
         for block in self.blocks:
             hidden_states = block(hidden_states, conditioning)
+        hidden_states = hidden_states[:, 1:, :]
         hidden_states = self.final_layer(hidden_states, conditioning)
         return hidden_states
 
