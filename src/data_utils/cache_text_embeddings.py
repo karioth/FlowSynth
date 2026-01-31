@@ -4,15 +4,18 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from tqdm import tqdm
-from transformers import ClapModel, ClapProcessor
+from transformers import ClapModel, ClapProcessor, AutoTokenizer, T5EncoderModel
 
 
 class CaptionDataset(Dataset):
     """
-    Loads captions from JSONL and returns (embedding_id, caption_text).
-    embedding_id format: {track_id}_{start:03d}-{end:03d}
+    Loads captions from JSONL and returns (key, caption_text).
+    Manifest JSONL entries contain:
+      - key: str
+      - caption: str
     """
     def __init__(self, metadata_path: str):
         self.metadata_path = Path(metadata_path)
@@ -20,24 +23,19 @@ class CaptionDataset(Dataset):
 
         with open(self.metadata_path, 'r') as f:
             for line in f:
-                try:
-                    entry = json.loads(line.strip())
-                    self.entries.append(entry)
-                except json.JSONDecodeError:
+                if not line.strip():
                     continue
+                entry = json.loads(line)
+                self.entries.append(entry)
 
     def __len__(self):
         return len(self.entries)
 
     def __getitem__(self, idx):
         entry = self.entries[idx]
-        track_id = entry['id']
-        start = int(entry['start_time'])
-        end = int(entry['end_time'])
-        caption = entry['caption']
-
-        embedding_id = f"{track_id}_{start:03d}-{end:03d}"
-        return embedding_id, caption
+        key = entry["key"]
+        caption = entry["caption"]
+        return key, caption
 
 
 def init_distributed_mode(device: str):
@@ -56,11 +54,13 @@ def init_distributed_mode(device: str):
 def get_args_parser():
     parser = argparse.ArgumentParser("Cache CLAP text embeddings", add_help=True)
     parser.add_argument("--metadata_path", required=True, type=str,
-                        help="Path to final_caption30sec.jsonl")
+                        help="Path to manifest.jsonl")
     parser.add_argument("--output_dir", required=True, type=str,
-                        help="Output directory for text embeddings")
+                        help="Output root for text embeddings")
     parser.add_argument("--model_name", default="laion/larger_clap_music", type=str,
                         help="HuggingFace model ID")
+    parser.add_argument("--t5_model_name", default="google/flan-t5-large", type=str,
+                        help="HuggingFace model ID for Flan-T5 encoder")
     parser.add_argument("--batch_size", default=32, type=int,
                         help="Batch size per GPU")
     parser.add_argument("--device", default="cuda", type=str,
@@ -73,6 +73,49 @@ def get_args_parser():
     parser.set_defaults(pin_mem=True)
 
     return parser
+
+
+def _out_path(output_dir: Path, key: str) -> Path:
+    p = Path(key)
+    if p.suffix != ".pt":
+        p = p.with_suffix(".pt")
+    return output_dir / p
+
+
+@torch.no_grad()
+def encode_clap_text(model: ClapModel, processor: ClapProcessor, captions: list[str], device: str):
+    # Tokenize once; we’ll slice away padding when saving.
+    inputs = processor(
+        text=captions,
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    text_kwargs = {k: inputs[k] for k in ("input_ids", "attention_mask", "token_type_ids") if k in inputs}
+    text_out = model.text_model(return_dict=True, output_hidden_states=False, **text_kwargs)
+
+    proj = model.text_projection if hasattr(model, "text_projection") else model.text_model.text_projection
+    embeds_unnorm = proj(text_out.pooler_output)          # [B, 512]
+    embeds = F.normalize(embeds_unnorm, dim=-1)           # matches get_text_features in your setup
+    lengths = inputs["attention_mask"].sum(dim=-1).to(torch.int64)  # [B], excludes padding
+    return embeds, text_out.last_hidden_state, lengths
+
+
+@torch.no_grad()
+def encode_t5_tokens(t5_tok, t5_enc, captions: list[str], device: str):
+    t5_inputs = t5_tok(
+        captions,
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+    )
+    t5_inputs = {k: v.to(device) for k, v in t5_inputs.items()}
+    t5_out = t5_enc(**t5_inputs, return_dict=True)
+    t5_last = t5_out.last_hidden_state  # [B, Lt, 1024]
+    t5_lens = t5_inputs["attention_mask"].sum(dim=-1).to(torch.int64)
+    return t5_last, t5_lens
 
 
 @torch.no_grad()
@@ -88,6 +131,11 @@ def main(args):
 
     model = ClapModel.from_pretrained(args.model_name, use_safetensors=True).eval().to(device)
     processor = ClapProcessor.from_pretrained(args.model_name)
+
+    if rank == 0:
+        print(f"Loading Flan-T5 encoder: {args.t5_model_name}")
+    t5_tok = AutoTokenizer.from_pretrained(args.t5_model_name)
+    t5_enc = T5EncoderModel.from_pretrained(args.t5_model_name, use_safetensors=True).eval().to(device)
 
     if rank == 0:
         print(f"Loading captions from: {args.metadata_path}")
@@ -120,36 +168,37 @@ def main(args):
         data_iter = tqdm(loader, total=len(loader), desc="Encoding", unit="batch")
 
     for batch in data_iter:
-        embedding_ids = [item[0] for item in batch]
+        keys = [item[0] for item in batch]
         captions = [item[1] for item in batch]
 
         # Check which embeddings already exist
         to_process_ids = []
         to_process_captions = []
-        for emb_id, caption in zip(embedding_ids, captions):
-            out_path = output_dir / f"{emb_id}.pt"
+        to_process_paths = []
+        for key, caption in zip(keys, captions):
+            out_path = _out_path(output_dir, key)
             if not out_path.exists():
-                to_process_ids.append(emb_id)
+                to_process_ids.append(key)
                 to_process_captions.append(caption)
+                to_process_paths.append(out_path)
 
         if not to_process_ids:
             continue
 
-        # Process text through CLAP
-        inputs = processor(
-            text=to_process_captions,
-            padding=True,
-            truncation=True,
-            return_tensors="pt"
-        ).to(device)
-
-        text_embeds = model.get_text_features(**inputs)
+        clap_embeds, clap_last_hidden, clap_lens = encode_clap_text(model, processor, to_process_captions, device)
+        t5_last_hidden, t5_lens = encode_t5_tokens(t5_tok, t5_enc, to_process_captions, device)
 
         # Save embeddings
-        for emb_id, text_embed in zip(to_process_ids, text_embeds):
-            out_path = output_dir / f"{emb_id}.pt"
+        for i, out_path in enumerate(to_process_paths):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            Lc = int(clap_lens[i].item())
+            Lt = int(t5_lens[i].item())
             payload = {
-                "text_embedding": text_embed.cpu().to(torch.float32),
+                "clap_embedding": clap_embeds[i].cpu().to(torch.float32),                    # [512], normalized
+                "clap_last_hidden": clap_last_hidden[i, :Lc].cpu().to(torch.float32),        # [Lc, 768], no padding
+                "clap_len": Lc,
+                "flan_t5_last_hidden": t5_last_hidden[i, :Lt].cpu().to(torch.float32),       # [Lt, 1024], no padding
+                "flan_t5_len": Lt,
             }
 
             tmp_path = str(out_path) + ".tmp"

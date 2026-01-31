@@ -24,6 +24,7 @@ class HFParquetAudioDataset(Dataset):
         cache_dir: str | None,
         out_root: Path,
         min_duration_seconds: float,
+        max_duration_seconds: float,
         done_cache: set[str] | None = None,
     ):
         self.hf_name = hf_name
@@ -31,7 +32,14 @@ class HFParquetAudioDataset(Dataset):
         self.ds = load_dataset(hf_name, data_dir=data_dir, split=split, cache_dir=cache_dir)
         self.out_root = out_root
         self.min_duration_seconds = float(min_duration_seconds)
+        self.max_duration_seconds = float(max_duration_seconds)
         self.done = done_cache or set()
+
+    def _non_silence_ratio(self, wav: torch.Tensor) -> float:
+        non_silent = wav.abs() > 1e-4
+        if non_silent.ndim == 2:
+            non_silent = non_silent.any(dim=0)
+        return non_silent.float().mean().item()
 
     def __len__(self):
         return len(self.ds)
@@ -56,8 +64,25 @@ class HFParquetAudioDataset(Dataset):
 
         x = x.clamp_(-1, 1)
 
-        if x.shape[-1] < self.min_duration_seconds * float(sr):
+        num_frames = x.shape[-1]
+        min_frames = int(self.min_duration_seconds * float(sr))
+        if num_frames < min_frames:
+            print(f"too short, skipping: {uid}")
             return None
+        max_frames = int(self.max_duration_seconds * float(sr))
+        if max_frames > 0 and num_frames > max_frames:
+            print(f"file too long, taking random 10min crop: {path}")
+            max_start = num_frames - max_frames
+            found = False
+            for _ in range(10):
+                start = torch.randint(0, max_start + 1, (1,)).item() if max_start > 0 else 0
+                seg = x[:, start : start + max_frames]
+                if self._non_silence_ratio(seg) >= 0.7:
+                    x = seg
+                    found = True
+                    break
+            if not found:
+                x = seg
 
         return str(uid), x, sr, str(out_path)
 
@@ -99,7 +124,8 @@ def get_args_parser():
     parser.add_argument("--batch_size", default=1, type=int)
     parser.add_argument("--chunk_size_latents", default=1024, type=int)
     parser.add_argument("--overlap_latents", default=12, type=int)
-    parser.add_argument("--min_duration_seconds", default=10.0, type=float)
+    parser.add_argument("--min_duration_seconds", default=0.05, type=float)
+    parser.add_argument("--max_duration_seconds", default=600.0, type=float)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--no_deterministic", action="store_false", dest="deterministic")
     parser.set_defaults(deterministic=True)
@@ -152,6 +178,7 @@ def main(args):
         cache_dir=args.hf_cache_dir,
         out_root=out_root,
         min_duration_seconds=args.min_duration_seconds,
+        max_duration_seconds=args.max_duration_seconds,
         done_cache=done_cache,
     )
     if rank == 0:
