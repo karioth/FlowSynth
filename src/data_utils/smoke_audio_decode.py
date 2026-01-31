@@ -8,7 +8,7 @@ import torchaudio
 import dacvae
 
 
-DEFAULT_IN_DIR = "/share/users/student/f/friverossego/datasets/audio_caps/validation/audio_latents"
+DEFAULT_IN_DIR = "/share/users/student/f/friverossego/datasets/AudioCaps/train/audio_latents"
 DEFAULT_OUT_DIR = "/share/users/student/f/friverossego/LatentLM/smoketest"
 
 
@@ -53,20 +53,15 @@ def _read_caption_from_manifest(manifest_path: str | None, target_id: str) -> tu
 
 
 def _infer_manifest_path(in_path: str | None, in_dir: str | None) -> str | None:
-    candidates: list[str] = []
     if in_path:
         latents_dir = os.path.dirname(os.path.abspath(in_path))
-        candidates.append(os.path.join(os.path.dirname(latents_dir), "manifest.jsonl"))
-        candidates.append(os.path.join(latents_dir, "manifest.jsonl"))
+        return os.path.join(os.path.dirname(latents_dir), "manifest.jsonl")
     if in_dir:
         dir_path = os.path.abspath(in_dir)
         if os.path.basename(dir_path) == "audio_latents":
-            candidates.append(os.path.join(os.path.dirname(dir_path), "manifest.jsonl"))
-        candidates.append(os.path.join(dir_path, "manifest.jsonl"))
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return candidates[0] if candidates else None
+            return os.path.join(os.path.dirname(dir_path), "manifest.jsonl")
+        return os.path.join(dir_path, "manifest.jsonl")
+    return None
 
 
 def _sample_pt_from_dir(dir_path: str) -> str:
@@ -89,6 +84,7 @@ def _sample_pt_from_dir(dir_path: str) -> str:
     return choice
 
 
+@torch.no_grad()
 def main() -> None:
     parser = argparse.ArgumentParser(description="Decode cached DACVAE latents to audio.")
     parser.add_argument("--in_path", default=None, type=str,
@@ -97,10 +93,6 @@ def main() -> None:
                         help="Directory to sample a .pt file from when --in_path is omitted")
     parser.add_argument("--out_dir", default=DEFAULT_OUT_DIR, type=str,
                         help="Output directory for decoded audio")
-    parser.add_argument("--manifest_path", default=None, type=str,
-                        help="Optional path to manifest.jsonl (defaults to sibling of audio_latents)")
-    parser.add_argument("--sidecar_path", default=None, type=str,
-                        help="Deprecated alias for --manifest_path")
     args = parser.parse_args()
 
     from src.data_utils.audio_utils import decode_audio_latents
@@ -144,9 +136,7 @@ def main() -> None:
     _save_audio(mean_path, mean_audio, int(model.sample_rate))
     _save_audio(sample_path, sample_audio, int(model.sample_rate))
 
-    manifest_path = args.manifest_path or args.sidecar_path
-    if manifest_path is None:
-        manifest_path = _infer_manifest_path(args.in_path, args.in_dir)
+    manifest_path = _infer_manifest_path(args.in_path, args.in_dir)
 
     target_id = os.path.splitext(os.path.basename(args.in_path))[0]
     caption, status = _read_caption_from_manifest(manifest_path, target_id)

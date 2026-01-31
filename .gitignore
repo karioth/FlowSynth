@@ -13,16 +13,16 @@ __pycache__/
 *.sh
 lightning_logs/
 wandb/
-logs*/
+
 
 # Experiment outputs
 results*/
-samples*/
+*samples*/
 pretrained_models/
-visuals*/
+
 smoke*/
 # Docs
 *.md
 !README.md
 ardit_animation.py
-audio_samples/
+*logs*/
