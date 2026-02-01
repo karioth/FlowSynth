@@ -25,6 +25,9 @@ class LitModule(L.LightningModule):
         num_classes: int = 1000,
         conditioning_type: str = "class",
         conditioning_dim: int | None = None,
+        clap_dim: int = 512,
+        t5_dim: int = 1024,
+        prompt_seq_len: int = 69,
         prediction_type: str = "flow",
         t_m: float = 0.0,
         t_s: float = 1.0,
@@ -46,13 +49,20 @@ class LitModule(L.LightningModule):
                 seq_len = input_size * input_size
         self.save_hyperparameters()
 
-        self.model = All_models[model_name](
+        model_kwargs = dict(
             seq_len=seq_len,
             in_channels=latent_size,
             num_classes=num_classes,
             conditioning_type=conditioning_type,
             conditioning_dim=conditioning_dim,
         )
+        if conditioning_type == "continuous":
+            model_kwargs.update(
+                clap_dim=clap_dim,
+                t5_dim=t5_dim,
+                prompt_seq_len=prompt_seq_len,
+            )
+        self.model = All_models[model_name](**model_kwargs)
 
         if isinstance(self.model, Transformer):
             self.noise_scheduler = FlowMatchingSchedulerTransformer(

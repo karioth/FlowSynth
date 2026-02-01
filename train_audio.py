@@ -12,16 +12,48 @@ from src.lightning import LitModule, EMAWeightAveraging
 from src.data_utils.audio_datamodule import CachedAudioDataModule
 
 
+def _parse_manifest_paths(values: list[str] | None) -> list[str]:
+    if not values:
+        raise ValueError("No manifest paths provided")
+    manifest_paths = []
+    for value in values:
+        if value is None:
+            continue
+        for item in value.split(","):
+            item = item.strip()
+            if item:
+                manifest_paths.append(item)
+    if not manifest_paths:
+        raise ValueError("No manifest paths provided")
+    for path in manifest_paths:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing manifest: {path}")
+    return manifest_paths
+
+
 def main(args):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
     seed_everything(args.global_seed, workers=True)
 
+    manifest_paths = _parse_manifest_paths(args.manifest_paths)
+    data_root = args.data_root
+
+    silence_path = args.silence_latent_path
+    if not os.path.isabs(silence_path):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        silence_path = os.path.join(script_dir, silence_path)
+    if not os.path.exists(silence_path):
+        raise FileNotFoundError(f"Missing silence latent: {silence_path}")
+
     dm = CachedAudioDataModule(
-        data_path=args.data_path,
+        manifest_paths=manifest_paths,
+        data_root=data_root,
+        silence_latent_path=silence_path,
         batch_size=args.batch_size,
-        seq_len=args.seq_len,
+        target_seq_len=args.seq_len,
+        max_t5_tokens=args.prompt_seq_len - 1,
         num_workers=args.num_workers,
     )
 
@@ -31,7 +63,9 @@ def main(args):
         latent_size=args.latent_size,
         num_classes=1,  # unused for continuous conditioning
         conditioning_type=args.conditioning_type,
-        conditioning_dim=args.conditioning_dim,
+        clap_dim=args.clap_dim,
+        t5_dim=args.t5_dim,
+        prompt_seq_len=args.prompt_seq_len,
         prediction_type=args.prediction_type,
         batch_mul=args.batch_mul,
         mask_prob_min=args.mask_prob_min,
@@ -77,8 +111,24 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--data-path", type=str, required=True,
-                   help="Path to cached audio latents (audioset_FBdacvae)")
+    p.add_argument(
+        "--manifest-paths",
+        action="append",
+        default=["/share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl"],
+        help="JSONL manifest paths (repeatable or comma-separated)",
+    )
+    p.add_argument(
+        "--data-root",
+        type=str,
+        default="/share/users/student/f/friverossego/datasets",
+        help="Base directory for relative manifest entries",
+    )
+    p.add_argument(
+        "--silence-latent-path",
+        type=str,
+        default="silence_samples/silence_10s_dacvae.pt",
+        help="Path to silence latent for padding",
+    )
     p.add_argument("--results-dir", type=str, default="results_audio")
 
     p.add_argument("--model", type=str, default="MaskedAR-L")
@@ -88,8 +138,12 @@ if __name__ == "__main__":
                    help="DACVAE latent dim (128, moments=256)")
     p.add_argument("--conditioning-type", type=str, default="continuous",
                    help="Conditioning type: 'class' or 'continuous'")
-    p.add_argument("--conditioning-dim", type=int, default=512,
-                   help="CLAP embedding dimension")
+    p.add_argument("--clap-dim", type=int, default=512,
+                   help="CLAP pooled embedding dimension")
+    p.add_argument("--t5-dim", type=int, default=1024,
+                   help="T5 hidden state dimension")
+    p.add_argument("--prompt-seq-len", type=int, default=69,
+                   help="Prompt sequence length (1 CLAP + max T5 tokens)")
     p.add_argument("--prediction-type", type=str, default="flow")
     p.add_argument("--batch-mul", type=int, default=2)
     p.add_argument("--mask-prob-min", type=float, default=0.5)

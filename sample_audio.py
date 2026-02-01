@@ -28,6 +28,14 @@ def parse_args():
                         help="Path to DACVAE weights (default: facebook/dacvae-watermarked)")
     parser.add_argument("--clap-model", type=str, default="laion/larger_clap_music",
                         help="HuggingFace CLAP model ID")
+    parser.add_argument("--t5-model", type=str, default="google/flan-t5-large",
+                        help="HuggingFace T5 model ID")
+    parser.add_argument("--max-t5-tokens", type=int, default=None,
+                        help="Maximum T5 tokens (defaults to prompt_seq_len - 1)")
+    parser.add_argument("--clap-dim", type=int, default=512,
+                        help="CLAP pooled embedding dimension")
+    parser.add_argument("--t5-dim", type=int, default=1024,
+                        help="T5 hidden state dimension")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--precision",
@@ -44,7 +52,7 @@ def parse_args():
     parser.add_argument("--text-file", type=str, default=None,
                         help="File with text prompts (one per line)")
     parser.add_argument("--embedding", type=str, default=None,
-                        help="Path to pre-computed CLAP embedding .pt file")
+                        help="Path to pre-computed prompt embeddings (.pt dict with clap/t5/t5_mask)")
     parser.add_argument("--output-dir", type=str, default="audio_samples")
     parser.add_argument("--sample-rate", type=int, default=48000,
                         help="Output sample rate (DACVAE default: 48000)")
@@ -68,16 +76,71 @@ def load_clap_model(model_id: str, device: torch.device):
     return model, processor
 
 
-def get_text_embedding(clap_model, clap_processor, text: str, device: torch.device):
-    inputs = clap_processor(
+def load_t5_model(model_id: str, device: torch.device):
+    from transformers import AutoTokenizer, T5EncoderModel
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = T5EncoderModel.from_pretrained(model_id).eval().to(device)
+    return model, tokenizer
+
+
+def get_text_embeddings(
+    clap_model,
+    clap_processor,
+    t5_model,
+    t5_tokenizer,
+    text: str,
+    device: torch.device,
+    max_t5_tokens: int,
+    clap_dim: int,
+    t5_dim: int,
+):
+    clap_inputs = clap_processor(
         text=[text],
         padding=True,
         truncation=True,
-        return_tensors="pt"
+        return_tensors="pt",
     ).to(device)
     with torch.no_grad():
-        embedding = clap_model.get_text_features(**inputs)
-    return embedding
+        clap_emb = clap_model.get_text_features(**clap_inputs)
+
+    if clap_emb.shape[-1] != clap_dim:
+        raise ValueError(f"Unexpected CLAP dim: {clap_emb.shape[-1]} (expected {clap_dim})")
+
+    t5_inputs = t5_tokenizer(
+        [text],
+        padding=False,
+        truncation=True,
+        max_length=max_t5_tokens,
+        return_tensors="pt",
+    ).to(device)
+    with torch.no_grad():
+        t5_output = t5_model(
+            input_ids=t5_inputs["input_ids"],
+            attention_mask=t5_inputs.get("attention_mask"),
+            return_dict=True,
+        )
+    t5_hidden = t5_output.last_hidden_state[0]
+    if t5_hidden.shape[-1] != t5_dim:
+        raise ValueError(f"Unexpected T5 dim: {t5_hidden.shape[-1]} (expected {t5_dim})")
+
+    actual_len = t5_hidden.shape[0]
+    if actual_len > max_t5_tokens:
+        t5_hidden = t5_hidden[:max_t5_tokens]
+        actual_len = max_t5_tokens
+
+    if actual_len < max_t5_tokens:
+        pad_size = max_t5_tokens - actual_len
+        padding = torch.zeros(pad_size, t5_hidden.shape[1], device=device, dtype=t5_hidden.dtype)
+        t5_hidden = torch.cat([t5_hidden, padding], dim=0)
+
+    t5_mask = torch.zeros(max_t5_tokens, device=device, dtype=torch.bool)
+    t5_mask[:actual_len] = True
+
+    return {
+        "clap": clap_emb,
+        "t5": t5_hidden.unsqueeze(0),
+        "t5_mask": t5_mask.unsqueeze(0),
+    }
 
 
 def load_dacvae(weights_path: str, device: torch.device):
@@ -111,14 +174,53 @@ def main():
     lit.to(device=device)
     lit.eval()
 
+    prompt_seq_len = getattr(lit.hparams, "prompt_seq_len", None)
+    clap_dim = getattr(lit.hparams, "clap_dim", args.clap_dim)
+    t5_dim = getattr(lit.hparams, "t5_dim", args.t5_dim)
+    if args.max_t5_tokens is not None:
+        max_t5_tokens = args.max_t5_tokens
+    elif prompt_seq_len is not None:
+        max_t5_tokens = int(prompt_seq_len) - 1
+    else:
+        max_t5_tokens = 68
+
     # Get prompts
     if args.embedding is not None:
-        # Use pre-computed embedding
+        # Use pre-computed embeddings
         print(f"Loading embedding from {args.embedding}")
         embeddings = torch.load(args.embedding, map_location=device)
-        if embeddings.dim() == 1:
-            embeddings = embeddings.unsqueeze(0)
-        prompts = [f"embedding_{i}" for i in range(len(embeddings))]
+        if not isinstance(embeddings, dict):
+            raise ValueError("Expected embedding file to be a dict with keys: clap, t5, t5_mask")
+        if not {"clap", "t5", "t5_mask"}.issubset(embeddings):
+            raise ValueError("Embedding dict missing required keys: clap, t5, t5_mask")
+
+        clap = embeddings["clap"].to(device)
+        t5 = embeddings["t5"].to(device)
+        t5_mask = embeddings["t5_mask"].to(device)
+
+        if clap.dim() == 1:
+            clap = clap.unsqueeze(0)
+        if t5.dim() == 2:
+            t5 = t5.unsqueeze(0)
+        if t5_mask.dim() == 1:
+            t5_mask = t5_mask.unsqueeze(0)
+
+        if clap.shape[-1] != clap_dim:
+            raise ValueError(f"Unexpected CLAP dim: {clap.shape[-1]} (expected {clap_dim})")
+        if t5.shape[-1] != t5_dim:
+            raise ValueError(f"Unexpected T5 dim: {t5.shape[-1]} (expected {t5_dim})")
+        if t5.shape[1] != max_t5_tokens or t5_mask.shape[1] != max_t5_tokens:
+            raise ValueError("T5 sequence length does not match max_t5_tokens")
+
+        prompts = [f"embedding_{i}" for i in range(clap.shape[0])]
+        all_prompt_data = [
+            {
+                "clap": clap[i : i + 1],
+                "t5": t5[i : i + 1],
+                "t5_mask": t5_mask[i : i + 1],
+            }
+            for i in range(clap.shape[0])
+        ]
     else:
         # Get text prompts
         if args.text is not None:
@@ -133,16 +235,29 @@ def main():
         print(f"Loading CLAP model: {args.clap_model}")
         clap_model, clap_processor = load_clap_model(args.clap_model, device)
 
-        # Generate embeddings for all prompts
-        print("Generating CLAP embeddings...")
-        embeddings = []
-        for prompt in prompts:
-            emb = get_text_embedding(clap_model, clap_processor, prompt, device)
-            embeddings.append(emb)
-        embeddings = torch.cat(embeddings, dim=0)
+        # Load T5 model
+        print(f"Loading T5 model: {args.t5_model}")
+        t5_model, t5_tokenizer = load_t5_model(args.t5_model, device)
 
-        # Free CLAP model memory
-        del clap_model, clap_processor
+        # Generate embeddings for all prompts
+        print("Generating prompt embeddings...")
+        all_prompt_data = []
+        for prompt in prompts:
+            prompt_data = get_text_embeddings(
+                clap_model,
+                clap_processor,
+                t5_model,
+                t5_tokenizer,
+                prompt,
+                device,
+                max_t5_tokens=max_t5_tokens,
+                clap_dim=clap_dim,
+                t5_dim=t5_dim,
+            )
+            all_prompt_data.append(prompt_data)
+
+        # Free CLAP/T5 model memory
+        del clap_model, clap_processor, t5_model, t5_tokenizer
         torch.cuda.empty_cache()
 
     # Load DACVAE for decoding
@@ -153,10 +268,10 @@ def main():
 
     # Generate samples
     print(f"Generating {len(prompts)} audio samples...")
-    for i, (prompt, embedding) in enumerate(tqdm(zip(prompts, embeddings), total=len(prompts))):
+    for i, (prompt, prompt_data) in enumerate(tqdm(zip(prompts, all_prompt_data), total=len(prompts))):
         with autocast:
             latents = lit.sample_latents(
-                embedding.unsqueeze(0) if embedding.dim() == 1 else embedding,
+                prompt_data,
                 cfg_scale=args.cfg_scale,
                 num_inference_steps=args.num_inference_steps,
             )

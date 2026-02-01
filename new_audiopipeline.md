@@ -5,6 +5,8 @@ Update LatentLM audio training pipeline to support:
 1. New dataset structure (WavCaps/AudioCaps with separate text_embeddings and audio_latents folders)
 2. 69-token prompt conditioning (pooled CLAP + T5 hidden states)
 3. Variable-length audio with silence padding/random cropping
+4. Repurpose `conditioning_type="continuous"` to CLAP+T5 sequence prompts (no backward compat)
+5. Manifest-driven dataloader (JSONL pairs) to avoid filesystem scans at train time
 
 ---
 
@@ -12,11 +14,11 @@ Update LatentLM audio training pipeline to support:
 
 ### 1. `src/data_utils/audio_datamodule.py`
 Create new `MultiSourceAudioDataset` class:
-- Load from multiple dataset sources (WavCaps subsets + AudioCaps train)
-- Match audio_latents/*.pt with text_embeddings/*.pt by filename
+- Load from one or more JSONL manifests (each line provides audio/text paths)
 - Audio handling:
   - Shorter than 251: pad with silence from `silence_samples/silence_10s_dacvae.pt`
   - Longer than 251: random crop
+  - Trim `posterior_params` to `latent_length` before pad/crop
 - Text handling:
   - Return dict with `clap` [512], `t5` [68, 1024], `t5_len`
   - Pad T5 to 68 tokens if shorter, truncate if longer
@@ -45,29 +47,33 @@ Create new `SequencePromptEmbedder` class:
 
 ### 5. `src/models/Transformer.py`
 - Replace `ContinuousEmbedder` with `SequencePromptEmbedder`
-- `forward_parallel`: prepend 69 tokens, shift input by 69 instead of 1
-- `forward_recurrent`: process 69 prompt tokens at start_pos=0
+- `forward_parallel`: prepend prompt tokens, keep shift-by-1, then drop first `prompt_seq_len - 1` outputs to return `seq_len`
+- `forward_recurrent`: process prompt sequence at `start_pos=0`; subsequent tokens use offset `start_pos = prompt_seq_len - 1 + i`
 
 ### 6. `src/models/MaskedAR.py`
 - Replace `ContinuousEmbedder` with `SequencePromptEmbedder`
 - `forward_backbone`: prepend 69 tokens, remove after blocks
-- `forward_recurrent`: handle 69 prompt tokens at position 0
+- `forward_recurrent`: handle 69 prompt tokens at position 0; sampling offsets use `start_pos = prompt_seq_len + i - 1`
 
 ### 7. `src/lightning.py`
 - Add params: `clap_dim`, `t5_dim`, `prompt_seq_len`
-- Add `conditioning_type="sequence"` handling
+- Repurpose `conditioning_type="continuous"` to CLAP+T5 sequence prompts
 - `training_step`: unpack `prompt_data` dict
 
 ### 8. `train_audio.py`
 New arguments:
-- `--wavcaps-root` (default: /share/users/student/f/friverossego/datasets/WavCaps)
-- `--audiocaps-root` (default: /share/users/student/f/friverossego/datasets/AudioCaps)
+- `--manifest-paths` (comma-separated or repeatable JSONL manifest files)
+- `--data-root` (default: /share/users/student/f/friverossego/datasets)
 - `--silence-latent-path` (default: silence_samples/silence_10s_dacvae.pt)
 - `--clap-dim` (512), `--t5-dim` (1024), `--prompt-seq-len` (69)
 
-Build dataset configs for WavCaps subsets (AudioSet_SL, BBC_Sound_Effects, FreeSound, SoundBible) + AudioCaps train
+Manifest generator will build the JSONL from WavCaps subsets (AudioSet_SL, BBC_Sound_Effects, FreeSound, SoundBible) + AudioCaps train
 
-### 9. `sample_audio.py`
+### 9. `scripts/build_audio_manifest.py` (new)
+- Scan dataset roots once and write JSONL entries with paired audio/text paths
+- Encodes `source` (e.g., "WavCaps/FreeSound") for optional filtering or weighting
+
+### 10. `sample_audio.py`
 - Add T5 model loading (`google/flan-t5-large`)
 - New `get_text_embeddings()` function returning dict with clap/t5/t5_len
 - Pass dict to `sample_latents()` instead of single tensor
@@ -75,6 +81,9 @@ Build dataset configs for WavCaps subsets (AudioSet_SL, BBC_Sound_Effects, FreeS
 ---
 
 ## Implementation Order
+
+0. **Manifest Generator** - `scripts/build_audio_manifest.py`
+   - Build JSONL manifests for all sources
 
 1. **Data Pipeline** - `audio_datamodule.py`
    - Test loading independently before model changes
@@ -113,6 +122,56 @@ Build dataset configs for WavCaps subsets (AudioSet_SL, BBC_Sound_Effects, FreeS
 
 ---
 
+# Step 0: Manifest Generator - Detailed Plan
+
+## File: `scripts/build_audio_manifest.py`
+
+### Purpose
+Create a JSONL manifest with paired audio/text embeddings so the dataloader does not scan the filesystem.
+
+### Expected data layout
+```
+/share/users/student/f/friverossego/datasets/
+  AudioCaps/{train,val,test}/{audio_latents,text_embeddings}
+  WavCaps/{AudioSet_SL,BBC_Sound_Effects,FreeSound,SoundBible}/{audio_latents,text_embeddings}
+```
+
+### CLI Sketch
+```python
+parser.add_argument("--data-root", required=True)
+parser.add_argument("--wavcaps-subsets", default="AudioSet_SL,BBC_Sound_Effects,FreeSound,SoundBible")
+parser.add_argument("--audiocaps-splits", default="train")
+parser.add_argument("--output", required=True)
+```
+
+### Output format
+Each line is a JSON object with relative paths (from `--data-root`):
+```json
+{"audio_path":"WavCaps/FreeSound/audio_latents/000000123.pt","text_path":"WavCaps/FreeSound/text_embeddings/000000123.pt","source":"WavCaps/FreeSound"}
+```
+
+### Pseudocode
+```python
+for subset in wavcaps_subsets:
+    root = data_root / "WavCaps" / subset
+    for audio_path in (root / "audio_latents").rglob("*.pt"):
+        rel = audio_path.relative_to(data_root)
+        text_rel = Path(str(rel).replace("/audio_latents/", "/text_embeddings/"))
+        text_path = data_root / text_rel
+        if text_path.exists():
+            write_jsonl({"audio_path": str(rel), "text_path": str(text_rel), "source": f"WavCaps/{subset}"})
+
+for split in audiocaps_splits:
+    root = data_root / "AudioCaps" / split
+    ... same logic with source = f"AudioCaps/{split}"
+```
+
+### Verification
+1. Run the script and ensure it writes a non-empty JSONL file.
+2. Spot-check a few entries to confirm paths exist.
+
+---
+
 # Step 1: Data Pipeline - Detailed Plan
 
 ## File: `src/data_utils/audio_datamodule.py`
@@ -133,12 +192,13 @@ class CachedAudioDataset(Dataset):
 class MultiSourceAudioDataset(Dataset):
     """
     Loads audio latents and text embeddings from separate directories.
-    Supports multiple dataset sources (WavCaps subsets + AudioCaps).
+    Supports multiple dataset sources via JSONL manifests.
     """
 
     def __init__(
         self,
-        dataset_roots: list[str],      # List of dataset root paths
+        manifest_paths: list[str],     # JSONL manifest files
+        data_root: str | None,         # Base path for relative entries
         silence_latent_path: str,       # Path to silence_10s_dacvae.pt
         target_seq_len: int = 251,      # Target audio sequence length
         max_t5_tokens: int = 68,        # Max T5 tokens (prompt_seq_len - 1)
@@ -147,14 +207,14 @@ class MultiSourceAudioDataset(Dataset):
 ```
 
 **Constructor logic:**
-1. Load silence latent from `silence_latent_path`
+1. Validate `silence_latent_path` exists, then load silence latent
    - Extract `posterior_params` → transpose to [T, 2C]
    - Store as `self.silence_latent`
-2. For each root in `dataset_roots`:
-   - Scan `{root}/audio_latents/*.pt` for all files
-   - For each audio file, verify matching `{root}/text_embeddings/{same_name}.pt` exists
+2. Load JSONL entries from `manifest_paths`
+   - Each line provides `audio_path` and `text_path` (relative or absolute)
+   - If relative, resolve against `data_root`
    - Store tuples: `(audio_path, text_path)`
-3. Concatenate all file tuples into `self.files`
+3. Concatenate all entries into `self.files`
 
 **`__getitem__` logic:**
 ```python
@@ -166,6 +226,7 @@ def __getitem__(self, idx):
     posterior_params = audio_data["posterior_params"]  # [256, T_var]
     latent_length = audio_data["latent_length"]
     moments = posterior_params.transpose(0, 1)  # [T_var, 256]
+    moments = moments[:latent_length]  # Trim to true length before pad/crop
 
     # 2. Adjust audio length
     moments = self._adjust_audio_length(moments)  # [251, 256]
@@ -268,7 +329,8 @@ def audio_collate_fn(batch: list) -> tuple[torch.Tensor, dict]:
 class CachedAudioDataModule(L.LightningDataModule):
     def __init__(
         self,
-        dataset_roots: list[str],       # NEW: list of roots instead of single path
+        manifest_paths: list[str],      # NEW: one or more JSONL manifests
+        data_root: str | None,          # NEW: base path for relative entries
         silence_latent_path: str,       # NEW
         batch_size: int,
         target_seq_len: int = 251,      # renamed from seq_len
@@ -276,7 +338,8 @@ class CachedAudioDataModule(L.LightningDataModule):
         num_workers: int = 4,
     ):
         super().__init__()
-        self.dataset_roots = dataset_roots
+        self.manifest_paths = manifest_paths
+        self.data_root = data_root
         self.silence_latent_path = silence_latent_path
         self.batch_size = batch_size
         self.target_seq_len = target_seq_len
@@ -286,7 +349,8 @@ class CachedAudioDataModule(L.LightningDataModule):
 
     def setup(self, stage=None):
         self.train_dataset = MultiSourceAudioDataset(
-            dataset_roots=self.dataset_roots,
+            manifest_paths=self.manifest_paths,
+            data_root=self.data_root,
             silence_latent_path=self.silence_latent_path,
             target_seq_len=self.target_seq_len,
             max_t5_tokens=self.max_t5_tokens,
@@ -305,18 +369,35 @@ class CachedAudioDataModule(L.LightningDataModule):
         )
 ```
 
-### Dataset Roots Configuration
+### Manifest Generation
 
-When called from `train_audio.py`, build roots list:
-```python
-dataset_roots = [
-    "/share/users/student/f/friverossego/datasets/WavCaps/AudioSet_SL",
-    "/share/users/student/f/friverossego/datasets/WavCaps/BBC_Sound_Effects",
-    "/share/users/student/f/friverossego/datasets/WavCaps/FreeSound",
-    "/share/users/student/f/friverossego/datasets/WavCaps/SoundBible",
-    "/share/users/student/f/friverossego/datasets/AudioCaps/train",
-]
+Data layout (current setup):
 ```
+/share/users/student/f/friverossego/datasets/
+  AudioCaps/{train,val,test}/{audio_latents,text_embeddings}
+  WavCaps/{AudioSet_SL,BBC_Sound_Effects,FreeSound,SoundBible}/{audio_latents,text_embeddings}
+```
+
+Use a one-time manifest builder to create a JSONL list of paired files:
+```bash
+python scripts/build_audio_manifest.py \
+  --data-root /share/users/student/f/friverossego/datasets \
+  --wavcaps-subsets AudioSet_SL,BBC_Sound_Effects,FreeSound,SoundBible \
+  --audiocaps-splits train \
+  --output /share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl
+```
+
+Each line maps an audio latent to its matching text embedding via relative paths.
+
+### Manifest Format
+
+**Manifest file** (`audio_manifest_train.jsonl`):
+```json
+{"audio_path":"WavCaps/FreeSound/audio_latents/000000123.pt","text_path":"WavCaps/FreeSound/text_embeddings/000000123.pt","source":"WavCaps/FreeSound"}
+```
+
+- Paths are relative to `--data-root` (or absolute if you prefer).
+- Optional fields (if you want): `latent_length`, `t5_len`, `duration_sec`.
 
 ### Data File Formats Reference
 
@@ -352,7 +433,8 @@ dataset_roots = [
 1. **Unit test - file discovery:**
    ```python
    dataset = MultiSourceAudioDataset(
-       dataset_roots=[".../WavCaps/FreeSound"],
+       manifest_paths=[".../audio_manifest_train.jsonl"],
+       data_root="/share/users/student/f/friverossego/datasets",
        silence_latent_path=".../silence_10s_dacvae.pt",
    )
    print(f"Found {len(dataset)} samples")
@@ -384,8 +466,8 @@ dataset_roots = [
 
 5. **Integration test - full dataset:**
    ```python
-   all_roots = [...]  # all 5 dataset roots
-   dataset = MultiSourceAudioDataset(all_roots, silence_path)
+   manifests = ["/share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl"]
+   dataset = MultiSourceAudioDataset(manifests, "/share/users/student/f/friverossego/datasets", silence_path)
    print(f"Total samples: {len(dataset)}")  # Should be ~400k+
    ```
 
@@ -651,6 +733,7 @@ All 4 models share the same pattern:
 2. **New**: `prompt_embedder` outputs [B, 69, hidden_size] → prepend 69 tokens
 
 Key change: **1 token → 69 tokens** everywhere prompt is used.
+Note: `conditioning_type="continuous"` now expects dict prompt_data (CLAP+T5).
 
 ---
 
@@ -673,8 +756,7 @@ if conditioning_type == "continuous":
 
 # New
 if conditioning_type == "continuous":
-    assert conditioning_dim is not None
-    # For backward compat, check if new params provided
+    # continuous now expects dict prompt_data (CLAP+T5)
     clap_dim = kwargs.get("clap_dim", 512)
     t5_dim = kwargs.get("t5_dim", 1024)
     prompt_seq_len = kwargs.get("prompt_seq_len", 69)
@@ -740,7 +822,7 @@ if start_pos == 0:
     hidden_states = prompt_seq  # Already has seq dim
 ```
 
-**Also need to track**: When `start_pos < self.prompt_seq_len`, we're still processing prompt tokens.
+**Also need to track**: After the initial prompt pass, subsequent `start_pos` values should be offset by `prompt_seq_len - 1`.
 
 ### `sample_with_cfg` (lines 334-416)
 
@@ -771,12 +853,10 @@ prompt_drop_ids[batch_size:] = 1  # Second half gets null
 
 **Current:** Loop `for i in range(self.seq_len)` with `start_pos=i`
 
-**New:** Loop `for i in range(self.prompt_seq_len + self.seq_len)` or handle prompt positions specially.
-
-Actually, cleaner approach: Process all 69 prompt tokens at once at position 0, then continue from position 69.
+**New:** Process all prompt tokens at once at `start_pos=0`, then generate tokens with `start_pos = prompt_seq_len + i - 1` for `i >= 1`.
 
 ```python
-# First pass: all 69 prompt tokens at once
+# First pass: all 69 prompt tokens at once (provides conditioning for token 0)
 conditioning = self.forward_recurrent(
     prompt,  # dict
     start_pos=0,
@@ -786,15 +866,17 @@ conditioning = self.forward_recurrent(
 )
 conditioning = conditioning[:, -1:]  # Get the mask position output
 
-# Subsequent passes: same as before, but start_pos begins at 69
-for i in range(self.seq_len):
+# Subsequent passes: write token i-1 at prompt_seq_len + i - 1
+for i in range(1, self.seq_len):
     # ...
     conditioning = self.forward_recurrent(
         recurrent_input,
-        start_pos=self.prompt_seq_len + i,  # Offset by 69
+        start_pos=self.prompt_seq_len + i - 1,
         # ...
     )
 ```
+
+Set `InferenceParams(max_seqlen=self.seq_len + self.prompt_seq_len, ...)` to accommodate prompt + tokens.
 
 ---
 
@@ -875,8 +957,10 @@ hidden_states = torch.cat((label_emb.unsqueeze(1), hidden_states[:, :-1]), dim=1
 **New:**
 ```python
 prompt_seq = self.prompt_embedder(prompt, self.training, force_drop_ids=prompt_drop_ids)  # [B, 69, H]
-# Shift input: drop last 69 tokens to make room for prompt
-hidden_states = torch.cat((prompt_seq, hidden_states[:, :-self.prompt_seq_len]), dim=1)
+# Keep shift-by-1, then drop the first (prompt_seq_len - 1) outputs
+hidden_states = torch.cat((prompt_seq, hidden_states[:, :-1]), dim=1)  # [B, P+T-1, H]
+# ... blocks ...
+hidden_states = hidden_states[:, self.prompt_seq_len - 1:, :]  # back to [B, T, H]
 ```
 
 ### `forward_recurrent` (lines 233-257)
@@ -896,7 +980,9 @@ if start_pos == 0:
 
 ### `sample_with_cfg` (lines 276-321)
 
-Same dict-based CFG handling, plus adjustment for AR loop positions.
+Same dict-based CFG handling, plus:
+- Use `start_pos = (prompt_seq_len - 1) + i` when writing tokens during AR sampling
+- Set `InferenceParams(max_seqlen=self.seq_len + self.prompt_seq_len - 1, ...)`
 
 ---
 
@@ -989,7 +1075,8 @@ def __init__(
 4. **Position encoding compatibility:**
    ```python
    # Verify RoPE handles longer sequences (T+69 instead of T+1)
-   # May need to adjust max_seqlen in InferenceParams
+   # Transformer: InferenceParams max_seqlen = seq_len + prompt_seq_len - 1
+   # MaskedAR: InferenceParams max_seqlen = seq_len + prompt_seq_len
    ```
 
 ---
@@ -998,10 +1085,10 @@ def __init__(
 
 | Model | forward | forward_parallel | forward_recurrent | sample_with_cfg |
 |-------|---------|-----------------|-------------------|-----------------|
-| MaskedAR | N/A (calls backbone) | N/A | ✓ pos 0 → 69 tokens | ✓ dict handling |
+| MaskedAR | N/A (calls backbone) | N/A | ✓ pos 0 → 69 tokens (offset in sampling) | ✓ dict handling |
 | AR_DiT | ✓ 69 tokens + time mod | N/A | N/A | ✓ dict handling |
 | DiT | ✓ 69 tokens | N/A | N/A | ✓ dict handling |
-| Transformer | N/A (calls parallel) | ✓ shift by 69 | ✓ pos 0 → 69 tokens | ✓ dict handling |
+| Transformer | N/A (calls parallel) | ✓ prepend prompt + shift by 1, drop `prompt_seq_len - 1` | ✓ pos 0 → 69 tokens (offset in sampling) | ✓ dict handling |
 
 ---
 
@@ -1019,12 +1106,12 @@ def __init__(
 
 ```python
 # ===== Dataset Configuration (NEW) =====
-p.add_argument("--wavcaps-root", type=str,
-               default="/share/users/student/f/friverossego/datasets/WavCaps",
-               help="Root directory for WavCaps dataset")
-p.add_argument("--audiocaps-root", type=str,
-               default="/share/users/student/f/friverossego/datasets/AudioCaps",
-               help="Root directory for AudioCaps dataset")
+p.add_argument("--manifest-paths", type=str,
+               default="/share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl",
+               help="Comma-separated JSONL manifests for training")
+p.add_argument("--data-root", type=str,
+               default="/share/users/student/f/friverossego/datasets",
+               help="Base directory for relative paths in manifests")
 p.add_argument("--silence-latent-path", type=str,
                default="silence_samples/silence_10s_dacvae.pt",
                help="Path to silence latent for padding")
@@ -1042,36 +1129,21 @@ p.add_argument("--seq-len", type=int, default=251,
                help="Audio sequence length (target for DACVAE latents)")
 p.add_argument("--conditioning-type", type=str, default="continuous",
                help="Conditioning type: 'class' or 'continuous'")
-# Note: --conditioning-dim is no longer used directly, kept for backward compat
+# Note: --conditioning-dim is unused for sequence prompts; kept for CLI parity
 ```
 
-### Build Dataset Roots Function
+### Resolve Manifest Paths
 
 ```python
-def build_dataset_roots(args) -> list[str]:
-    """Build list of dataset root paths for training."""
-    roots = []
-
-    # WavCaps subsets (all for training)
-    wavcaps_subsets = ["AudioSet_SL", "BBC_Sound_Effects", "FreeSound", "SoundBible"]
-    for subset in wavcaps_subsets:
-        subset_path = os.path.join(args.wavcaps_root, subset)
-        if os.path.exists(subset_path):
-            roots.append(subset_path)
-        else:
-            print(f"Warning: WavCaps subset not found: {subset_path}")
-
-    # AudioCaps train split only
-    audiocaps_train = os.path.join(args.audiocaps_root, "train")
-    if os.path.exists(audiocaps_train):
-        roots.append(audiocaps_train)
-    else:
-        print(f"Warning: AudioCaps train not found: {audiocaps_train}")
-
-    if len(roots) == 0:
-        raise ValueError("No dataset roots found!")
-
-    return roots
+def resolve_manifest_paths(args) -> list[str]:
+    """Parse and validate JSONL manifests."""
+    manifests = [p.strip() for p in args.manifest_paths.split(",") if p.strip()]
+    if not manifests:
+        raise ValueError("No manifest paths provided")
+    for path in manifests:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing manifest: {path}")
+    return manifests
 ```
 
 ### Updated main() Function
@@ -1082,18 +1154,22 @@ def main(args):
     torch.backends.cudnn.allow_tf32 = True
     seed_everything(args.global_seed, workers=True)
 
-    # Build dataset configuration
-    dataset_roots = build_dataset_roots(args)
+    # Resolve manifests
+    manifest_paths = resolve_manifest_paths(args)
+    data_root = args.data_root
 
     # Resolve silence latent path (relative to script dir or absolute)
     silence_path = args.silence_latent_path
     if not os.path.isabs(silence_path):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         silence_path = os.path.join(script_dir, silence_path)
+    if not os.path.exists(silence_path):
+        raise FileNotFoundError(f"Missing silence latent: {silence_path}")
 
     # Create datamodule with new structure
     dm = CachedAudioDataModule(
-        dataset_roots=dataset_roots,
+        manifest_paths=manifest_paths,
+        data_root=data_root,
         silence_latent_path=silence_path,
         batch_size=args.batch_size,
         target_seq_len=args.seq_len,
@@ -1140,7 +1216,7 @@ class LitModule(L.LightningModule):
         latent_size: int = 16,
         num_classes: int = 1000,
         conditioning_type: str = "class",
-        conditioning_dim: int | None = None,  # Keep for backward compat
+        conditioning_dim: int | None = None,  # Unused for sequence prompts; kept for CLI parity
         # ===== NEW PARAMS =====
         clap_dim: int = 512,
         t5_dim: int = 1024,
@@ -1275,9 +1351,9 @@ No changes needed in schedulers - they just pass prompt through.
 
 2. **Dataset root discovery:**
    ```python
-   # Verify all 5 roots are found
-   roots = build_dataset_roots(args)
-   assert len(roots) == 5
+   # Verify manifest resolves and exists
+   manifests = resolve_manifest_paths(args)
+   assert len(manifests) >= 1
    ```
 
 3. **Single training step:**
@@ -1301,8 +1377,8 @@ No changes needed in schedulers - they just pass prompt through.
 4. **Full integration test:**
    ```bash
    python train_audio.py \
-       --wavcaps-root /path/to/WavCaps \
-       --audiocaps-root /path/to/AudioCaps \
+       --manifest-paths /share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl \
+       --data-root /share/users/student/f/friverossego/datasets \
        --batch-size 2 \
        --epochs 1 \
        --log-every 1
@@ -1332,6 +1408,7 @@ parser.add_argument("--clap-dim", type=int, default=512,
                     help="CLAP pooled embedding dimension")
 parser.add_argument("--t5-dim", type=int, default=1024,
                     help="T5 hidden state dimension")
+# Prefer checkpoint hparams (prompt_seq_len/clap_dim/t5_dim) when available; CLI overrides if set
 ```
 
 ### Load T5 Model Function
@@ -1434,6 +1511,12 @@ def main():
     lit.to(device=device)
     lit.eval()
 
+    # Prefer checkpoint dims to avoid mismatch
+    prompt_seq_len = getattr(lit.hparams, "prompt_seq_len", args.max_t5_tokens + 1)
+    clap_dim = getattr(lit.hparams, "clap_dim", args.clap_dim)
+    t5_dim = getattr(lit.hparams, "t5_dim", args.t5_dim)
+    max_t5_tokens = args.max_t5_tokens or (prompt_seq_len - 1)
+
     # ===== Get Prompts =====
     if args.embedding is not None:
         # Load pre-computed embeddings (must be in new dict format)
@@ -1476,9 +1559,9 @@ def main():
                 clap_model, clap_processor,
                 t5_model, t5_tokenizer,
                 prompt, device,
-                max_t5_tokens=args.max_t5_tokens,
-                clap_dim=args.clap_dim,
-                t5_dim=args.t5_dim,
+                max_t5_tokens=max_t5_tokens,
+                clap_dim=clap_dim,
+                t5_dim=t5_dim,
             )
             all_prompt_data.append(prompt_data)
 
