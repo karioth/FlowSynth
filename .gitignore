@@ -10,7 +10,7 @@ __pycache__/
 # Logs
 *.out
 *.err
-*.sh
+
 lightning_logs/
 wandb/
 
@@ -22,8 +22,6 @@ pretrained_models/
 
 smoke*/
 # Docs
-*.md
-!README.md
 ardit_animation.py
 *logs*/
 *debug*/
