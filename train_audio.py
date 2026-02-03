@@ -153,7 +153,7 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
     p.add_argument("--global-seed", type=int, default=0)
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=12)
 
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--ckpt-every", type=int, default=5000)

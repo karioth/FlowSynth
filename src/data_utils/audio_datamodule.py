@@ -5,7 +5,8 @@ from pathlib import Path
 import torch
 import lightning as L
 
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
+from torchdata.stateful_dataloader import StatefulDataLoader as DataLoader
 
 
 class MultiSourceAudioDataset(Dataset):
@@ -194,6 +195,7 @@ class CachedAudioDataModule(L.LightningDataModule):
             persistent_workers=self.num_workers > 0,
             drop_last=True,
             collate_fn=audio_collate_fn,
+            in_order=False, ## we need this beacuse some latents are very big, and take longer to load. So the gpu starves waiting for those batches.
         )
 
 

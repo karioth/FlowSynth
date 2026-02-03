@@ -15,7 +15,7 @@ PROJECT_ROOT="/share/users/student/f/friverossego/LatentLM"
 
 module purge 2>/dev/null || true
 
-SCRATCH_BASE="/share/users/student/f/friverossego/tmp"
+SCRATCH_BASE="/share/users/student/d/dguen/tmp"
 export TMPDIR="${SLURM_TMPDIR:-$SCRATCH_BASE/tmp}"
 export TORCHINDUCTOR_CACHE_DIR="$SCRATCH_BASE/torchinductor"
 export TRITON_CACHE_DIR="$SCRATCH_BASE/triton"

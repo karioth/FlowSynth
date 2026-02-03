@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -22,6 +23,11 @@ def _ensure_pt(name: str) -> str:
     if name.endswith(".pt"):
         return name
     return f"{name}.pt"
+
+
+def _hash_prefix(value: str, prefix_len: int) -> str:
+    digest = hashlib.md5(value.encode("utf-8")).hexdigest()
+    return digest[:prefix_len]
 
 
 def _iter_manifest_entries(manifest_path: Path):
@@ -47,6 +53,7 @@ def _write_source(
     rel_root: Path,
     manifest_path: Path,
     latents_dir: str,
+    hash_prefix_len: int,
     verify_exists: bool,
     skip_missing: bool,
     source_label: str,
@@ -56,7 +63,11 @@ def _write_source(
 
     for key, entry in _iter_manifest_entries(manifest_path):
         filename = _ensure_pt(key)
-        latent_rel = rel_root / latents_dir / filename
+        if hash_prefix_len > 0:
+            bucket = _hash_prefix(key, hash_prefix_len)
+            latent_rel = rel_root / latents_dir / bucket / filename
+        else:
+            latent_rel = rel_root / latents_dir / filename
 
         if verify_exists:
             latent_abs = data_root / latent_rel
@@ -124,6 +135,13 @@ def main() -> None:
         help="Merged latents directory name",
     )
     parser.add_argument(
+        "--hash-prefix-len",
+        type=int,
+        default=0,
+        help="If > 0, hash each key and insert a subdir of this hex length "
+             "(e.g., 2 => 256 buckets) under latents-dir.",
+    )
+    parser.add_argument(
         "--verify-exists",
         action="store_true",
         help="Check that each audio/text file exists",
@@ -138,6 +156,8 @@ def main() -> None:
     data_root = Path(args.data_root).expanduser().resolve()
     if not data_root.exists():
         raise FileNotFoundError(f"Missing data root: {data_root}")
+    if args.hash_prefix_len < 0 or args.hash_prefix_len > 32:
+        raise ValueError("--hash-prefix-len must be between 0 and 32")
 
     wavcaps_subsets = _parse_csv(args.wavcaps_subsets)
     audiocaps_splits = _parse_csv(args.audiocaps_splits)
@@ -161,6 +181,7 @@ def main() -> None:
                 rel_root=rel_root,
                 manifest_path=manifest_path,
                 latents_dir=args.latents_dir,
+                hash_prefix_len=args.hash_prefix_len,
                 verify_exists=args.verify_exists,
                 skip_missing=args.skip_missing,
                 source_label=source_label,
@@ -181,6 +202,7 @@ def main() -> None:
                 rel_root=rel_root,
                 manifest_path=manifest_path,
                 latents_dir=args.latents_dir,
+                hash_prefix_len=args.hash_prefix_len,
                 verify_exists=args.verify_exists,
                 skip_missing=args.skip_missing,
                 source_label=source_label,
