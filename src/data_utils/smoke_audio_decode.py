@@ -8,7 +8,7 @@ import torchaudio
 import dacvae
 
 
-DEFAULT_IN_DIR = "/share/users/student/f/friverossego/datasets/AudioCaps/train/audio_latents"
+DEFAULT_IN_DIR = "/share/users/student/f/friverossego/datasets/AudioCaps/train/latents"
 DEFAULT_OUT_DIR = "/share/users/student/f/friverossego/LatentLM/smoketest"
 
 
@@ -58,7 +58,7 @@ def _infer_manifest_path(in_path: str | None, in_dir: str | None) -> str | None:
         return os.path.join(os.path.dirname(latents_dir), "manifest.jsonl")
     if in_dir:
         dir_path = os.path.abspath(in_dir)
-        if os.path.basename(dir_path) == "audio_latents":
+        if os.path.basename(dir_path) == "latents":
             return os.path.join(os.path.dirname(dir_path), "manifest.jsonl")
         return os.path.join(dir_path, "manifest.jsonl")
     return None

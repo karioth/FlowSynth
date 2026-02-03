@@ -2,7 +2,6 @@ import json
 import os
 import random
 from pathlib import Path
-from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -21,9 +20,7 @@ from sample_audio import load_clap_model, load_t5_model, get_text_embeddings, lo
 
 
 # Hardcode paths here
-MANIFEST_PATHS = [
-    "/share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl",
-]
+MANIFEST_PATHS = ["/share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl"]
 DATA_ROOT = "/share/users/student/f/friverossego/datasets"
 SILENCE_LATENT_PATH = "silence_samples/silence_10s_dacvae.pt"
 CAPTION_MANIFEST_PATH = "/share/users/student/f/friverossego/datasets/WavCaps/AudioSet_SL/manifest.jsonl"
@@ -36,6 +33,8 @@ USE_MANIFEST_CAPTION = True
 # Optional filters
 SOURCE_FILTER = "AudioSet_SL"
 SELECT_KEY = None
+NUM_SAMPLES = 8
+MAX_SCAN = 20000
 
 # Models and dims
 CLAP_MODEL_ID = "laion/larger_clap_music"
@@ -56,7 +55,7 @@ NUM_HEADS = 8
 CLASS_DROPOUT_PROB = 0.1
 
 # Model switch
-MODEL_KIND = "MaskedAR"  # Options: DiT, Transformer, AR_DiT, MaskedAR
+MODEL_KIND = "DiT"  # Options: DiT, Transformer, AR_DiT, MaskedAR
 DIFFUSION_DEPTH = 2
 BATCH_MUL = 1
 MASK_PROB_MIN = 0.5
@@ -104,10 +103,15 @@ def _iter_manifest_entries(manifest_paths: list[str]):
                 yield json.loads(stripped)
 
 
-def _select_sample():
+def _select_samples():
     select_key_lower = SELECT_KEY.lower() if isinstance(SELECT_KEY, str) else None
+    selected = []
+    scanned = 0
 
     for entry in _iter_manifest_entries(MANIFEST_PATHS):
+        if MAX_SCAN > 0 and scanned >= MAX_SCAN:
+            break
+        scanned += 1
         entry_key = entry.get("key") or entry.get("id")
         entry_key_str = str(entry_key) if entry_key is not None else ""
         entry_key_base = os.path.splitext(os.path.basename(entry_key_str))[0]
@@ -120,21 +124,16 @@ def _select_sample():
             if source is not None and SOURCE_FILTER not in source:
                 continue
 
-        audio_path = _resolve_path(entry["audio_path"], DATA_ROOT)
-        text_path = _resolve_path(entry["text_path"], DATA_ROOT)
-        if not os.path.exists(audio_path):
+        latent_path = _resolve_path(entry["path"], DATA_ROOT)
+        if not os.path.exists(latent_path):
             if select_key_lower is not None:
-                raise FileNotFoundError(f"Missing audio for SELECT_KEY={SELECT_KEY}: {audio_path}")
-            continue
-        if not os.path.exists(text_path):
-            if select_key_lower is not None:
-                raise FileNotFoundError(f"Missing text for SELECT_KEY={SELECT_KEY}: {text_path}")
+                raise FileNotFoundError(f"Missing latent for SELECT_KEY={SELECT_KEY}: {latent_path}")
             continue
 
-        audio_data = torch.load(audio_path, map_location="cpu", weights_only=True)
-        posterior_params = audio_data["posterior_params"]
+        data = torch.load(latent_path, map_location="cpu", weights_only=True)
+        posterior_params = data["posterior_params"]
         moments = posterior_params.transpose(0, 1)
-        latent_length = int(audio_data.get("latent_length", moments.shape[0]))
+        latent_length = int(data.get("latent_length", moments.shape[0]))
         if latent_length != SEQ_LEN:
             if select_key_lower is not None:
                 raise RuntimeError(
@@ -142,16 +141,35 @@ def _select_sample():
                 )
             continue
 
-        sample_key = entry_key_base or os.path.splitext(os.path.basename(audio_path))[0]
+        sample_key = entry_key_base or os.path.splitext(os.path.basename(latent_path))[0]
         fallback_caption = entry.get("caption")
-        return sample_key, audio_path, text_path, fallback_caption
+        selected.append(
+            {
+                "key": sample_key,
+                "latent_path": latent_path,
+                "fallback_caption": fallback_caption,
+                "data": data,
+            }
+        )
+        if select_key_lower is not None:
+            break
+        if len(selected) >= NUM_SAMPLES:
+            break
 
     if select_key_lower is not None:
+        if not selected:
+            raise RuntimeError(
+                f"No matching sample found for SELECT_KEY={SELECT_KEY}. "
+                "Check key, SOURCE_FILTER, and manifest path."
+            )
+        return selected
+
+    if len(selected) < NUM_SAMPLES:
         raise RuntimeError(
-            f"No matching sample found for SELECT_KEY={SELECT_KEY}. "
-            "Check key, SOURCE_FILTER, and manifest path."
+            f"Found only {len(selected)} samples (need {NUM_SAMPLES}). "
+            "Adjust filters or manifest path."
         )
-    raise RuntimeError("No matching sample found. Adjust filters or manifest path.")
+    return selected
 
 
 def _read_caption_from_manifest(manifest_path: str | None, target_key: str) -> tuple[str | None, str]:
@@ -218,7 +236,7 @@ def _prepare_t5(t5_hidden: torch.Tensor, t5_len: int) -> tuple[torch.Tensor, tor
     return t5_padded, t5_mask
 
 
-def _compare_conditioning(train_prompt: dict, raw_prompt: dict) -> None:
+def _compare_conditioning(train_prompt: dict, raw_prompt: dict, label: str = "") -> None:
     clap_train = train_prompt["clap"].float()
     clap_raw = raw_prompt["clap"].float()
     t5_train = train_prompt["t5"].float()
@@ -231,16 +249,19 @@ def _compare_conditioning(train_prompt: dict, raw_prompt: dict) -> None:
     clap_diff = (clap_train - clap_raw).abs()
     t5_diff = (t5_train - t5_raw).abs()
 
+    prefix = f"[{label}] " if label else ""
     print(
-        f"CLAP diff max={clap_diff.max().item():.6f} mean={clap_diff.mean().item():.6f} close={clap_close}"
+        f"{prefix}CLAP diff max={clap_diff.max().item():.6f} "
+        f"mean={clap_diff.mean().item():.6f} close={clap_close}"
     )
     print(
-        f"T5 diff max={t5_diff.max().item():.6f} mean={t5_diff.mean().item():.6f} close={t5_close}"
+        f"{prefix}T5 diff max={t5_diff.max().item():.6f} "
+        f"mean={t5_diff.mean().item():.6f} close={t5_close}"
     )
-    print(f"T5 mask match: {mask_equal}")
+    print(f"{prefix}T5 mask match: {mask_equal}")
 
     if not clap_close or not t5_close or not mask_equal:
-        raise RuntimeError("Prompt embeddings do not match raw caption within tolerance.")
+        raise RuntimeError(f"Prompt embeddings do not match raw caption within tolerance ({label}).")
 
 
 def main():
@@ -258,40 +279,54 @@ def main():
 
     autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    sample_key, audio_path, text_path, fallback_caption = _select_sample()
-    caption, caption_source = _load_caption(sample_key, fallback_caption)
-    print(f"Using audio: {audio_path}")
-    print(f"Using text:  {text_path}")
-    print(f"Caption:    {caption}")
-    print(f"Caption src: {caption_source}")
+    samples = _select_samples()
+    print(f"Selected {len(samples)} samples")
 
-    audio_data = torch.load(audio_path, map_location="cpu", weights_only=True)
-    posterior_params = audio_data["posterior_params"].transpose(0, 1)
-    latent_length = int(audio_data.get("latent_length", posterior_params.shape[0]))
-    if latent_length != SEQ_LEN:
-        raise RuntimeError(f"latent_length {latent_length} != SEQ_LEN {SEQ_LEN}")
-    moments = posterior_params[:latent_length]
+    moments_list = []
+    prompt_train_list = []
+    captions = []
+    sample_ids = []
 
-    text_data = torch.load(text_path, map_location="cpu", weights_only=True)
-    clap_emb = text_data["clap_embedding"]
-    t5_hidden = text_data["t5_last_hidden"]
-    t5_len = int(text_data["t5_len"])
-    if clap_emb.shape[-1] != CLAP_DIM:
-        raise RuntimeError(f"CLAP dim mismatch: {clap_emb.shape[-1]} != {CLAP_DIM}")
-    if t5_hidden.shape[-1] != T5_DIM:
-        raise RuntimeError(f"T5 dim mismatch: {t5_hidden.shape[-1]} != {T5_DIM}")
+    for sample in samples:
+        sample_key = sample["key"]
+        latent_path = sample["latent_path"]
+        caption, caption_source = _load_caption(sample_key, sample["fallback_caption"])
+        print(f"Using latents: {latent_path}")
+        print(f"Caption:    {caption}")
+        print(f"Caption src: {caption_source}")
 
-    t5_padded, t5_mask = _prepare_t5(t5_hidden, t5_len)
-    prompt_train = {
-        "clap": clap_emb.unsqueeze(0),
-        "t5": t5_padded.unsqueeze(0),
-        "t5_mask": t5_mask.unsqueeze(0),
-    }
+        data = sample["data"]
+        posterior_params = data["posterior_params"].transpose(0, 1)
+        latent_length = int(data.get("latent_length", posterior_params.shape[0]))
+        if latent_length != SEQ_LEN:
+            raise RuntimeError(f"latent_length {latent_length} != SEQ_LEN {SEQ_LEN}")
+        moments = posterior_params[:latent_length]
+
+        clap_emb = data["clap_embedding"]
+        t5_hidden = data["t5_last_hidden"]
+        t5_len = int(data["t5_len"])
+        if clap_emb.shape[-1] != CLAP_DIM:
+            raise RuntimeError(f"CLAP dim mismatch: {clap_emb.shape[-1]} != {CLAP_DIM}")
+        if t5_hidden.shape[-1] != T5_DIM:
+            raise RuntimeError(f"T5 dim mismatch: {t5_hidden.shape[-1]} != {T5_DIM}")
+
+        t5_padded, t5_mask = _prepare_t5(t5_hidden, t5_len)
+        prompt_train_list.append(
+            {
+                "clap": clap_emb.unsqueeze(0),
+                "t5": t5_padded.unsqueeze(0),
+                "t5_mask": t5_mask.unsqueeze(0),
+            }
+        )
+
+        moments_list.append(moments)
+        captions.append(caption)
+        sample_ids.append(os.path.splitext(os.path.basename(latent_path))[0])
 
     os.makedirs(SMOKETEST_DIR, exist_ok=True)
     dacvae_model = load_dacvae(DACVAE_WEIGHTS, device)
-    sample_id = os.path.splitext(os.path.basename(audio_path))[0]
-    x0_ref = moments.unsqueeze(0)
+    sample_id = os.path.splitext(os.path.basename(latent_path))[0]
+    x0_ref = torch.stack(moments_list, dim=0)
     posterior = SequenceDiagonalGaussianDistribution(x0_ref, deterministic=USE_POSTERIOR_MEAN)
     x0_latents = posterior.mode() if USE_POSTERIOR_MEAN else posterior.sample()
     latents = x0_latents.transpose(1, 2)
@@ -300,13 +335,17 @@ def main():
         "latent_length": latents.shape[-1],
     }
     with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
-        audio = decode_audio_latents(dacvae_model, latents.float().to(device), metadata)
-    audio = audio.detach().cpu()
-    if audio.dim() == 3:
-        audio = audio[0]
-    smoke_path = os.path.join(SMOKETEST_DIR, f"{sample_id}_input.mp3")
-    torchaudio.save(smoke_path, audio, metadata["sample_rate"], format="mp3")
-    print(f"Saved smoketest input: {smoke_path}")
+        audio_batch = decode_audio_latents(dacvae_model, latents.float().to(device), metadata)
+    audio_batch = audio_batch.detach().cpu()
+    if audio_batch.dim() == 2:
+        audio_batch = audio_batch.unsqueeze(0)
+    for idx, sample_id in enumerate(sample_ids):
+        audio = audio_batch[idx]
+        if audio.dim() == 3:
+            audio = audio[0]
+        smoke_path = os.path.join(SMOKETEST_DIR, f"{sample_id}_input.mp3")
+        torchaudio.save(smoke_path, audio, metadata["sample_rate"], format="mp3")
+        print(f"Saved smoketest input: {smoke_path}")
 
     del dacvae_model
     torch.cuda.empty_cache()
@@ -315,45 +354,47 @@ def main():
     clap_model, clap_processor = load_clap_model(CLAP_MODEL_ID, device)
     t5_model, t5_tokenizer = load_t5_model(T5_MODEL_ID, device)
 
-    raw_prompt = get_text_embeddings(
-        clap_model,
-        clap_processor,
-        t5_model,
-        t5_tokenizer,
-        caption,
-        device,
-        max_t5_tokens=MAX_T5_TOKENS,
-        clap_dim=CLAP_DIM,
-        t5_dim=T5_DIM,
-    )
+    raw_prompt_list = []
+    for caption, sample_id, prompt_train in zip(captions, sample_ids, prompt_train_list):
+        raw_prompt = get_text_embeddings(
+            clap_model,
+            clap_processor,
+            t5_model,
+            t5_tokenizer,
+            caption,
+            device,
+            max_t5_tokens=MAX_T5_TOKENS,
+            clap_dim=CLAP_DIM,
+            t5_dim=T5_DIM,
+        )
+        raw_prompt_cpu = {
+            "clap": raw_prompt["clap"].detach().cpu(),
+            "t5": raw_prompt["t5"].detach().cpu(),
+            "t5_mask": raw_prompt["t5_mask"].detach().cpu(),
+        }
+        prompt_train_cpu = {
+            "clap": prompt_train["clap"].detach().cpu(),
+            "t5": prompt_train["t5"].detach().cpu(),
+            "t5_mask": prompt_train["t5_mask"].detach().cpu(),
+        }
+        _compare_conditioning(prompt_train_cpu, raw_prompt_cpu, label=sample_id)
+        raw_prompt_list.append(raw_prompt_cpu)
 
     del clap_model, clap_processor, t5_model, t5_tokenizer
     torch.cuda.empty_cache()
 
-    prompt_train_cpu = {
-        "clap": prompt_train["clap"].detach().cpu(),
-        "t5": prompt_train["t5"].detach().cpu(),
-        "t5_mask": prompt_train["t5_mask"].detach().cpu(),
-    }
-    raw_prompt_cpu = {
-        "clap": raw_prompt["clap"].detach().cpu(),
-        "t5": raw_prompt["t5"].detach().cpu(),
-        "t5_mask": raw_prompt["t5_mask"].detach().cpu(),
-    }
-    _compare_conditioning(prompt_train_cpu, raw_prompt_cpu)
-
     prompt_train = {
-        "clap": prompt_train["clap"].to(device),
-        "t5": prompt_train["t5"].to(device),
-        "t5_mask": prompt_train["t5_mask"].to(device),
+        "clap": torch.cat([p["clap"] for p in prompt_train_list], dim=0).to(device),
+        "t5": torch.cat([p["t5"] for p in prompt_train_list], dim=0).to(device),
+        "t5_mask": torch.cat([p["t5_mask"] for p in prompt_train_list], dim=0).to(device),
     }
     prompt_sample = {
-        "clap": raw_prompt["clap"].to(device),
-        "t5": raw_prompt["t5"].to(device),
-        "t5_mask": raw_prompt["t5_mask"].to(device),
+        "clap": torch.cat([p["clap"] for p in raw_prompt_list], dim=0).to(device),
+        "t5": torch.cat([p["t5"] for p in raw_prompt_list], dim=0).to(device),
+        "t5_mask": torch.cat([p["t5_mask"] for p in raw_prompt_list], dim=0).to(device),
     }
 
-    moments = moments.unsqueeze(0).to(device)
+    moments = torch.stack(moments_list, dim=0).to(device)
     posterior = SequenceDiagonalGaussianDistribution(moments, deterministic=USE_POSTERIOR_MEAN)
 
     if MODEL_KIND == "DiT":
@@ -464,16 +505,20 @@ def main():
             "latent_length": latents.shape[-1],
         }
         with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
-            audio = decode_audio_latents(dacvae_model, latents.float(), metadata)
+            audio_batch = decode_audio_latents(dacvae_model, latents.float(), metadata)
 
-        audio = audio.detach().cpu()
-        if audio.dim() == 3:
-            audio = audio[0]
+        audio_batch = audio_batch.detach().cpu()
+        if audio_batch.dim() == 2:
+            audio_batch = audio_batch.unsqueeze(0)
 
-        filename = f"cfg_{cfg_scale:g}.mp3"
-        filepath = os.path.join(OUTPUT_DIR, filename)
-        torchaudio.save(filepath, audio, SAMPLE_RATE, format="mp3")
-        print(f"Saved: {filepath}")
+        for idx, sample_id in enumerate(sample_ids):
+            audio = audio_batch[idx]
+            if audio.dim() == 3:
+                audio = audio[0]
+            filename = f"{sample_id}_cfg_{cfg_scale:g}.mp3"
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            torchaudio.save(filepath, audio, SAMPLE_RATE, format="mp3")
+            print(f"Saved: {filepath}")
 
 
 if __name__ == "__main__":

@@ -10,11 +10,10 @@ from torch.utils.data import Dataset, DataLoader
 
 class MultiSourceAudioDataset(Dataset):
     """
-    Loads audio latents and text embeddings from JSONL manifests.
+    Loads merged audio latents + text embeddings from JSONL manifests.
 
     Each manifest entry provides:
-        - audio_path: path to audio_latents/{id}.pt
-        - text_path: path to text_embeddings/{id}.pt
+        - path: path to latents/{id}.pt
 
     Returns:
         - moments: [T, 2C] adjusted to target_seq_len
@@ -50,20 +49,19 @@ class MultiSourceAudioDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        audio_path, text_path = self.files[idx]
+        latent_path = self.files[idx]
 
-        audio_data = torch.load(audio_path, map_location="cpu", weights_only=True)
-        posterior_params = audio_data["posterior_params"]
+        data = torch.load(latent_path, map_location="cpu", weights_only=True)
+        posterior_params = data["posterior_params"]
         moments = posterior_params.transpose(0, 1)
-        latent_length = int(audio_data.get("latent_length", moments.shape[0]))
+        latent_length = int(data.get("latent_length", moments.shape[0]))
         assert latent_length <= moments.shape[0], "latent_length exceeds moments length"
         moments = moments[:latent_length]
         moments = self._adjust_audio_length(moments)
 
-        text_data = torch.load(text_path, map_location="cpu", weights_only=True)
-        clap_emb = text_data["clap_embedding"]
-        t5_hidden = text_data["t5_last_hidden"]
-        t5_len = int(text_data["t5_len"])
+        clap_emb = data["clap_embedding"]
+        t5_hidden = data["t5_last_hidden"]
+        t5_len = int(data["t5_len"])
         assert t5_len == t5_hidden.shape[0], "t5_len mismatch"
         t5_padded, t5_mask = self._prepare_t5(t5_hidden, t5_len)
 
@@ -84,11 +82,9 @@ class MultiSourceAudioDataset(Dataset):
                 if not stripped:
                     continue
                 entry = json.loads(stripped)
-                audio_path = entry["audio_path"]
-                text_path = entry["text_path"]
-                resolved_audio = self._resolve_path(audio_path)
-                resolved_text = self._resolve_path(text_path)
-                self.files.append((resolved_audio, resolved_text))
+                latent_path = entry["path"]
+                resolved_path = self._resolve_path(latent_path)
+                self.files.append(resolved_path)
 
     def _resolve_path(self, path_str: str) -> str:
         path = Path(path_str)

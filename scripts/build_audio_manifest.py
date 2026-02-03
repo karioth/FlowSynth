@@ -46,10 +46,7 @@ def _write_source(
     data_root: Path,
     rel_root: Path,
     manifest_path: Path,
-    audio_dir: str,
-    text_dir: str,
-    include_caption: bool,
-    include_duration: bool,
+    latents_dir: str,
     verify_exists: bool,
     skip_missing: bool,
     source_label: str,
@@ -59,29 +56,26 @@ def _write_source(
 
     for key, entry in _iter_manifest_entries(manifest_path):
         filename = _ensure_pt(key)
-        audio_rel = rel_root / audio_dir / filename
-        text_rel = rel_root / text_dir / filename
+        latent_rel = rel_root / latents_dir / filename
 
         if verify_exists:
-            audio_abs = data_root / audio_rel
-            text_abs = data_root / text_rel
-            if not audio_abs.exists() or not text_abs.exists():
+            latent_abs = data_root / latent_rel
+            if not latent_abs.exists():
                 missing += 1
                 if skip_missing:
                     continue
                 raise FileNotFoundError(
-                    f"Missing file for key '{key}' in {source_label}: {audio_abs} or {text_abs}"
+                    f"Missing file for key '{key}' in {source_label}: {latent_abs}"
                 )
 
         out_entry = {
-            "audio_path": audio_rel.as_posix(),
-            "text_path": text_rel.as_posix(),
+            "path": latent_rel.as_posix(),
             "source": source_label,
             "key": key,
         }
-        if include_caption and "caption" in entry:
+        if "caption" in entry:
             out_entry["caption"] = entry["caption"]
-        if include_duration and "duration" in entry:
+        if "duration" in entry:
             out_entry["duration"] = entry["duration"]
 
         out_file.write(json.dumps(out_entry, ensure_ascii=True))
@@ -124,26 +118,10 @@ def main() -> None:
         help="Manifest filename inside each subset/split directory",
     )
     parser.add_argument(
-        "--audio-dir",
+        "--latents-dir",
         type=str,
-        default="audio_latents",
-        help="Audio latents directory name",
-    )
-    parser.add_argument(
-        "--text-dir",
-        type=str,
-        default="text_embeddings",
-        help="Text embeddings directory name",
-    )
-    parser.add_argument(
-        "--include-caption",
-        action="store_true",
-        help="Copy 'caption' from source manifests into the global manifest",
-    )
-    parser.add_argument(
-        "--include-duration",
-        action="store_true",
-        help="Copy 'duration' from source manifests into the global manifest",
+        default="latents",
+        help="Merged latents directory name",
     )
     parser.add_argument(
         "--verify-exists",
@@ -182,10 +160,7 @@ def main() -> None:
                 data_root=data_root,
                 rel_root=rel_root,
                 manifest_path=manifest_path,
-                audio_dir=args.audio_dir,
-                text_dir=args.text_dir,
-                include_caption=args.include_caption,
-                include_duration=args.include_duration,
+                latents_dir=args.latents_dir,
                 verify_exists=args.verify_exists,
                 skip_missing=args.skip_missing,
                 source_label=source_label,
@@ -205,10 +180,7 @@ def main() -> None:
                 data_root=data_root,
                 rel_root=rel_root,
                 manifest_path=manifest_path,
-                audio_dir=args.audio_dir,
-                text_dir=args.text_dir,
-                include_caption=args.include_caption,
-                include_duration=args.include_duration,
+                latents_dir=args.latents_dir,
                 verify_exists=args.verify_exists,
                 skip_missing=args.skip_missing,
                 source_label=source_label,
