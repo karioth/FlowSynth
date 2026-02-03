@@ -449,7 +449,7 @@ def Transformer_B(**kwargs) -> Transformer:
         depth=24,
         hidden_size=768,
         num_heads=12,
-        diffusion_depth=6,
+        diffusion_depth=4,
         intermediate_size=3072,
         diffusion_intermediate_size=3072,
         **kwargs,

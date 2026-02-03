@@ -1709,3 +1709,27 @@ def precompute_embeddings(
    for cfg in [1.0, 4.0, 7.0]:
        latents = lit.sample_latents(prompt_data, cfg_scale=cfg)
    ```
+
+---
+
+## Quick Train Command (DiT-Base)
+```bash
+python train_audio.py \
+  --manifest-paths /share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl \
+  --data-root /share/users/student/f/friverossego/datasets \
+  --silence-latent-path silence_samples/silence_10s_dacvae.pt \
+  --results-dir debugggg/ \
+  --epochs 10 \
+  --model MaskedAR-Base \
+  --seq-len 251 \
+  --latent-size 128 \
+  --conditioning-type continuous \
+  --prompt-seq-len 69 \
+  --clap-dim 512 \
+  --t5-dim 1024 \
+  --batch-size 8 \
+  --precision bf16-mixed \
+  --devices 1 \
+  --strategy auto \
+  --log-every 1
+```

@@ -3,10 +3,10 @@
 #SBATCH --nodes=1                           # e.g. 1 for l40s and H100, 2 for A100 
 #SBATCH --gpus-per-node=H100.80gb:1         # e.g. H100.80gb:8, A100:4 or L40S:4
 #SBATCH --ntasks-per-node=1                 # set = GPUs per node
-#SBATCH --cpus-per-task=6                   # 6 CPUs per GPU (because 1 task == 1 GPU)
+#SBATCH --cpus-per-task=10                   # 10 CPUs per GPU (because 1 task == 1 GPU)
 #SBATCH --mem=200G
 #SBATCH --time=48:00:00
-#SBATCH --job-name=Audio_DiT
+#SBATCH --job-name=Audio_AR
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
 
@@ -18,7 +18,9 @@ fi
 echo "Running in shell: $SHELL"
 
 PROJECT_ROOT="/share/users/student/f/friverossego/LatentLM"
-DATA_ROOT="/share/users/student/f/friverossego/audioset_FBdacvae"
+DATA_ROOT="/share/users/student/f/friverossego/datasets"
+MANIFEST_PATHS="/share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl"
+SILENCE_LATENT_PATH="silence_samples/silence_10s_dacvae.pt"
 
 # Derive from allocation
 NUM_NODES="${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-1}}"
@@ -70,15 +72,19 @@ cd "$PROJECT_ROOT"
 srun python train_audio.py \
   --num-nodes "$NUM_NODES" \
   --devices "$TASKS_PER_NODE" \
-  --data-path "$DATA_ROOT" \
-  --results-dir audio_logs/DiT_base_30e \
-  --model DiT-Base \
-  --seq-len 251\
+  --manifest-paths "$MANIFEST_PATHS" \
+  --data-root "$DATA_ROOT" \
+  --silence-latent-path "$SILENCE_LATENT_PATH" \
+  --results-dir audio_logs/Transformer_B_30e \
+  --model Transformer-B \
+  --seq-len 251 \
   --latent-size 128 \
   --conditioning-type continuous \
-  --conditioning-dim 512 \
+  --prompt-seq-len 69 \
+  --clap-dim 512 \
+  --t5-dim 1024 \
   --batch-size 128 \
-  --epochs 40 \
+  --epochs 30 \
   --lr 1e-4 \
   --lr-warmup-steps 300 \
   --precision bf16-mixed \
