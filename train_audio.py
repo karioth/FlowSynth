@@ -156,7 +156,7 @@ if __name__ == "__main__":
     p.add_argument("--num-workers", type=int, default=12)
 
     p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--ckpt-every", type=int, default=5000)
+    p.add_argument("--ckpt-every", type=int, default=10000)
     p.add_argument("--resume", type=str, default=None,
                    help="Path to a checkpoint to resume training.")
 
