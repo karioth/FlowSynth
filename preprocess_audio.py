@@ -120,7 +120,7 @@ def _process_file(path_str: str):
     """Process a single audio file."""
     from audiotools import AudioSignal
 
-    from src.data_utils.audio_utils import encode_audio_latents
+    from src.data_utils.utils import encode_audio_latents
 
     path = Path(path_str)
     input_root = _WORKER_STATE["input_root"]
@@ -177,7 +177,7 @@ def _process_hf_index(idx: int):
     """Process a single HuggingFace dataset index."""
     from audiotools import AudioSignal
 
-    from src.data_utils.audio_utils import encode_audio_latents
+    from src.data_utils.utils import encode_audio_latents
 
     out_root = _WORKER_STATE["out_root"]
     ds = _WORKER_STATE["dataset"]

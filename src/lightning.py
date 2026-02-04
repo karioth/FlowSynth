@@ -1,6 +1,9 @@
+from typing import Any, cast
+
 import torch
 import lightning as L
 from lightning.pytorch.callbacks import WeightAveraging
+from lightning.pytorch.utilities.types import OptimizerLRScheduler
 from torch.optim.swa_utils import get_ema_avg_fn
 
 from diffusers.optimization import get_scheduler
@@ -12,7 +15,7 @@ from .flow_matching import (
     FlowMatchingSchedulerARDiff,
     FlowMatchingSchedulerMaskedAR,
 )
-from .models.modules.distributions import SequenceDiagonalGaussianDistribution
+from .utils import sample_posterior
 
 
 class LitModule(L.LightningModule):
@@ -20,11 +23,7 @@ class LitModule(L.LightningModule):
         self,
         model_name: str = "Transformer-L",
         seq_len: int | None = None,
-        input_size: int | None = None,
         latent_size: int = 16,
-        num_classes: int = 1000,
-        conditioning_type: str = "class",
-        conditioning_dim: int | None = None,
         clap_dim: int = 512,
         t5_dim: int = 1024,
         prompt_seq_len: int = 69,
@@ -34,8 +33,6 @@ class LitModule(L.LightningModule):
         batch_mul: int = 4,
         mask_prob_min: float = 0.5,
         mask_prob_max: float = 0.5,
-        data_scale: float = 1.0,
-        data_bias: float = 0.0,
         lr: float = 1e-4,
         weight_decay: float = 0.01,
         lr_scheduler: str = "cosine",
@@ -43,25 +40,16 @@ class LitModule(L.LightningModule):
     ):
         super().__init__()
         if seq_len is None:
-            if input_size is None:
-                seq_len = 1024
-            else:
-                seq_len = input_size * input_size
+            raise ValueError("seq_len is required for audio-only training.")
         self.save_hyperparameters()
 
         model_kwargs = dict(
             seq_len=seq_len,
             in_channels=latent_size,
-            num_classes=num_classes,
-            conditioning_type=conditioning_type,
-            conditioning_dim=conditioning_dim,
+            clap_dim=clap_dim,
+            t5_dim=t5_dim,
+            prompt_seq_len=prompt_seq_len,
         )
-        if conditioning_type == "continuous":
-            model_kwargs.update(
-                clap_dim=clap_dim,
-                t5_dim=t5_dim,
-                prompt_seq_len=prompt_seq_len,
-            )
         self.model = All_models[model_name](**model_kwargs)
 
         if isinstance(self.model, Transformer):
@@ -95,32 +83,14 @@ class LitModule(L.LightningModule):
         else:
             raise NotImplementedError("Unsupported model type.")
 
-        self.register_buffer("scaling_factor", torch.tensor(data_scale, dtype=torch.float32))
-        self.register_buffer("bias_factor", torch.tensor(data_bias, dtype=torch.float32))
-        self.register_buffer("has_scaling", torch.tensor(True, dtype=torch.bool))
-
     def training_step(self, batch, batch_idx):
-        moments, prompts = batch
-        posterior = SequenceDiagonalGaussianDistribution(moments)
-        x0 = posterior.sample()
+        posterior_params, prompts = batch
+        x0 = sample_posterior(posterior_params)
 
-        x0 = self._normalize(x0)
         loss = self.noise_scheduler.get_losses(self.model, x0, prompts)
 
         self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         return loss
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        bias = self.bias_factor.to(dtype=x.dtype)
-        scale = self.scaling_factor.to(dtype=x.dtype)
-        return (x + bias) * scale
-
-    def unnormalize_latents(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.has_scaling.item():
-            raise RuntimeError("Scaling/bias not set; cannot unnormalize latents.")
-        bias = self.bias_factor.to(dtype=x.dtype)
-        scale = self.scaling_factor.to(dtype=x.dtype)
-        return x / scale - bias
 
     @torch.no_grad()
     def sample_latents(
@@ -129,8 +99,8 @@ class LitModule(L.LightningModule):
         cfg_scale: float = 4.0,
         num_inference_steps: int = 250,
         scheduler=None,
-        ardiff_step: int = None,
-        base_num_frames: int = None,
+        ardiff_step: int | None = None,
+        base_num_frames: int | None = None,
     ):
         self.eval()
         if scheduler is None:
@@ -141,18 +111,10 @@ class LitModule(L.LightningModule):
             base_num_frames=base_num_frames,
         )
         scheduler.set_timesteps(num_inference_steps, device=self.device)
-        latents = self.model.sample_with_cfg(prompt, cfg_scale, scheduler)
-        return self.unnormalize_latents(latents)
+        return self.model.sample_with_cfg(prompt, cfg_scale, scheduler)
 
-    def load_state_dict(self, state_dict, strict: bool = True):
-        remapped = {}
-        for key, value in state_dict.items():
-            if "model.label_embedder." in key:
-                key = key.replace("model.label_embedder.", "model.prompt_embedder.")
-            remapped[key] = value
-        return super().load_state_dict(remapped, strict=strict)
-
-    def configure_optimizers(self):
+    def configure_optimizers(self) -> OptimizerLRScheduler:
+        hparams = cast(Any, self.hparams)
         decay, no_decay = [], []
         for n, p in self.model.named_parameters():
             if not p.requires_grad:
@@ -163,16 +125,16 @@ class LitModule(L.LightningModule):
                 decay.append(p)      # linear/conv weights, embedding matrices, etc.
 
         optimizer = torch.optim.AdamW(
-            [{"params": decay, "weight_decay": self.hparams.weight_decay},
+            [{"params": decay, "weight_decay": hparams.weight_decay},
             {"params": no_decay, "weight_decay": 0.0}],
-            lr=self.hparams.lr,
+            lr=hparams.lr,
         )
 
-        num_training_steps = self.trainer.estimated_stepping_batches
+        num_training_steps = int(self.trainer.estimated_stepping_batches)
         scheduler = get_scheduler(
-            self.hparams.lr_scheduler,
+            hparams.lr_scheduler,
             optimizer=optimizer,
-            num_warmup_steps=self.hparams.lr_warmup_steps,
+            num_warmup_steps=hparams.lr_warmup_steps,
             num_training_steps=num_training_steps,
         )
         return {

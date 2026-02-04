@@ -8,7 +8,7 @@ from .common import (
     configure_worker_threads,
     SkipLogger,
 )
-from .audio_items import (
+from .items import (
     AudioItem,
     AUDIO_EXTS,
     list_audio_files,
@@ -29,7 +29,7 @@ __all__ = [
     "atomic_write_pt",
     "configure_worker_threads",
     "SkipLogger",
-    # audio_items
+    # items
     "AudioItem",
     "AUDIO_EXTS",
     "list_audio_files",

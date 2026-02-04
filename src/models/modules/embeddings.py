@@ -61,53 +61,7 @@ class TimestepEmbedder(nn.Module):
         return self.mlp(t_freq)
 
 
-class LabelEmbedder(nn.Module):
-    """Embeds class labels into vector representations. Also handles label dropout for CFG."""
-
-    def __init__(self, num_classes: int, hidden_size: int, dropout_prob: float = 0.1) -> None:
-        super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
-        self.num_classes = num_classes
-        self.dropout_prob = dropout_prob
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.normal_(self.embedding_table.weight, std=0.02)
-
-    def token_drop(
-        self,
-        labels: torch.Tensor,
-        force_drop_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Drops labels to enable classifier-free guidance.
-        """
-        if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
-        else:
-            drop_ids = force_drop_ids == 1
-        labels = torch.where(drop_ids, self.num_classes, labels)
-        return labels
-
-    def forward(
-        self,
-        labels: torch.Tensor,
-        train: bool,
-        force_drop_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        use_dropout = self.dropout_prob > 0
-        if (train and use_dropout) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
-        embeddings = self.embedding_table(labels)
-
-        if torch.is_autocast_enabled():
-            # CUDA autocast dtype (bf16/fp16 depending on your autocast context)
-            embeddings = embeddings.to(torch.get_autocast_gpu_dtype())
-        return embeddings
-
-
-class SequencePromptEmbedder(nn.Module):
+class PromptEmbedder(nn.Module):
     """
     Embeds pooled CLAP + T5 hidden states into a fixed-length prompt sequence.
 
@@ -185,7 +139,7 @@ if __name__ == "__main__":
     batch_size = 2
     hidden_size = 768
 
-    embedder = SequencePromptEmbedder(
+        embedder = PromptEmbedder(
         clap_dim=512,
         t5_dim=1024,
         hidden_size=hidden_size,

@@ -1,4 +1,4 @@
-# train_audio.py
+# train.py
 import argparse
 import os
 
@@ -9,7 +9,7 @@ from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
 
 from src.lightning import LitModule, EMAWeightAveraging
-from src.data_utils.audio_datamodule import CachedAudioDataModule
+from src.data_utils.datamodule import CachedAudioDataModule
 
 
 def _parse_manifest_paths(values: list[str] | None) -> list[str]:
@@ -61,8 +61,6 @@ def main(args):
         model_name=args.model,
         seq_len=args.seq_len,
         latent_size=args.latent_size,
-        num_classes=1,  # unused for continuous conditioning
-        conditioning_type=args.conditioning_type,
         clap_dim=args.clap_dim,
         t5_dim=args.t5_dim,
         prompt_seq_len=args.prompt_seq_len,
@@ -135,9 +133,7 @@ if __name__ == "__main__":
     p.add_argument("--seq-len", type=int, default=251,
                    help="Audio sequence length (fixed at 251 for DACVAE)")
     p.add_argument("--latent-size", type=int, default=128,
-                   help="DACVAE latent dim (128, moments=256)")
-    p.add_argument("--conditioning-type", type=str, default="continuous",
-                   help="Conditioning type: 'class' or 'continuous'")
+                   help="DACVAE latent dim (128, posterior_params=256)")
     p.add_argument("--clap-dim", type=int, default=512,
                    help="CLAP pooled embedding dimension")
     p.add_argument("--t5-dim", type=int, default=1024,

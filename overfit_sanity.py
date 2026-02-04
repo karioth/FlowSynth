@@ -14,9 +14,9 @@ from src.flow_matching import (
     FlowMatchingSchedulerARDiff,
     FlowMatchingSchedulerMaskedAR,
 )
-from src.models.modules.distributions import SequenceDiagonalGaussianDistribution
-from src.data_utils.audio_utils import decode_audio_latents
-from sample_audio import load_clap_model, load_t5_model, get_text_embeddings, load_dacvae
+from src.utils import sample_posterior
+from src.data_utils.utils import decode_audio_latents
+from sample import load_clap_model, load_t5_model, get_text_embeddings, load_dacvae
 
 
 # Hardcode paths here
@@ -66,7 +66,6 @@ LR = 1e-4
 WEIGHT_DECAY = 0.0
 MAX_STEPS = 2000
 LOG_EVERY = 50
-USE_POSTERIOR_MEAN = True
 
 # Sampling
 CFG_SCALES = [0.0, 4.0]
@@ -131,9 +130,8 @@ def _select_samples():
             continue
 
         data = torch.load(latent_path, map_location="cpu", weights_only=True)
-        posterior_params = data["posterior_params"]
-        moments = posterior_params.transpose(0, 1)
-        latent_length = int(data.get("latent_length", moments.shape[0]))
+        posterior_params = data["posterior_params"].transpose(0, 1)
+        latent_length = int(data.get("latent_length", posterior_params.shape[0]))
         if latent_length != SEQ_LEN:
             if select_key_lower is not None:
                 raise RuntimeError(
@@ -282,7 +280,7 @@ def main():
     samples = _select_samples()
     print(f"Selected {len(samples)} samples")
 
-    moments_list = []
+    posterior_params_list = []
     prompt_train_list = []
     captions = []
     sample_ids = []
@@ -300,7 +298,7 @@ def main():
         latent_length = int(data.get("latent_length", posterior_params.shape[0]))
         if latent_length != SEQ_LEN:
             raise RuntimeError(f"latent_length {latent_length} != SEQ_LEN {SEQ_LEN}")
-        moments = posterior_params[:latent_length]
+        posterior_params = posterior_params[:latent_length]
 
         clap_emb = data["clap_embedding"]
         t5_hidden = data["t5_last_hidden"]
@@ -319,16 +317,15 @@ def main():
             }
         )
 
-        moments_list.append(moments)
+        posterior_params_list.append(posterior_params)
         captions.append(caption)
         sample_ids.append(os.path.splitext(os.path.basename(latent_path))[0])
 
     os.makedirs(SMOKETEST_DIR, exist_ok=True)
     dacvae_model = load_dacvae(DACVAE_WEIGHTS, device)
     sample_id = os.path.splitext(os.path.basename(latent_path))[0]
-    x0_ref = torch.stack(moments_list, dim=0)
-    posterior = SequenceDiagonalGaussianDistribution(x0_ref, deterministic=USE_POSTERIOR_MEAN)
-    x0_latents = posterior.mode() if USE_POSTERIOR_MEAN else posterior.sample()
+    posterior_params_batch = torch.stack(posterior_params_list, dim=0)
+    x0_latents = sample_posterior(posterior_params_batch)
     latents = x0_latents.transpose(1, 2)
     metadata = {
         "sample_rate": int(getattr(dacvae_model, "sample_rate", SAMPLE_RATE)),
@@ -394,8 +391,7 @@ def main():
         "t5_mask": torch.cat([p["t5_mask"] for p in raw_prompt_list], dim=0).to(device),
     }
 
-    moments = torch.stack(moments_list, dim=0).to(device)
-    posterior = SequenceDiagonalGaussianDistribution(moments, deterministic=USE_POSTERIOR_MEAN)
+    posterior_params = torch.stack(posterior_params_list, dim=0).to(device)
 
     if MODEL_KIND == "DiT":
         model = DiT(
@@ -406,11 +402,10 @@ def main():
             num_heads=NUM_HEADS,
             num_kv_heads=NUM_HEADS,
             intermediate_size=INTERMEDIATE_SIZE,
-            conditioning_type="continuous",
             clap_dim=CLAP_DIM,
             t5_dim=T5_DIM,
             prompt_seq_len=PROMPT_SEQ_LEN,
-            class_dropout_prob=CLASS_DROPOUT_PROB,
+            prompt_dropout_prob=CLASS_DROPOUT_PROB,
         ).to(device)
         scheduler = FlowMatchingSchedulerDiT()
     elif MODEL_KIND == "Transformer":
@@ -424,11 +419,10 @@ def main():
             num_kv_heads=NUM_HEADS,
             intermediate_size=INTERMEDIATE_SIZE,
             diffusion_intermediate_size=INTERMEDIATE_SIZE,
-            conditioning_type="continuous",
             clap_dim=CLAP_DIM,
             t5_dim=T5_DIM,
             prompt_seq_len=PROMPT_SEQ_LEN,
-            class_dropout_prob=CLASS_DROPOUT_PROB,
+            prompt_dropout_prob=CLASS_DROPOUT_PROB,
         ).to(device)
         scheduler = FlowMatchingSchedulerTransformer(batch_mul=BATCH_MUL)
     elif MODEL_KIND == "AR_DiT":
@@ -440,11 +434,10 @@ def main():
             num_heads=NUM_HEADS,
             num_kv_heads=NUM_HEADS,
             intermediate_size=INTERMEDIATE_SIZE,
-            conditioning_type="continuous",
             clap_dim=CLAP_DIM,
             t5_dim=T5_DIM,
             prompt_seq_len=PROMPT_SEQ_LEN,
-            class_dropout_prob=CLASS_DROPOUT_PROB,
+            prompt_dropout_prob=CLASS_DROPOUT_PROB,
         ).to(device)
         scheduler = FlowMatchingSchedulerARDiff()
     elif MODEL_KIND == "MaskedAR":
@@ -458,11 +451,10 @@ def main():
             num_kv_heads=NUM_HEADS,
             intermediate_size=INTERMEDIATE_SIZE,
             diffusion_intermediate_size=INTERMEDIATE_SIZE,
-            conditioning_type="continuous",
             clap_dim=CLAP_DIM,
             t5_dim=T5_DIM,
             prompt_seq_len=PROMPT_SEQ_LEN,
-            class_dropout_prob=CLASS_DROPOUT_PROB,
+            prompt_dropout_prob=CLASS_DROPOUT_PROB,
         ).to(device)
         scheduler = FlowMatchingSchedulerMaskedAR(
             mask_prob_min=MASK_PROB_MIN,
@@ -476,7 +468,7 @@ def main():
     model.train()
     for step in range(1, MAX_STEPS + 1):
         optimizer.zero_grad(set_to_none=True)
-        x0 = posterior.mode() if USE_POSTERIOR_MEAN else posterior.sample()
+        x0 = sample_posterior(posterior_params)
         with autocast:
             loss = scheduler.get_losses(model, x0, prompt_train)
         loss.backward()

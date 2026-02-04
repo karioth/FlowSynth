@@ -95,7 +95,7 @@ def main() -> None:
                         help="Output directory for decoded audio")
     args = parser.parse_args()
 
-    from src.data_utils.audio_utils import decode_audio_latents
+    from src.data_utils.utils import decode_audio_latents
 
     os.makedirs(args.out_dir, exist_ok=True)
 

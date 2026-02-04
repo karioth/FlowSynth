@@ -7,7 +7,7 @@ from flash_attn.utils.generation import InferenceParams
 from .modules.attention import Attention
 from .modules.norms import RMSNorm
 from .modules.adaln import AdaLNzero, modulate, gate, FinalLayer
-from .modules.embeddings import TimestepEmbedder, LabelEmbedder, SequencePromptEmbedder
+from .modules.embeddings import TimestepEmbedder, PromptEmbedder
 from .modules.ffn import SwiGLU
 
 
@@ -113,10 +113,7 @@ class Transformer(nn.Module):
         num_kv_heads: int | None = None,
         intermediate_size: int | None = None,
         diffusion_intermediate_size: int | None = None,
-        class_dropout_prob: float = 0.1,
-        num_classes: int = 1000,
-        conditioning_type: str = "class",
-        conditioning_dim: int | None = None,
+        prompt_dropout_prob: float = 0.1,
         clap_dim: int = 512,
         t5_dim: int = 1024,
         prompt_seq_len: int = 69,
@@ -133,7 +130,6 @@ class Transformer(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.hidden_size = hidden_size
         self.seq_len = seq_len
-        self.conditioning_type = conditioning_type
 
         if intermediate_size is None:
             intermediate_size = int(hidden_size * 10 / 3 / 64) * 64
@@ -144,20 +140,14 @@ class Transformer(nn.Module):
         self.noisy_input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.time_embedder = TimestepEmbedder(hidden_size)
 
-        if conditioning_type == "class":
-            self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-            self.prompt_seq_len = 1
-        elif conditioning_type == "continuous":
-            self.prompt_embedder = SequencePromptEmbedder(
-                clap_dim=clap_dim,
-                t5_dim=t5_dim,
-                hidden_size=hidden_size,
-                prompt_seq_len=prompt_seq_len,
-                dropout_prob=class_dropout_prob,
-            )
-            self.prompt_seq_len = prompt_seq_len
-        else:
-            raise ValueError(f"Unknown conditioning_type: {conditioning_type}")
+        self.prompt_embedder = PromptEmbedder(
+            clap_dim=clap_dim,
+            t5_dim=t5_dim,
+            hidden_size=hidden_size,
+            prompt_seq_len=prompt_seq_len,
+            dropout_prob=prompt_dropout_prob,
+        )
+        self.prompt_seq_len = prompt_seq_len
 
         self.blocks = nn.ModuleList(
             [
@@ -206,7 +196,7 @@ class Transformer(nn.Module):
         hidden_states: torch.Tensor,
         timesteps: torch.Tensor,
         x_start: torch.Tensor,
-        prompt: torch.Tensor | dict,
+        prompt: dict[str, torch.Tensor],
         batch_mul: int = 1,
         **kwargs,
     ) -> torch.Tensor:
@@ -215,7 +205,7 @@ class Transformer(nn.Module):
         hidden_states: (B, T, C) tensor of noisy latent tokens
         x_start: (B, T, C) tensor of clean latent tokens
         timesteps: (B, T) or (B,) tensor of diffusion timesteps
-        prompt: (B,) tensor of class prompts
+        prompt: dict with clap/t5 embeddings
         """
         del kwargs
         conditioning = self.forward_parallel(x_start, prompt)
@@ -225,7 +215,7 @@ class Transformer(nn.Module):
     def forward_parallel(
         self,
         hidden_states: torch.Tensor,
-        prompt: torch.Tensor | dict,
+        prompt: dict[str, torch.Tensor],
         prompt_drop_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states = self.input_embedder(hidden_states)
@@ -234,8 +224,6 @@ class Transformer(nn.Module):
             self.training,
             force_drop_ids=prompt_drop_ids,
         )
-        if self.conditioning_type == "class":
-            prompt_seq = prompt_seq.unsqueeze(1)
         hidden_states = torch.cat((prompt_seq, hidden_states[:, :-1]), dim=1)
         for block in self.blocks:
             hidden_states = block(hidden_states)
@@ -244,32 +232,34 @@ class Transformer(nn.Module):
 
     def forward_recurrent(
         self,
-        hidden_states: torch.Tensor | dict,
+        hidden_states: dict[str, torch.Tensor] | torch.Tensor,
         start_pos: int = 0,
         inference_params: InferenceParams | None = None,
         prompt_drop_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         start_pos = int(start_pos)
         if start_pos == 0:
-            prompt_seq = self.prompt_embedder(
-                hidden_states,
+            if not isinstance(hidden_states, dict):
+                raise ValueError("Prompt data is required when start_pos is 0.")
+            prompt_data = hidden_states
+            token_states = self.prompt_embedder(
+                prompt_data,
                 self.training,
                 force_drop_ids=prompt_drop_ids,
             )
-            if self.conditioning_type == "class":
-                prompt_seq = prompt_seq.unsqueeze(1)
-            hidden_states = prompt_seq
         else:
-            hidden_states = self.input_embedder(hidden_states)
+            if not torch.is_tensor(hidden_states):
+                raise ValueError("Latent tokens are required when start_pos is not 0.")
+            token_states = self.input_embedder(hidden_states)
 
         if inference_params is not None:
             inference_params.seqlen_offset = start_pos
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, inference_params=inference_params)
+            token_states = block(token_states, inference_params=inference_params)
 
-        hidden_states = self.condition_layer(hidden_states[:, -1:])
-        return hidden_states
+        token_states = self.condition_layer(token_states[:, -1:])
+        return token_states
 
     def forward_diffusion(
         self,
@@ -288,45 +278,35 @@ class Transformer(nn.Module):
         hidden_states = self.final_layer(hidden_states, conditioning)
         return hidden_states
 
-    def sample_with_cfg(self, prompt: torch.Tensor | dict, cfg_scale: float, sample_func) -> torch.Tensor:
+    def sample_with_cfg(self, prompt: dict[str, torch.Tensor], cfg_scale: float, sample_func) -> torch.Tensor:
         # Build [cond, uncond] prompt batch for classifier-free guidance.
-        prompt_drop_ids = None
-        if self.conditioning_type == "class":
-            if not torch.is_tensor(prompt):
-                prompt = torch.tensor(prompt, device=self.device, dtype=torch.long)
-            else:
-                prompt = prompt.to(device=self.device, dtype=torch.long)
-            y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
-            prompt = torch.cat([prompt, y_null], dim=0)
-            prompt_input = prompt
+        clap = prompt["clap"]
+        t5 = prompt["t5"]
+        t5_mask = prompt["t5_mask"]
+        if not torch.is_tensor(clap):
+            clap = torch.tensor(clap, device=self.device, dtype=self.dtype)
         else:
-            clap = prompt["clap"]
-            t5 = prompt["t5"]
-            t5_mask = prompt["t5_mask"]
-            if not torch.is_tensor(clap):
-                clap = torch.tensor(clap, device=self.device, dtype=self.dtype)
-            else:
-                clap = clap.to(device=self.device, dtype=self.dtype)
-            if not torch.is_tensor(t5):
-                t5 = torch.tensor(t5, device=self.device, dtype=self.dtype)
-            else:
-                t5 = t5.to(device=self.device, dtype=self.dtype)
-            if not torch.is_tensor(t5_mask):
-                t5_mask = torch.tensor(t5_mask, device=self.device, dtype=torch.bool)
-            else:
-                t5_mask = t5_mask.to(device=self.device, dtype=torch.bool)
+            clap = clap.to(device=self.device, dtype=self.dtype)
+        if not torch.is_tensor(t5):
+            t5 = torch.tensor(t5, device=self.device, dtype=self.dtype)
+        else:
+            t5 = t5.to(device=self.device, dtype=self.dtype)
+        if not torch.is_tensor(t5_mask):
+            t5_mask = torch.tensor(t5_mask, device=self.device, dtype=torch.bool)
+        else:
+            t5_mask = t5_mask.to(device=self.device, dtype=torch.bool)
 
-            batch_size = clap.shape[0]
-            prompt = {
-                "clap": torch.cat([clap, clap], dim=0),
-                "t5": torch.cat([t5, t5], dim=0),
-                "t5_mask": torch.cat([t5_mask, t5_mask], dim=0),
-            }
-            prompt_drop_ids = torch.zeros(batch_size * 2, device=self.device, dtype=torch.long)
-            prompt_drop_ids[batch_size:] = 1
-            prompt_input = prompt
+        batch_size = clap.shape[0]
+        prompt = {
+            "clap": torch.cat([clap, clap], dim=0),
+            "t5": torch.cat([t5, t5], dim=0),
+            "t5_mask": torch.cat([t5_mask, t5_mask], dim=0),
+        }
+        prompt_drop_ids = torch.zeros(batch_size * 2, device=self.device, dtype=torch.long)
+        prompt_drop_ids[batch_size:] = 1
+        prompt_input = prompt
 
-        batch_size = prompt["clap"].shape[0] if isinstance(prompt, dict) else prompt.shape[0]
+        batch_size = prompt["clap"].shape[0]
         inference_params = InferenceParams(
             max_seqlen=self.seq_len + self.prompt_seq_len - 1,
             max_batch_size=batch_size,
@@ -344,6 +324,8 @@ class Transformer(nn.Module):
             if i == 0:
                 recurrent_input = prompt_input
             else:
+                if prev_token is None:
+                    raise RuntimeError("Expected prev_token to be set before recurrent steps.")
                 recurrent_input = torch.cat([prev_token, prev_token], dim=0)
             conditioning = self.forward_recurrent(
                 recurrent_input,
@@ -492,7 +474,6 @@ if __name__ == "__main__":
         num_kv_heads=num_heads,
         intermediate_size=64,
         diffusion_intermediate_size=64,
-        conditioning_type="continuous",
         clap_dim=clap_dim,
         t5_dim=t5_dim,
         prompt_seq_len=prompt_seq_len,

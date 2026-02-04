@@ -17,7 +17,7 @@ class MultiSourceAudioDataset(Dataset):
         - path: path to latents/{id}.pt
 
     Returns:
-        - moments: [T, 2C] adjusted to target_seq_len
+        - posterior_params: [T, 2C] adjusted to target_seq_len
         - prompt_data: dict with clap/t5 embeddings and t5_mask
     """
 
@@ -53,12 +53,11 @@ class MultiSourceAudioDataset(Dataset):
         latent_path = self.files[idx]
 
         data = torch.load(latent_path, map_location="cpu", weights_only=True)
-        posterior_params = data["posterior_params"]
-        moments = posterior_params.transpose(0, 1)
-        latent_length = int(data.get("latent_length", moments.shape[0]))
-        assert latent_length <= moments.shape[0], "latent_length exceeds moments length"
-        moments = moments[:latent_length]
-        moments = self._adjust_audio_length(moments)
+        posterior_params = data["posterior_params"].transpose(0, 1)
+        latent_length = int(data.get("latent_length", posterior_params.shape[0]))
+        assert latent_length <= posterior_params.shape[0], "latent_length exceeds posterior_params length"
+        posterior_params = posterior_params[:latent_length]
+        posterior_params = self._adjust_audio_length(posterior_params)
 
         clap_emb = data["clap_embedding"]
         t5_hidden = data["t5_last_hidden"]
@@ -72,7 +71,7 @@ class MultiSourceAudioDataset(Dataset):
             "t5_mask": t5_mask,
         }
 
-        return moments, prompt_data
+        return posterior_params, prompt_data
 
     def _load_manifest(self, manifest_path: Path) -> None:
         if not manifest_path.exists():
@@ -96,30 +95,29 @@ class MultiSourceAudioDataset(Dataset):
 
     def _load_silence_latent(self, silence_path: Path) -> torch.Tensor:
         data = torch.load(silence_path, map_location="cpu", weights_only=True)
-        posterior_params = data["posterior_params"]
-        moments = posterior_params.transpose(0, 1)
-        latent_length = int(data.get("latent_length", moments.shape[0]))
-        assert latent_length <= moments.shape[0], "silence latent_length exceeds moments length"
-        moments = moments[:latent_length]
-        assert moments.shape[0] > 0, f"Silence latent has zero length: {silence_path}"
-        return moments
+        posterior_params = data["posterior_params"].transpose(0, 1)
+        latent_length = int(data.get("latent_length", posterior_params.shape[0]))
+        assert latent_length <= posterior_params.shape[0], "silence latent_length exceeds posterior_params length"
+        posterior_params = posterior_params[:latent_length]
+        assert posterior_params.shape[0] > 0, f"Silence latent has zero length: {silence_path}"
+        return posterior_params
 
-    def _adjust_audio_length(self, moments: torch.Tensor) -> torch.Tensor:
-        current_len = moments.shape[0]
+    def _adjust_audio_length(self, posterior_params: torch.Tensor) -> torch.Tensor:
+        current_len = posterior_params.shape[0]
 
         if current_len == self.target_seq_len:
-            return moments
+            return posterior_params
 
         if current_len < self.target_seq_len:
             pad_needed = self.target_seq_len - current_len
             silence_len = self.silence_latent.shape[0]
             num_tiles = (pad_needed // silence_len) + 1
             padding = self.silence_latent.repeat(num_tiles, 1)[:pad_needed]
-            return torch.cat([moments, padding], dim=0)
+            return torch.cat([posterior_params, padding], dim=0)
 
         max_start = current_len - self.target_seq_len
         start = torch.randint(0, max_start + 1, (1,)).item()
-        return moments[start : start + self.target_seq_len]
+        return posterior_params[start : start + self.target_seq_len]
 
     def _prepare_t5(self, t5_hidden: torch.Tensor, t5_len: int) -> tuple[torch.Tensor, torch.Tensor]:
         if t5_len <= 0:
@@ -139,16 +137,16 @@ class MultiSourceAudioDataset(Dataset):
 
 
 def audio_collate_fn(batch: list[tuple[torch.Tensor, dict]]) -> tuple[torch.Tensor, dict]:
-    moments_list = [item[0] for item in batch]
+    posterior_params_list = [item[0] for item in batch]
     prompt_list = [item[1] for item in batch]
 
-    moments = torch.stack(moments_list, dim=0)
+    posterior_params = torch.stack(posterior_params_list, dim=0)
     prompt_data = {
         "clap": torch.stack([p["clap"] for p in prompt_list], dim=0),
         "t5": torch.stack([p["t5"] for p in prompt_list], dim=0),
         "t5_mask": torch.stack([p["t5_mask"] for p in prompt_list], dim=0),
     }
-    return moments, prompt_data
+    return posterior_params, prompt_data
 
 
 class CachedAudioDataModule(L.LightningDataModule):
@@ -222,8 +220,11 @@ def _run_smoke_tests(args: argparse.Namespace) -> None:
 
     assert len(dataset) > 0, "Dataset is empty"
 
-    moments, prompt_data = dataset[0]
-    assert moments.shape == (args.seq_len, args.latent_dim), f"Unexpected moments shape: {moments.shape}"
+    posterior_params, prompt_data = dataset[0]
+    assert posterior_params.shape == (
+        args.seq_len,
+        args.latent_dim,
+    ), f"Unexpected posterior_params shape: {posterior_params.shape}"
     assert prompt_data["clap"].shape == (args.clap_dim,), f"Unexpected clap shape: {prompt_data['clap'].shape}"
     assert prompt_data["t5"].shape == (
         args.max_t5_tokens,
@@ -238,12 +239,12 @@ def _run_smoke_tests(args: argparse.Namespace) -> None:
 
     loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=audio_collate_fn)
     batch = next(iter(loader))
-    batch_moments, batch_prompt = batch
-    assert batch_moments.shape == (
+    batch_posterior_params, batch_prompt = batch
+    assert batch_posterior_params.shape == (
         args.batch_size,
         args.seq_len,
         args.latent_dim,
-    ), f"Unexpected batch moments shape: {batch_moments.shape}"
+    ), f"Unexpected batch posterior_params shape: {batch_posterior_params.shape}"
     assert batch_prompt["clap"].shape == (
         args.batch_size,
         args.clap_dim,

@@ -7,7 +7,7 @@ from flash_attn.utils.generation import InferenceParams
 from .modules.attention import Attention
 from .modules.norms import RMSNorm
 from .modules.adaln import AdaLNzero, modulate, gate, FinalLayer
-from .modules.embeddings import TimestepEmbedder, LabelEmbedder, SequencePromptEmbedder
+from .modules.embeddings import TimestepEmbedder, PromptEmbedder
 from .modules.ffn import SwiGLU
 
 
@@ -103,10 +103,7 @@ class MaskedARTransformer(nn.Module):
         num_kv_heads: int | None = None,
         intermediate_size: int | None = None,
         diffusion_intermediate_size: int | None = None,
-        class_dropout_prob: float = 0.1,
-        num_classes: int = 1000,
-        conditioning_type: str = "class",
-        conditioning_dim: int | None = None,
+        prompt_dropout_prob: float = 0.1,
         clap_dim: int = 512,
         t5_dim: int = 1024,
         prompt_seq_len: int = 69,
@@ -123,7 +120,6 @@ class MaskedARTransformer(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.hidden_size = hidden_size
         self.seq_len = seq_len
-        self.conditioning_type = conditioning_type
 
         if intermediate_size is None:
             intermediate_size = int(hidden_size * 10 / 3 / 64) * 64
@@ -134,20 +130,14 @@ class MaskedARTransformer(nn.Module):
         self.noisy_input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.time_embedder = TimestepEmbedder(hidden_size)
 
-        if conditioning_type == "class":
-            self.prompt_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-            self.prompt_seq_len = 1
-        elif conditioning_type == "continuous":
-            self.prompt_embedder = SequencePromptEmbedder(
-                clap_dim=clap_dim,
-                t5_dim=t5_dim,
-                hidden_size=hidden_size,
-                prompt_seq_len=prompt_seq_len,
-                dropout_prob=class_dropout_prob,
-            )
-            self.prompt_seq_len = prompt_seq_len
-        else:
-            raise ValueError(f"Unknown conditioning_type: {conditioning_type}")
+        self.prompt_embedder = PromptEmbedder(
+            clap_dim=clap_dim,
+            t5_dim=t5_dim,
+            hidden_size=hidden_size,
+            prompt_seq_len=prompt_seq_len,
+            dropout_prob=prompt_dropout_prob,
+        )
+        self.prompt_seq_len = prompt_seq_len
 
         # Learnable [MASK] token
         self.mask_token = nn.Parameter(torch.empty(1, 1, hidden_size))
@@ -199,7 +189,7 @@ class MaskedARTransformer(nn.Module):
         hidden_states: torch.Tensor,
         timesteps: torch.Tensor,
         x_start: torch.Tensor,
-        prompt: torch.Tensor | dict,
+        prompt: dict,
         mask: torch.Tensor,
         flat_mask_indices: torch.Tensor,
         batch_mul: int = 1,
@@ -212,7 +202,7 @@ class MaskedARTransformer(nn.Module):
             hidden_states: (num_masked * batch_mul, C) noisy tokens at masked positions
             timesteps: (num_masked * batch_mul,) diffusion timesteps
             x_start: (B, T, C) clean latent tokens (full sequences for backbone)
-            prompt: (B,) class prompts
+        prompt: dict with clap/t5 embeddings
             mask: (B, T) boolean tensor, True = masked position
             flat_mask_indices: (num_masked,) indices into flattened B*T
             batch_mul: batch multiplier for multiple timestep samples
@@ -240,7 +230,7 @@ class MaskedARTransformer(nn.Module):
     def forward_backbone(
         self,
         hidden_states: torch.Tensor,
-        prompt: torch.Tensor | dict,
+        prompt: dict,
         mask: torch.Tensor,
     ) -> torch.Tensor:
         """
@@ -261,8 +251,6 @@ class MaskedARTransformer(nn.Module):
 
         # Prepend prompt embedding (no shift needed - same position readout)
         prompt_seq = self.prompt_embedder(prompt, self.training)
-        if self.conditioning_type == "class":
-            prompt_seq = prompt_seq.unsqueeze(1)
         hidden_states = torch.cat((prompt_seq, hidden_states), dim=1)
 
         for block in self.blocks:
@@ -274,7 +262,7 @@ class MaskedARTransformer(nn.Module):
 
     def forward_recurrent(
         self,
-        hidden_states: torch.Tensor | dict | None,
+        hidden_states: dict | torch.Tensor | None,
         start_pos: int = 0,
         inference_params: InferenceParams | None = None,
         append_mask: bool = False,
@@ -292,14 +280,11 @@ class MaskedARTransformer(nn.Module):
         start_pos = int(start_pos)
         if start_pos == 0:
             # First position: embed the prompt
-            prompt_seq = self.prompt_embedder(
+            hidden_states = self.prompt_embedder(
                 hidden_states,
                 self.training,
                 force_drop_ids=prompt_drop_ids,
             )
-            if self.conditioning_type == "class":
-                prompt_seq = prompt_seq.unsqueeze(1)
-            hidden_states = prompt_seq
         elif hidden_states is None:
             # Query with mask token (matches training)
             batch_size = inference_params.max_batch_size
@@ -348,7 +333,7 @@ class MaskedARTransformer(nn.Module):
 
     def sample_with_cfg(
         self,
-        prompt: torch.Tensor | dict,
+        prompt: dict,
         cfg_scale: float,
         sample_func,
     ) -> torch.Tensor:
@@ -366,43 +351,33 @@ class MaskedARTransformer(nn.Module):
         the generated token updates KV while the MASK tokens are only used for queries.
         """
         # Build [cond, uncond] prompt batch for classifier-free guidance.
-        prompt_drop_ids = None
-        if self.conditioning_type == "class":
-            if not torch.is_tensor(prompt):
-                prompt = torch.tensor(prompt, device=self.device, dtype=torch.long)
-            else:
-                prompt = prompt.to(device=self.device, dtype=torch.long)
-            y_null = torch.full_like(prompt, self.prompt_embedder.num_classes, device=self.device)
-            prompt = torch.cat([prompt, y_null], dim=0)
-            prompt_input = prompt
+        clap = prompt["clap"]
+        t5 = prompt["t5"]
+        t5_mask = prompt["t5_mask"]
+        if not torch.is_tensor(clap):
+            clap = torch.tensor(clap, device=self.device, dtype=self.dtype)
         else:
-            clap = prompt["clap"]
-            t5 = prompt["t5"]
-            t5_mask = prompt["t5_mask"]
-            if not torch.is_tensor(clap):
-                clap = torch.tensor(clap, device=self.device, dtype=self.dtype)
-            else:
-                clap = clap.to(device=self.device, dtype=self.dtype)
-            if not torch.is_tensor(t5):
-                t5 = torch.tensor(t5, device=self.device, dtype=self.dtype)
-            else:
-                t5 = t5.to(device=self.device, dtype=self.dtype)
-            if not torch.is_tensor(t5_mask):
-                t5_mask = torch.tensor(t5_mask, device=self.device, dtype=torch.bool)
-            else:
-                t5_mask = t5_mask.to(device=self.device, dtype=torch.bool)
+            clap = clap.to(device=self.device, dtype=self.dtype)
+        if not torch.is_tensor(t5):
+            t5 = torch.tensor(t5, device=self.device, dtype=self.dtype)
+        else:
+            t5 = t5.to(device=self.device, dtype=self.dtype)
+        if not torch.is_tensor(t5_mask):
+            t5_mask = torch.tensor(t5_mask, device=self.device, dtype=torch.bool)
+        else:
+            t5_mask = t5_mask.to(device=self.device, dtype=torch.bool)
 
-            batch_size = clap.shape[0]
-            prompt = {
-                "clap": torch.cat([clap, clap], dim=0),
-                "t5": torch.cat([t5, t5], dim=0),
-                "t5_mask": torch.cat([t5_mask, t5_mask], dim=0),
-            }
-            prompt_drop_ids = torch.zeros(batch_size * 2, device=self.device, dtype=torch.long)
-            prompt_drop_ids[batch_size:] = 1
-            prompt_input = prompt
+        batch_size = clap.shape[0]
+        prompt = {
+            "clap": torch.cat([clap, clap], dim=0),
+            "t5": torch.cat([t5, t5], dim=0),
+            "t5_mask": torch.cat([t5_mask, t5_mask], dim=0),
+        }
+        prompt_drop_ids = torch.zeros(batch_size * 2, device=self.device, dtype=torch.long)
+        prompt_drop_ids[batch_size:] = 1
+        prompt_input = prompt
 
-        batch_size = prompt["clap"].shape[0] if isinstance(prompt, dict) else prompt.shape[0]
+        batch_size = prompt["clap"].shape[0]
         inference_params = InferenceParams(
             max_seqlen=self.seq_len + self.prompt_seq_len,
             max_batch_size=batch_size,
@@ -590,7 +565,6 @@ if __name__ == "__main__":
         num_kv_heads=num_heads,
         intermediate_size=64,
         diffusion_intermediate_size=64,
-        conditioning_type="continuous",
         clap_dim=clap_dim,
         t5_dim=t5_dim,
         prompt_seq_len=prompt_seq_len,

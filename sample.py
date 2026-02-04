@@ -10,7 +10,7 @@ import torchaudio
 from tqdm import tqdm
 
 from src.lightning import LitModule
-from src.data_utils.audio_utils import decode_audio_latents
+from src.data_utils.utils import decode_audio_latents
 
 
 DEFAULT_PROMPTS = [
