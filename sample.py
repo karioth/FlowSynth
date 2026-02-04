@@ -1,4 +1,4 @@
-# sample_audio.py
+# sample.py
 import argparse
 import os
 import random

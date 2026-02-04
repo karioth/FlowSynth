@@ -12,7 +12,7 @@ Update LatentLM audio training pipeline to support:
 
 ## Files to Modify
 
-### 1. `src/data_utils/audio_datamodule.py`
+### 1. `src/data_utils/datamodule.py`
 Create new `MultiSourceAudioDataset` class:
 - Load from one or more JSONL manifests (each line provides audio/text paths)
 - Audio handling:
@@ -25,7 +25,7 @@ Create new `MultiSourceAudioDataset` class:
 - Custom collate function to batch the dict structure
 
 ### 2. `src/models/modules/embeddings.py`
-Create new `SequencePromptEmbedder` class:
+Create new `PromptEmbedder` class:
 - Two projection layers: `clap_proj` (512 → hidden_size), `t5_proj` (1024 → hidden_size)
 - Learnable `null_embeddings` [69, hidden_size] for padding and CFG dropout
 - Forward:
@@ -35,23 +35,23 @@ Create new `SequencePromptEmbedder` class:
   - CFG dropout: replace ALL 69 tokens with null_embeddings
 
 ### 3. `src/models/AR_DiT.py`
-- Replace `ContinuousEmbedder` with `SequencePromptEmbedder`
+- Replace `ContinuousEmbedder` with `PromptEmbedder`
 - Forward: prepend 69 prompt tokens (not 1), zero time modulation for prompt tokens
 - Output: remove first 69 tokens before final layer
 - Update `sample_with_cfg` for dict prompt structure
 
 ### 4. `src/models/DiT.py`
-- Replace `ContinuousEmbedder` with `SequencePromptEmbedder`
+- Replace `ContinuousEmbedder` with `PromptEmbedder`
 - Forward: prepend 69 tokens, remove after blocks
 - Update `sample_with_cfg` for dict prompt structure
 
 ### 5. `src/models/Transformer.py`
-- Replace `ContinuousEmbedder` with `SequencePromptEmbedder`
+- Replace `ContinuousEmbedder` with `PromptEmbedder`
 - `forward_parallel`: prepend prompt tokens, keep shift-by-1, then drop first `prompt_seq_len - 1` outputs to return `seq_len`
 - `forward_recurrent`: process prompt sequence at `start_pos=0`; subsequent tokens use offset `start_pos = prompt_seq_len - 1 + i`
 
 ### 6. `src/models/MaskedAR.py`
-- Replace `ContinuousEmbedder` with `SequencePromptEmbedder`
+- Replace `ContinuousEmbedder` with `PromptEmbedder`
 - `forward_backbone`: prepend 69 tokens, remove after blocks
 - `forward_recurrent`: handle 69 prompt tokens at position 0; sampling offsets use `start_pos = prompt_seq_len + i - 1`
 
@@ -60,7 +60,7 @@ Create new `SequencePromptEmbedder` class:
 - Repurpose `conditioning_type="continuous"` to CLAP+T5 sequence prompts
 - `training_step`: unpack `prompt_data` dict
 
-### 8. `train_audio.py`
+### 8. `train.py`
 New arguments:
 - `--manifest-paths` (comma-separated or repeatable JSONL manifest files)
 - `--data-root` (default: /share/users/student/f/friverossego/datasets)
@@ -69,11 +69,11 @@ New arguments:
 
 Manifest generator will build the JSONL from WavCaps subsets (AudioSet_SL, BBC_Sound_Effects, FreeSound, SoundBible) + AudioCaps train
 
-### 9. `scripts/build_audio_manifest.py` (new)
+### 9. `scripts/build_manifest.py` (new)
 - Scan dataset roots once and write JSONL entries with paired audio/text paths
 - Encodes `source` (e.g., "WavCaps/FreeSound") for optional filtering or weighting
 
-### 10. `sample_audio.py`
+### 10. `sample.py`
 - Add T5 model loading (`google/flan-t5-large`)
 - New `get_text_embeddings()` function returning dict with clap/t5/t5_len
 - Pass dict to `sample_latents()` instead of single tensor
@@ -82,14 +82,14 @@ Manifest generator will build the JSONL from WavCaps subsets (AudioSet_SL, BBC_S
 
 ## Implementation Order
 
-0. **Manifest Generator** - `scripts/build_audio_manifest.py`
+0. **Manifest Generator** - `scripts/build_manifest.py`
    - Build JSONL manifests for all sources
 
-1. **Data Pipeline** - `audio_datamodule.py`
+1. **Data Pipeline** - `datamodule.py`
    - Test loading independently before model changes
 
 2. **Embedding Layer** - `embeddings.py`
-   - Add `SequencePromptEmbedder`, keep old `ContinuousEmbedder`
+   - Add `PromptEmbedder`, keep old `ContinuousEmbedder`
 
 3. **Models** (one at a time)
    - MaskedAR.py (primary model for audio)
@@ -97,9 +97,9 @@ Manifest generator will build the JSONL from WavCaps subsets (AudioSet_SL, BBC_S
    - DiT.py
    - Transformer.py
 
-4. **Training Script** - `train_audio.py`, `lightning.py`
+4. **Training Script** - `train.py`, `lightning.py`
 
-5. **Inference** - `sample_audio.py`
+5. **Inference** - `sample.py`
 
 ---
 
@@ -118,13 +118,13 @@ Manifest generator will build the JSONL from WavCaps subsets (AudioSet_SL, BBC_S
 1. Run data loading test: load batch, verify shapes match expected
 2. Run single training step with gradient check
 3. Full training run on small subset
-4. Inference test with sample_audio.py
+4. Inference test with sample.py
 
 ---
 
 # Step 0: Manifest Generator - Detailed Plan
 
-## File: `scripts/build_audio_manifest.py`
+## File: `scripts/build_manifest.py`
 
 ### Purpose
 Create a JSONL manifest with paired audio/text embeddings so the dataloader does not scan the filesystem.
@@ -174,14 +174,14 @@ for split in audiocaps_splits:
 
 # Step 1: Data Pipeline - Detailed Plan
 
-## File: `src/data_utils/audio_datamodule.py`
+## File: `src/data_utils/datamodule.py`
 
 ### Current State
 ```python
 class CachedAudioDataset(Dataset):
     # Loads single .pt files with combined audio + text
     # Fixed 251 sequence length, raises error if mismatch
-    # Returns: (moments [251, 256], clap_embedding [512])
+    # Returns: (posterior_params [251, 256], clap_embedding [512])
 ```
 
 ### New Classes to Add
@@ -225,11 +225,11 @@ def __getitem__(self, idx):
     audio_data = torch.load(audio_path, map_location="cpu", weights_only=True)
     posterior_params = audio_data["posterior_params"]  # [256, T_var]
     latent_length = audio_data["latent_length"]
-    moments = posterior_params.transpose(0, 1)  # [T_var, 256]
-    moments = moments[:latent_length]  # Trim to true length before pad/crop
+    posterior_params = posterior_params.transpose(0, 1)  # [T_var, 256]
+    posterior_params = posterior_params[:latent_length]  # Trim to true length before pad/crop
 
     # 2. Adjust audio length
-    moments = self._adjust_audio_length(moments)  # [251, 256]
+    posterior_params = self._adjust_audio_length(posterior_params)  # [251, 256]
 
     # 3. Load text embeddings
     text_data = torch.load(text_path, map_location="cpu", weights_only=True)
@@ -247,18 +247,18 @@ def __getitem__(self, idx):
         "t5_len": min(t5_len, self.max_t5_tokens),  # int
     }
 
-    return moments, prompt_data
+    return posterior_params, prompt_data
 ```
 
 **Helper methods:**
 
 ```python
-def _adjust_audio_length(self, moments: torch.Tensor) -> torch.Tensor:
+def _adjust_audio_length(self, posterior_params: torch.Tensor) -> torch.Tensor:
     """Pad with silence or random crop to target_seq_len."""
-    current_len = moments.shape[0]
+    current_len = posterior_params.shape[0]
 
     if current_len == self.target_seq_len:
-        return moments
+        return posterior_params
 
     if current_len < self.target_seq_len:
         # Pad with silence
@@ -270,13 +270,13 @@ def _adjust_audio_length(self, moments: torch.Tensor) -> torch.Tensor:
         silence_tiled = self.silence_latent.repeat(num_tiles, 1)
         padding = silence_tiled[:pad_needed]
 
-        return torch.cat([moments, padding], dim=0)
+        return torch.cat([posterior_params, padding], dim=0)
 
     else:  # current_len > target_seq_len
         # Random crop
         max_start = current_len - self.target_seq_len
         start = torch.randint(0, max_start + 1, (1,)).item()
-        return moments[start : start + self.target_seq_len]
+    return posterior_params[start : start + self.target_seq_len]
 
 
 def _prepare_t5(self, t5_hidden: torch.Tensor, t5_len: int) -> torch.Tensor:
@@ -299,20 +299,20 @@ def _prepare_t5(self, t5_hidden: torch.Tensor, t5_len: int) -> torch.Tensor:
 ```python
 def audio_collate_fn(batch: list) -> tuple[torch.Tensor, dict]:
     """
-    Collate batch of (moments, prompt_data) into batched tensors.
+    Collate batch of (posterior_params, prompt_data) into batched tensors.
 
     Returns:
-        moments: [B, 251, 256]
+        posterior_params: [B, 251, 256]
         prompt_data: {
             "clap": [B, 512],
             "t5": [B, 68, 1024],
             "t5_len": [B] (LongTensor)
         }
     """
-    moments_list = [item[0] for item in batch]
+    posterior_params_list = [item[0] for item in batch]
     prompt_list = [item[1] for item in batch]
 
-    moments = torch.stack(moments_list, dim=0)
+    posterior_params = torch.stack(posterior_params_list, dim=0)
 
     prompt_data = {
         "clap": torch.stack([p["clap"] for p in prompt_list], dim=0),
@@ -320,7 +320,7 @@ def audio_collate_fn(batch: list) -> tuple[torch.Tensor, dict]:
         "t5_len": torch.tensor([p["t5_len"] for p in prompt_list], dtype=torch.long),
     }
 
-    return moments, prompt_data
+    return posterior_params, prompt_data
 ```
 
 #### 3. Updated `CachedAudioDataModule`
@@ -380,7 +380,7 @@ Data layout (current setup):
 
 Use a one-time manifest builder to create a JSONL list of paired files:
 ```bash
-python scripts/build_audio_manifest.py \
+python scripts/build_manifest.py \
   --data-root /share/users/student/f/friverossego/datasets \
   --wavcaps-subsets AudioSet_SL,BBC_Sound_Effects,FreeSound,SoundBible \
   --audiocaps-splits train \
@@ -443,8 +443,8 @@ Each line maps an audio latent to its matching text embedding via relative paths
 
 2. **Unit test - single item shapes:**
    ```python
-   moments, prompt_data = dataset[0]
-   assert moments.shape == (251, 256)
+   posterior_params, prompt_data = dataset[0]
+   assert posterior_params.shape == (251, 256)
    assert prompt_data["clap"].shape == (512,)
    assert prompt_data["t5"].shape == (68, 1024)
    assert isinstance(prompt_data["t5_len"], int)
@@ -453,8 +453,8 @@ Each line maps an audio latent to its matching text embedding via relative paths
 3. **Unit test - batch shapes:**
    ```python
    loader = DataLoader(dataset, batch_size=4, collate_fn=audio_collate_fn)
-   moments, prompt_data = next(iter(loader))
-   assert moments.shape == (4, 251, 256)
+   posterior_params, prompt_data = next(iter(loader))
+   assert posterior_params.shape == (4, 251, 256)
    assert prompt_data["clap"].shape == (4, 512)
    assert prompt_data["t5"].shape == (4, 68, 1024)
    assert prompt_data["t5_len"].shape == (4,)
@@ -485,12 +485,12 @@ class ContinuousEmbedder(nn.Module):
     # Replaces entire sample with null when dropped
 ```
 
-### New Class: `SequencePromptEmbedder`
+### New Class: `PromptEmbedder`
 
 This class handles the 69-token prompt sequence (1 CLAP + 68 T5).
 
 ```python
-class SequencePromptEmbedder(nn.Module):
+class PromptEmbedder(nn.Module):
     """
     Embeds multi-modal prompt (pooled CLAP + T5 hidden states) into
     a fixed-length sequence for conditioning.
@@ -649,7 +649,7 @@ self.prompt_embedder = ContinuousEmbedder(conditioning_dim, hidden_size, dropout
 To:
 ```python
 # New: sequence output
-self.prompt_embedder = SequencePromptEmbedder(
+self.prompt_embedder = PromptEmbedder(
     clap_dim=512,
     t5_dim=1024,
     hidden_size=hidden_size,
@@ -663,7 +663,7 @@ self.prompt_embedder = SequencePromptEmbedder(
 
 1. **Shape test:**
    ```python
-   embedder = SequencePromptEmbedder(
+   embedder = PromptEmbedder(
        clap_dim=512, t5_dim=1024, hidden_size=768, prompt_seq_len=69
    )
    prompt_data = {
@@ -745,7 +745,7 @@ Note: `conditioning_type="continuous"` now expects dict prompt_data (CLAP+T5).
 from .modules.embeddings import TimestepEmbedder, LabelEmbedder, ContinuousEmbedder
 
 # New
-from .modules.embeddings import TimestepEmbedder, LabelEmbedder, ContinuousEmbedder, SequencePromptEmbedder
+from .modules.embeddings import TimestepEmbedder, LabelEmbedder, ContinuousEmbedder, PromptEmbedder
 ```
 
 ### Constructor Change
@@ -760,7 +760,7 @@ if conditioning_type == "continuous":
     clap_dim = kwargs.get("clap_dim", 512)
     t5_dim = kwargs.get("t5_dim", 1024)
     prompt_seq_len = kwargs.get("prompt_seq_len", 69)
-    self.prompt_embedder = SequencePromptEmbedder(
+    self.prompt_embedder = PromptEmbedder(
         clap_dim=clap_dim,
         t5_dim=t5_dim,
         hidden_size=hidden_size,
@@ -1095,12 +1095,12 @@ def __init__(
 # Step 4: Training Script - Detailed Plan
 
 ## Files to Modify
-- `train_audio.py` - CLI arguments and datamodule setup
+- `train.py` - CLI arguments and datamodule setup
 - `src/lightning.py` - LitModule constructor and training_step
 
 ---
 
-## train_audio.py
+## train.py
 
 ### New/Modified Arguments
 
@@ -1246,21 +1246,10 @@ class LitModule(L.LightningModule):
         model_kwargs = dict(
             seq_len=seq_len,
             in_channels=latent_size,
-            num_classes=num_classes,
-            conditioning_type=conditioning_type,
+            clap_dim=clap_dim,
+            t5_dim=t5_dim,
+            prompt_seq_len=prompt_seq_len,
         )
-
-        if conditioning_type == "continuous":
-            # Use new sequence prompt embedder params
-            model_kwargs.update(
-                clap_dim=clap_dim,
-                t5_dim=t5_dim,
-                prompt_seq_len=prompt_seq_len,
-                conditioning_dim=clap_dim,  # For any legacy code paths
-            )
-        else:
-            # Class conditioning (unchanged)
-            model_kwargs["conditioning_dim"] = conditioning_dim
 
         self.model = All_models[model_name](**model_kwargs)
 ```
@@ -1269,12 +1258,10 @@ class LitModule(L.LightningModule):
 
 ```python
 def training_step(self, batch, batch_idx):
-    moments, prompt_data = batch
+    posterior_params, prompt_data = batch
     # prompt_data is now dict: {"clap": [B, 512], "t5": [B, 68, 1024], "t5_len": [B]}
 
-    posterior = SequenceDiagonalGaussianDistribution(moments)
-    x0 = posterior.sample()
-    x0 = self._normalize(x0)
+    x0 = sample_posterior(posterior_params)
 
     # Pass prompt_data dict to scheduler (which passes to model)
     loss = self.noise_scheduler.get_losses(self.model, x0, prompt_data)
@@ -1308,8 +1295,7 @@ def sample_latents(
 
     # prompt is passed directly to model.sample_with_cfg
     # Model handles dict structure internally
-    latents = self.model.sample_with_cfg(prompt, cfg_scale, scheduler)
-    return self.unnormalize_latents(latents)
+    return self.model.sample_with_cfg(prompt, cfg_scale, scheduler)
 ```
 
 ---
@@ -1345,7 +1331,7 @@ No changes needed in schedulers - they just pass prompt through.
 
 1. **CLI argument parsing:**
    ```bash
-   python train_audio.py --help
+   python train.py --help
    # Verify new args appear
    ```
 
@@ -1361,10 +1347,10 @@ No changes needed in schedulers - they just pass prompt through.
    dm = CachedAudioDataModule(...)
    dm.setup()
    batch = next(iter(dm.train_dataloader()))
-   moments, prompt_data = batch
+   posterior_params, prompt_data = batch
 
    # Verify shapes
-   assert moments.shape == (batch_size, 251, 256)
+   assert posterior_params.shape == (batch_size, 251, 256)
    assert prompt_data["clap"].shape == (batch_size, 512)
    assert prompt_data["t5"].shape == (batch_size, 68, 1024)
 
@@ -1376,7 +1362,7 @@ No changes needed in schedulers - they just pass prompt through.
 
 4. **Full integration test:**
    ```bash
-   python train_audio.py \
+   python train.py \
        --manifest-paths /share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl \
        --data-root /share/users/student/f/friverossego/datasets \
        --batch-size 2 \
@@ -1389,7 +1375,7 @@ No changes needed in schedulers - they just pass prompt through.
 
 # Step 5: Inference - Detailed Plan
 
-## File: `sample_audio.py`
+## File: `sample.py`
 
 ### New Imports
 
@@ -1688,7 +1674,7 @@ def precompute_embeddings(
 
 3. **Full inference pipeline:**
    ```bash
-   python sample_audio.py \
+   python sample.py \
        --checkpoint path/to/checkpoint.ckpt \
        --text "A dog barking in the distance" \
        --output-dir test_samples
@@ -1697,7 +1683,7 @@ def precompute_embeddings(
 
 4. **Batch inference with pre-computed embeddings:**
    ```bash
-   python sample_audio.py \
+   python sample.py \
        --checkpoint path/to/checkpoint.ckpt \
        --embedding path/to/embeddings.pt \
        --output-dir batch_samples
@@ -1714,7 +1700,7 @@ def precompute_embeddings(
 
 ## Quick Train Command (DiT-Base)
 ```bash
-python train_audio.py \
+python train.py \
   --manifest-paths /share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl \
   --data-root /share/users/student/f/friverossego/datasets \
   --silence-latent-path silence_samples/silence_10s_dacvae.pt \

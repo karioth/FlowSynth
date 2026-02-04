@@ -12,7 +12,7 @@
 - Metrics: `src/metrics/__init__.py`, `src/metrics/fid.py`, `src/metrics/inception.py`, `src/metrics/IS.py`
 - Assets: `pretrained_models/kl16.ckpt`
 - Docs: `README.md`, `AGENTS.md`
-- Audio scripts needing signature updates: `train_audio.py`, `train_audio.sh`, `train_audio_deniz.sh`, `overfit_sanity.py`
+- Audio scripts needing signature updates: `train.py`, `train.sh`, `train_deniz.sh`, `overfit_sanity.py`
 - Shared model code to simplify: `src/lightning.py`, `src/models/DiT.py`, `src/models/Transformer.py`, `src/models/AR_DiT.py`, `src/models/MaskedAR.py`, `src/models/modules/embeddings.py`
 
 ## Plan
@@ -29,7 +29,7 @@
    - Remove `pretrained_models/kl16.ckpt` (vision-only weight).
 
 4. Simplify shared models to continuous-only prompting
-   - `src/models/modules/embeddings.py`: remove `LabelEmbedder`; keep `SequencePromptEmbedder`.
+   - `src/models/modules/embeddings.py`: remove `LabelEmbedder`; keep `PromptEmbedder`.
    - `src/models/DiT.py`, `src/models/Transformer.py`, `src/models/AR_DiT.py`, `src/models/MaskedAR.py`:
      - Remove `conditioning_type`, `num_classes`, and `conditioning_dim` arguments.
      - Replace class/continuous branches with a single prompt-dict path.
@@ -45,8 +45,8 @@
      - Optional: drop `data_scale`/`data_bias` normalization to keep audio latents unmodified.
 
 6. Update audio entry points and scripts
-   - `train_audio.py`: remove `--conditioning-type` and any class-related args; align with new LitModule/model signatures.
-   - `train_audio.sh`, `train_audio_deniz.sh`: drop `--conditioning-type` flags.
+   - `train.py`: remove `--conditioning-type` and any class-related args; align with new LitModule/model signatures.
+   - `train.sh`, `train_deniz.sh`: drop `--conditioning-type` flags.
    - `overfit_sanity.py`: remove class-conditioning args and update model constructors.
 
 7. Docs and dependency cleanup
@@ -55,7 +55,7 @@
 
 8. Validation
    - Search for leftovers: `rg "vision|imagenet|FID|inception|torchvision|kl16|ImageNet"` from repo root.
-   - Quick import checks: `python train_audio.py --help`, `python sample_audio.py --help`, `python preprocess_audio.py --help`.
+   - Quick import checks: `python train.py --help`, `python sample.py --help`, `python preprocess_audio.py --help`.
    - Optional: `python -m compileall src` to catch syntax/import errors.
 
 ## Compatibility Notes
