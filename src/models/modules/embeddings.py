@@ -139,7 +139,7 @@ if __name__ == "__main__":
     batch_size = 2
     hidden_size = 768
 
-        embedder = PromptEmbedder(
+    embedder = PromptEmbedder(
         clap_dim=512,
         t5_dim=1024,
         hidden_size=hidden_size,

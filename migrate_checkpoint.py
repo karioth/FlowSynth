@@ -52,6 +52,8 @@ def _to_dict(value: object) -> dict:
 def _remap_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     remapped = {}
     for key, value in state_dict.items():
+        if key in {"scaling_factor", "bias_factor", "has_scaling"}:
+            continue
         if "model.label_embedder." in key:
             key = key.replace("model.label_embedder.", "model.prompt_embedder.")
         remapped[key] = value
