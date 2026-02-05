@@ -11,29 +11,48 @@ Training expects JSONL manifests whose entries point to `.pt` files containing:
 - `t5_len`: int
 - `latent_length`: int (optional, kept for metadata)
 
-### 1) Cache audio latents
+### 1) Preprocess audio + captions
+Default run (WavCaps + AudioCaps, writes merged manifest):
 ```bash
-python preprocess_audio.py --source files --data_dir /path/to/audio --device cpu --processes 8
-python preprocess_audio.py --source hf --hf_dataset OpenSound/AudioCaps --hf_split train --device cuda --processes 4
-```
-Outputs `<data_dir>_cached` (or `--cached_path`) with `.pt` latents.
-
-### 2) Cache caption embeddings
-```bash
-python preprocess_captions.py --metadata_path /path/to/manifest.jsonl --output_dir /path/to/text_embeddings --device cpu --processes 28
+python preprocess.py \
+  --data-root /path/to/datasets \
+  --wavcaps-json-root /path/to/jsons \
+  --wavcaps-audio-root /path/to/audio \
+  --device cpu --processes 8 --threads-per-process 4
 ```
 
-### 3) Build a training manifest
-If you are using the AudioCaps/WavCaps layout, build a merged manifest:
+WavCaps only:
 ```bash
-python scripts/build_manifest.py --data-root /path/to/datasets --output /path/to/manifest.jsonl
+python preprocess.py \
+  --dataset wavcaps \
+  --data-root /path/to/datasets \
+  --wavcaps-json-root /path/to/jsons \
+  --wavcaps-audio-root /path/to/audio \
+  --device cpu --processes 8 --threads-per-process 4
 ```
-Otherwise, provide your own JSONL manifest with `path` fields pointing at cached `.pt` files.
 
-### 4) Train
+AudioCaps only:
+```bash
+python preprocess.py \
+  --dataset audiocaps \
+  --data-root /path/to/datasets \
+  --device cuda --processes 4
+```
+
+Merged manifest only:
+```bash
+python preprocess.py \
+  --merge-manifests \
+  --data-root /path/to/datasets \
+  --output /path/to/datasets/audio_manifest_train.jsonl
+```
+
+Latents are written under `latents/<md5[:2]>/<key>.pt` for each subset/split.
+
+### 2) Train
 ```bash
 python train.py \
-  --manifest-paths /path/to/manifest.jsonl \
+  --manifest-paths /path/to/datasets/audio_manifest_train.jsonl \
   --data-root /path/to/datasets \
   --results-dir logs/run_01 \
   --model MaskedAR-L \
@@ -45,7 +64,7 @@ python train.py \
   --precision bf16-mixed
 ```
 
-### 5) Sample
+### 3) Sample
 ```bash
 python sample.py \
   --checkpoint logs/run_01/checkpoints/last.ckpt \

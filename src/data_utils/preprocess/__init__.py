@@ -9,9 +9,7 @@ from .common import (
     SkipLogger,
 )
 from .items import (
-    AudioItem,
     AUDIO_EXTS,
-    list_audio_files,
     non_silence_ratio,
     apply_duration_filter,
     load_audio_from_path,
@@ -30,9 +28,7 @@ __all__ = [
     "configure_worker_threads",
     "SkipLogger",
     # items
-    "AudioItem",
     "AUDIO_EXTS",
-    "list_audio_files",
     "non_silence_ratio",
     "apply_duration_filter",
     "load_audio_from_path",

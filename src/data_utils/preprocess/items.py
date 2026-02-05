@@ -6,45 +6,13 @@ Supports both file-based and HuggingFace dataset sources.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 import torchaudio
 
-from .common import _fast_scandir
-
-
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
-
-
-def list_audio_files(root: Path | str, exts: set[str] | None = None) -> list[Path]:
-    """
-    Recursively list audio files under a directory.
-
-    Args:
-        root: Root directory to scan
-        exts: File extensions to include (default: AUDIO_EXTS)
-
-    Returns:
-        Sorted list of Path objects for audio files
-    """
-    exts = AUDIO_EXTS if exts is None else exts
-    _, files = _fast_scandir(str(root), exts)
-    files = [Path(p) for p in files]
-    files.sort()
-    return files
-
-
-@dataclass
-class AudioItem:
-    """Represents a single audio item ready for encoding."""
-
-    id: str  # Source identifier (path or HF index)
-    wav: torch.Tensor  # Waveform [C, T], clamped to [-1, 1]
-    sr: int  # Sample rate
-    out_path: str  # Target output path
 
 
 def non_silence_ratio(wav: torch.Tensor, threshold: float = 1e-4) -> float:

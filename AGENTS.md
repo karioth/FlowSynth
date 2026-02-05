@@ -9,17 +9,16 @@ This file guides agentic coding in this repository.
 
 ## Repository overview
 - EqSynth is a PyTorch Lightning research codebase for modeling DACVAE latents as sequences.
-- Top-level scripts (`train.py`, `sample.py`, `preprocess_audio.py`, `preprocess_captions.py`) are the main entry points.
+- Top-level scripts (`train.py`, `sample.py`, `preprocess.py`) are the main entry points.
 - Core code lives in `src/` (models, Lightning module, data utilities).
 - Data/cache outputs are stored in `logs_*`, `audio_samples`, `pretrained_models`, `silence_samples`; avoid editing or committing large binaries.
-- Preprocessing utilities live in `src/data_utils/preprocess` and are used by `preprocess_audio.py` and `preprocess_captions.py`.
+- Preprocessing utilities live in `src/data_utils/preprocess` and are used by `preprocess.py`.
 - Slurm/HPC helpers live in `bash_scripts/` and `train.sh`; they assume a cluster environment.
 
 ## Repo layout (selected)
 - `train.py`: Lightning training entry point.
 - `sample.py`: Sampling/decoding entry point.
-- `preprocess_audio.py`, `preprocess_captions.py`: Caching pipelines.
-- `scripts/build_manifest.py`: Manifest builder for AudioCaps/WavCaps layouts.
+- `preprocess.py`: Unified audio + caption preprocessing entry point.
 - `src/lightning.py`: `LitModule` and optimizer/scheduler setup.
 - `src/utils.py`: Posterior sampling helper.
 - `src/models/`: Transformer/DiT/AR_DiT/MaskedAR implementations.
@@ -28,13 +27,8 @@ This file guides agentic coding in this repository.
 ## Build / lint / test
 ### Build/run (no build system)
 - There is no build step (no `pyproject.toml`, `setup.py`, or `Makefile`); run scripts from repo root.
-- Audio caching:
-  `python preprocess_audio.py --source files --data_dir /path/to/audio --device cpu --processes 8`
-  `python preprocess_audio.py --source hf --hf_dataset OpenSound/AudioCaps --hf_split train --device cuda --processes 4`
-- Caption embeddings:
-  `python preprocess_captions.py --metadata_path /path/to/manifest.jsonl --output_dir /path/to/text_embeddings --device cpu --processes 28`
-- Build a training manifest (AudioCaps/WavCaps layout):
-  `python scripts/build_manifest.py --data-root /path/to/datasets --output /path/to/manifest.jsonl`
+- Preprocess (AudioCaps + WavCaps, builds merged manifest):
+  `python preprocess.py --data-root /path/to/datasets --wavcaps-json-root /path/to/jsons --wavcaps-audio-root /path/to/audio --device cpu --processes 8`
 - Audio training:
   `python train.py --manifest-paths /path/to/manifest.jsonl --data-root /path/to/datasets --results-dir logs/... --model MaskedAR-L --seq-len 251 --latent-size 128 ...`
 - Audio sampling:
@@ -129,15 +123,13 @@ This file guides agentic coding in this repository.
 
 ## Distributed and multiprocessing notes
 - Distributed sampling/training relies on `RANK`, `WORLD_SIZE`, and `LOCAL_RANK`; initialize with `torch.distributed.init_process_group`.
-- Preprocessing supports node sharding via `node_rank` and `node_world_size`; see `preprocess_audio.py` and `preprocess_captions.py`.
+- Preprocessing supports node sharding via `node_rank` and `node_world_size`; see `preprocess.py`.
 - GPU preprocessing uses spawn and a shared queue; avoid `fork` with CUDA.
 
 ## Common pitfalls
-- `preprocess_audio.py` requires `--source` and a matching set of source-specific flags.
-- `preprocess_captions.py` expects a JSONL manifest with `key` and `caption` fields.
+- `preprocess.py` requires `--wavcaps-json-root`/`--wavcaps-audio-root` for WavCaps encoding and uses manifest-driven keys.
 
 ## Repo hygiene
 - Do not modify or commit large binary artifacts (checkpoints, samples, logs, pretrained weights).
 - Keep outputs in existing artifact directories (`logs_*`, `audio_samples`, `pretrained_models`, `silence_samples`).
 - Run scripts from repo root so `src` imports resolve correctly.
-
