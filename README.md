@@ -1,4 +1,4 @@
-# LatentLM (PyTorch)
+# EqSynth (PyTorch)
 
 Audio-only research codebase for modeling DACVAE latents as sequences (B, T, C).
 

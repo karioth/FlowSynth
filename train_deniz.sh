@@ -12,7 +12,7 @@
 
 echo "Running in shell: $SHELL"
 
-PROJECT_ROOT="/share/users/student/f/friverossego/LatentLM"
+PROJECT_ROOT="/share/users/student/f/friverossego/EqSynth"
 DATA_ROOT="/share/users/student/f/friverossego/datasets"
 MANIFEST_PATHS="/share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl"
 SILENCE_LATENT_PATH="silence_samples/silence_10s_dacvae.pt"

@@ -1,7 +1,14 @@
 This file guides agentic coding in this repository.
 
+## Editor/agent rules
+- No Cursor rules found (`.cursor/rules/` or `.cursorrules`).
+- No Copilot rules found (`.github/copilot-instructions.md`).
+- If at any point (during planning or while you are already building) you’re unsure about my intent/preferences or an ambiguity (even minor) could change the outcome, **ask immediately via the question tool** before continuing—don’t guess or proceed on assumptions.
+- Prefer fixing the root cause over adding guardrails. Don’t “paper over” issues with broad try/except, silent fallbacks, auto-reshapes/broadcasting, or helper utilities that coerce tensors into the expected shape. Make invariants explicit (correct shapes/dtypes/devices at module boundaries) and fail fast when they’re violated. Use defensive handling only at true external boundaries (I/O, datasets, corrupted files), and keep it narrow and explicit.
+- My development workflow is “local edit + Git deploy to HPC.” You (the agent) should focus on proposing code changes, refactors, and command snippets, but assume you cannot run code, access the cluster filesystem, or verify runtime behavior. I will run tests/debugging on the HPC and report back outputs. When suggesting changes, prefer small, reviewable diffs and include the exact commands I should run on the cluster to validate (e.g., pytest ..., python -m ..., sbatch ...). Avoid instructions that depend on interactive cluster access or long-running jobs unless explicitly requested.
+
 ## Repository overview
-- LatentLM is a PyTorch Lightning research codebase for modeling DACVAE latents as sequences.
+- EqSynth is a PyTorch Lightning research codebase for modeling DACVAE latents as sequences.
 - Top-level scripts (`train.py`, `sample.py`, `preprocess_audio.py`, `preprocess_captions.py`) are the main entry points.
 - Core code lives in `src/` (models, Lightning module, data utilities).
 - Data/cache outputs are stored in `logs_*`, `audio_samples`, `pretrained_models`, `silence_samples`; avoid editing or committing large binaries.
@@ -134,8 +141,3 @@ This file guides agentic coding in this repository.
 - Keep outputs in existing artifact directories (`logs_*`, `audio_samples`, `pretrained_models`, `silence_samples`).
 - Run scripts from repo root so `src` imports resolve correctly.
 
-## Editor/agent rules
-- No Cursor rules found (`.cursor/rules/` or `.cursorrules`).
-- No Copilot rules found (`.github/copilot-instructions.md`).
-- When ambiguity could change the outcome, ask immediately using the question tool and proceed after resolving it.
-- Avoid excessively defensive code, if we are dealing with errors potentially external to the codebase (as in dataset handling), then its fine. If not, avoid try and except and always diagnose the root cause to make sure the whole flow of the code works as expected.
