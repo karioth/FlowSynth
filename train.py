@@ -66,8 +66,7 @@ def main(args):
         prompt_seq_len=args.prompt_seq_len,
         prediction_type=args.prediction_type,
         batch_mul=args.batch_mul,
-        mask_prob_min=args.mask_prob_min,
-        mask_prob_max=args.mask_prob_max,
+        mask_prob=args.mask_prob,
         lr=args.lr,
         weight_decay=args.weight_decay,
         lr_scheduler=args.lr_scheduler,
@@ -142,8 +141,7 @@ if __name__ == "__main__":
                    help="Prompt sequence length (1 CLAP + max T5 tokens)")
     p.add_argument("--prediction-type", type=str, default="flow")
     p.add_argument("--batch-mul", type=int, default=2)
-    p.add_argument("--mask-prob-min", type=float, default=0.5)
-    p.add_argument("--mask-prob-max", type=float, default=0.5)
+    p.add_argument("--mask-prob", type=float, default=0.7)
 
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--epochs", type=int, default=100)

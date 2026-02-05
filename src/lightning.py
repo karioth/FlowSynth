@@ -31,8 +31,7 @@ class LitModule(L.LightningModule):
         t_m: float = 0.0,
         t_s: float = 1.0,
         batch_mul: int = 4,
-        mask_prob_min: float = 0.5,
-        mask_prob_max: float = 0.5,
+        mask_prob: float = 0.7,
         lr: float = 1e-4,
         weight_decay: float = 0.01,
         lr_scheduler: str = "cosine",
@@ -76,8 +75,7 @@ class LitModule(L.LightningModule):
                 prediction_type=prediction_type,
                 t_m=t_m,
                 t_s=t_s,
-                mask_prob_min=mask_prob_min,
-                mask_prob_max=mask_prob_max,
+                mask_prob=mask_prob,
                 batch_mul=batch_mul,
             )
         else:

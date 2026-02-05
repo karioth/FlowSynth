@@ -58,8 +58,7 @@ CLASS_DROPOUT_PROB = 0.1
 MODEL_KIND = "DiT"  # Options: DiT, Transformer, AR_DiT, MaskedAR
 DIFFUSION_DEPTH = 2
 BATCH_MUL = 1
-MASK_PROB_MIN = 0.5
-MASK_PROB_MAX = 0.5
+MASK_PROB = 0.7
 
 # Training
 LR = 1e-4
@@ -457,8 +456,7 @@ def main():
             prompt_dropout_prob=CLASS_DROPOUT_PROB,
         ).to(device)
         scheduler = FlowMatchingSchedulerMaskedAR(
-            mask_prob_min=MASK_PROB_MIN,
-            mask_prob_max=MASK_PROB_MAX,
+            mask_prob=MASK_PROB,
             batch_mul=BATCH_MUL,
         )
     else:

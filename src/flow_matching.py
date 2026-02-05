@@ -501,14 +501,12 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
     def __init__(
         self,
         *args,
-        mask_prob_min: float = 0.3,
-        mask_prob_max: float = 0.7,
+        mask_prob: float = 0.7,
         batch_mul: int = 1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.mask_prob_min = mask_prob_min
-        self.mask_prob_max = mask_prob_max
+        self.mask_prob = mask_prob
         self.batch_mul = batch_mul
 
     def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
@@ -516,12 +514,8 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         total_tokens = bsz * seq_len
 
         # 1. Sample mask ratio, compute num_masked across entire batch
-        p = (
-            torch.rand(1, device=x0_seq.device, dtype=x0_seq.dtype)
-            * (self.mask_prob_max - self.mask_prob_min)
-            + self.mask_prob_min
-        )
-        num_masked = max(1, round(p.item() * total_tokens))
+        p = float(self.mask_prob)
+        num_masked = max(1, round(p * total_tokens))
 
         # 2. Select num_masked random positions from flattened B*L
         rand_scores = torch.rand(total_tokens, device=x0_seq.device)
