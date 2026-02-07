@@ -1,3 +1,7 @@
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import List, Optional, Tuple
+
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -20,6 +24,11 @@ MASK_SIGMA = 64
 MASK_EXPANSION = 2
 MASK_KAPPA = 1.0
 
+# CPU parallelism knobs
+NUM_WORKERS = 16
+CHUNK_STEPS = 250
+TORCH_THREADS_PER_WORKER = 1
+
 STORE_ALL_MASK_BATCHES = True
 PLOT_BATCH_INDEX = 0
 
@@ -38,6 +47,14 @@ def _resolve_device(device_str: str) -> torch.device:
     if device.type == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("DEVICE is set to mps, but MPS is not available.")
     return device
+
+
+def _build_scheduler() -> FlowMatchingSchedulerMaskedAR:
+    scheduler = FlowMatchingSchedulerMaskedAR(mask_prob=MASK_PROB, batch_mul=1)
+    scheduler.mask_sigma = MASK_SIGMA
+    scheduler.mask_expansion = MASK_EXPANSION
+    scheduler.mask_kappa = MASK_KAPPA
+    return scheduler
 
 
 def _sample_mask_batch(
@@ -64,25 +81,28 @@ def _sample_mask_batch(
     return mask_flat.view(batch_size, seq_len)
 
 
-def run_experiment() -> tuple[list[torch.Tensor] | None, np.ndarray, np.ndarray]:
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
+def _run_chunk(
+    start_step: int,
+    num_steps: int,
+    seed: int,
+    device_str: str,
+    store_masks: bool,
+) -> Tuple[int, np.ndarray, np.ndarray, Optional[List[np.ndarray]]]:
+    device = _resolve_device(device_str)
+    if device.type == "cpu":
+        torch.set_num_threads(max(1, int(TORCH_THREADS_PER_WORKER)))
 
-    device = _resolve_device(DEVICE)
+    torch.manual_seed(seed)
+    np.random.seed(seed % (2**32 - 1))
 
-    scheduler = FlowMatchingSchedulerMaskedAR(mask_prob=MASK_PROB, batch_mul=1)
-    scheduler.mask_sigma = MASK_SIGMA
-    scheduler.mask_expansion = MASK_EXPANSION
-    scheduler.mask_kappa = MASK_KAPPA
+    scheduler = _build_scheduler()
 
-    all_masks = [] if STORE_ALL_MASK_BATCHES else None
-    per_sequence_ratios = np.empty(NUM_STEPS * BATCH_SIZE, dtype=np.float32)
-    per_step_quantiles = np.empty((NUM_STEPS, 3), dtype=np.float32)  # q10, q50, q90
+    all_masks = [] if store_masks else None
+    ratios_chunk = np.empty(num_steps * BATCH_SIZE, dtype=np.float32)
+    quantiles_chunk = np.empty((num_steps, 3), dtype=np.float32)  # q10, q50, q90
 
     cursor = 0
-    progress_every = max(1, NUM_STEPS // 10)
-
-    for step in range(NUM_STEPS):
+    for step in range(num_steps):
         mask = _sample_mask_batch(
             scheduler=scheduler,
             batch_size=BATCH_SIZE,
@@ -91,21 +111,99 @@ def run_experiment() -> tuple[list[torch.Tensor] | None, np.ndarray, np.ndarray]
         )
 
         if all_masks is not None:
-            all_masks.append(mask.cpu())
+            all_masks.append(mask.cpu().numpy())
 
         ratios = mask.float().mean(dim=1).cpu().numpy()
-        per_sequence_ratios[cursor:cursor + BATCH_SIZE] = ratios
-        per_step_quantiles[step] = np.quantile(ratios, [0.10, 0.50, 0.90])
+        ratios_chunk[cursor:cursor + BATCH_SIZE] = ratios
+        quantiles_chunk[step] = np.quantile(ratios, [0.10, 0.50, 0.90])
         cursor += BATCH_SIZE
 
-        if (step + 1) % progress_every == 0 or step == 0:
-            print(f"[{step + 1:5d}/{NUM_STEPS}] mean ratio this batch: {ratios.mean():.4f}")
+    return start_step, ratios_chunk, quantiles_chunk, all_masks
+
+
+def run_experiment() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
+    device = _resolve_device(DEVICE)
+    print(
+        f"Running mask diagnostic: device={DEVICE}, steps={NUM_STEPS}, "
+        f"batch={BATCH_SIZE}, seq_len={SEQ_LEN}, workers={NUM_WORKERS}"
+    )
+
+    if NUM_WORKERS <= 1:
+        start_step, ratios_chunk, quantiles_chunk, all_masks = _run_chunk(
+            start_step=0,
+            num_steps=NUM_STEPS,
+            seed=SEED,
+            device_str=DEVICE,
+            store_masks=STORE_ALL_MASK_BATCHES,
+        )
+        del start_step
+        return all_masks, ratios_chunk, quantiles_chunk
+
+    if device.type != "cpu":
+        raise ValueError("NUM_WORKERS > 1 is currently supported only for DEVICE='cpu'.")
+
+    if CHUNK_STEPS <= 0:
+        raise ValueError(f"CHUNK_STEPS must be > 0, got {CHUNK_STEPS}.")
+
+    if STORE_ALL_MASK_BATCHES:
+        print(
+            "Warning: STORE_ALL_MASK_BATCHES=True with multiprocessing can use a lot of RAM."
+        )
+
+    total_cpus = os.cpu_count() or 1
+    worker_count = max(1, min(int(NUM_WORKERS), total_cpus))
+    if worker_count != NUM_WORKERS:
+        print(f"Clamping NUM_WORKERS from {NUM_WORKERS} to {worker_count} (available CPUs).")
+
+    chunk_specs: list[tuple[int, int]] = []
+    for start in range(0, NUM_STEPS, CHUNK_STEPS):
+        chunk_specs.append((start, min(CHUNK_STEPS, NUM_STEPS - start)))
+
+    per_sequence_ratios = np.empty(NUM_STEPS * BATCH_SIZE, dtype=np.float32)
+    per_step_quantiles = np.empty((NUM_STEPS, 3), dtype=np.float32)
+    all_masks: Optional[List[np.ndarray]]
+    if STORE_ALL_MASK_BATCHES:
+        all_masks = [np.zeros((0, 0), dtype=np.float32) for _ in range(NUM_STEPS)]
+    else:
+        all_masks = None
+
+    completed_steps = 0
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        futures = []
+        for chunk_idx, (start, count) in enumerate(chunk_specs):
+            chunk_seed = SEED + 100_003 * (chunk_idx + 1)
+            futures.append(
+                executor.submit(
+                    _run_chunk,
+                    start,
+                    count,
+                    chunk_seed,
+                    DEVICE,
+                    STORE_ALL_MASK_BATCHES,
+                )
+            )
+
+        for future in as_completed(futures):
+            start, ratios_chunk, quantiles_chunk, masks_chunk = future.result()
+            count = quantiles_chunk.shape[0]
+            end = start + count
+
+            per_step_quantiles[start:end] = quantiles_chunk
+            ratio_start = start * BATCH_SIZE
+            ratio_end = end * BATCH_SIZE
+            per_sequence_ratios[ratio_start:ratio_end] = ratios_chunk
+
+            if all_masks is not None and masks_chunk is not None:
+                all_masks[start:end] = masks_chunk
+
+            completed_steps += count
+            print(f"[{completed_steps:5d}/{NUM_STEPS}] steps complete")
 
     return all_masks, per_sequence_ratios, per_step_quantiles
 
 
 def _plot_results(
-    all_masks: list[torch.Tensor] | None,
+    all_masks: Optional[List[np.ndarray]],
     per_sequence_ratios: np.ndarray,
     per_step_quantiles: np.ndarray,
 ) -> None:
@@ -138,7 +236,7 @@ def _plot_results(
         preview_title = "Batch mask snapshot (not stored)"
     else:
         idx = max(0, min(PLOT_BATCH_INDEX, len(all_masks) - 1))
-        preview_mask = all_masks[idx].numpy().astype(np.float32)
+        preview_mask = all_masks[idx].astype(np.float32)
         preview_title = f"Batch mask snapshot (step {idx})"
 
     im = axes[2].imshow(preview_mask, aspect="auto", interpolation="nearest")
@@ -159,7 +257,7 @@ def _plot_results(
         plt.close(fig)
 
 
-def main() -> tuple[list[torch.Tensor] | None, np.ndarray, np.ndarray]:
+def main() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
     all_masks, per_sequence_ratios, per_step_quantiles = run_experiment()
 
     print("\nDiagnostics")
