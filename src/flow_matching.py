@@ -508,18 +508,88 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         super().__init__(*args, **kwargs)
         self.mask_prob = mask_prob
         self.batch_mul = batch_mul
+        self.mask_sigma = 64
+        self.mask_expansion = 2
+        self.mask_kappa = 1.0
+
+    def _gaussian_lowpass_field(
+        self,
+        total_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        sigma = int(self.mask_sigma)
+        expansion = int(self.mask_expansion)
+
+        if sigma <= 0:
+            raise ValueError(f"mask_sigma must be > 0, got {sigma}.")
+        if expansion <= 0:
+            raise ValueError(f"mask_expansion must be > 0, got {expansion}.")
+        if total_tokens <= 0:
+            raise ValueError(f"total_tokens must be > 0, got {total_tokens}.")
+
+        field_dtype = torch.float32
+        radius = expansion * sigma
+
+        noise = torch.randn(1, 1, total_tokens, device=device, dtype=field_dtype)
+        x = torch.arange(-radius, radius + 1, device=device, dtype=field_dtype)
+        kernel = torch.exp(-(x * x) / (2.0 * sigma * sigma))
+        kernel = (kernel / kernel.sum()).view(1, 1, -1)
+
+        noise = F.pad(noise, (radius, radius), mode="circular")
+        field = F.conv1d(noise, kernel)[0, 0]
+        field = (field - field.mean()) / (field.std(unbiased=False) + 1e-8)
+        return field
+
+    @staticmethod
+    def _sample_gumbel(
+        shape: tuple[int, ...],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        eps = 1e-12
+        u = torch.rand(shape, device=device, dtype=dtype).clamp_(eps, 1 - eps)
+        return -torch.log(-torch.log(u))
+
+    def _sample_mask_indices(
+        self,
+        total_tokens: int,
+        num_masked: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if num_masked <= 0 or num_masked > total_tokens:
+            raise ValueError(
+                f"num_masked must be in [1, {total_tokens}], got {num_masked}."
+            )
+        if num_masked == total_tokens:
+            return torch.arange(total_tokens, device=device)
+
+        field = self._gaussian_lowpass_field(total_tokens, device=device)
+        gumbel = self._sample_gumbel((total_tokens,), device=device, dtype=field.dtype)
+        scores = self.mask_kappa * field + gumbel
+        return torch.topk(scores, num_masked, largest=True, sorted=False).indices
 
     def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
         bsz, seq_len, latent_size = x0_seq.shape
         total_tokens = bsz * seq_len
 
-        # 1. Sample mask ratio, compute num_masked across entire batch
+        # 1. Compute fixed num_masked across the flattened batch
         p = float(self.mask_prob)
-        num_masked = max(1, round(p * total_tokens))
+        if not (0.0 <= p <= 1.0):
+            raise ValueError(f"mask_prob must be in [0, 1], got {p}.")
 
-        # 2. Select num_masked random positions from flattened B*L
-        rand_scores = torch.rand(total_tokens, device=x0_seq.device)
-        flat_mask_indices = rand_scores.argsort()[:num_masked]  # (num_masked,)
+        num_masked = round(p * total_tokens)
+        if num_masked <= 0:
+            raise ValueError(
+                "round(mask_prob * total_tokens) must be > 0 for MaskedAR training. "
+                f"Got mask_prob={p}, total_tokens={total_tokens}."
+            )
+
+        # 2. Select exact-K masked positions with low-pass field + Gumbel-topK
+        flat_mask_indices = self._sample_mask_indices(
+            total_tokens=total_tokens,
+            num_masked=num_masked,
+            device=x0_seq.device,
+        )
 
         # 3. Create boolean mask for backbone (reshape to B, L)
         mask_flat = torch.zeros(total_tokens, dtype=torch.bool, device=x0_seq.device)
