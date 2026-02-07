@@ -20,9 +20,23 @@ BATCH_SIZE = 256
 SEQ_LEN = 251
 
 MASK_PROB = 0.75
-MASK_SIGMA = 64
-MASK_EXPANSION = 2
-MASK_KAPPA = 0.3
+
+# Ratio schedule options: "mntp_mixture", "trunc_normal", "uniform", "fixed"
+SCHEDULE_KIND = "mntp_mixture"
+
+# MNTP-like mixture params (truncated normals in [0, 1])
+MIX_HIGH_WEIGHT = 0.82
+MIX_HIGH_MEAN = 0.85
+MIX_HIGH_STD = 0.03
+MIX_LOW_MEAN = 0.55
+MIX_LOW_STD = 0.20
+
+# Single truncated normal params (used when SCHEDULE_KIND == "trunc_normal")
+TRUNC_MEAN = 0.75
+TRUNC_STD = 0.12
+
+# Fixed ratio value (used when SCHEDULE_KIND == "fixed")
+FIXED_RATIO = 0.75
 
 # CPU parallelism knobs
 NUM_WORKERS = 62
@@ -34,7 +48,7 @@ PLOT_BATCH_INDEX = 0
 
 SAVE_PLOT = True
 SHOW_PLOT = True
-PLOT_PATH = "mask_ratio_distribution_sigma64_kappa3e-1.png"
+PLOT_PATH = "mask_ratio_distribution.png"
 
 SAVE_RATIOS = False
 RATIOS_PATH = "mask_ratios.npy"
@@ -51,9 +65,19 @@ def _resolve_device(device_str: str) -> torch.device:
 
 def _build_scheduler() -> FlowMatchingSchedulerMaskedAR:
     scheduler = FlowMatchingSchedulerMaskedAR(mask_prob=MASK_PROB, batch_mul=1)
-    scheduler.mask_sigma = MASK_SIGMA
-    scheduler.mask_expansion = MASK_EXPANSION
-    scheduler.mask_kappa = MASK_KAPPA
+
+    scheduler.mask_schedule = SCHEDULE_KIND
+
+    scheduler.mask_ratio_mix_high_weight = MIX_HIGH_WEIGHT
+    scheduler.mask_ratio_high_mean = MIX_HIGH_MEAN
+    scheduler.mask_ratio_high_std = MIX_HIGH_STD
+    scheduler.mask_ratio_low_mean = MIX_LOW_MEAN
+    scheduler.mask_ratio_low_std = MIX_LOW_STD
+
+    scheduler.mask_ratio_trunc_mean = TRUNC_MEAN
+    scheduler.mask_ratio_trunc_std = TRUNC_STD
+    scheduler.mask_ratio_fixed = FIXED_RATIO
+
     return scheduler
 
 
@@ -63,22 +87,12 @@ def _sample_mask_batch(
     seq_len: int,
     device: torch.device,
 ) -> torch.Tensor:
-    total_tokens = batch_size * seq_len
-    num_masked = round(float(scheduler.mask_prob) * total_tokens)
-    if num_masked <= 0:
-        raise ValueError(
-            "round(mask_prob * total_tokens) must be > 0 for this diagnostic. "
-            f"Got mask_prob={scheduler.mask_prob}, total_tokens={total_tokens}."
-        )
-
-    flat_mask_indices = scheduler._sample_mask_indices(
-        total_tokens=total_tokens,
-        num_masked=num_masked,
+    mask, _ = scheduler._sample_mask(
+        batch_size=batch_size,
+        seq_len=seq_len,
         device=device,
     )
-    mask_flat = torch.zeros(total_tokens, dtype=torch.bool, device=device)
-    mask_flat[flat_mask_indices] = True
-    return mask_flat.view(batch_size, seq_len)
+    return mask
 
 
 def _run_chunk(
@@ -125,7 +139,8 @@ def run_experiment() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray
     device = _resolve_device(DEVICE)
     print(
         f"Running mask diagnostic: device={DEVICE}, steps={NUM_STEPS}, "
-        f"batch={BATCH_SIZE}, seq_len={SEQ_LEN}, workers={NUM_WORKERS}"
+        f"batch={BATCH_SIZE}, seq_len={SEQ_LEN}, workers={NUM_WORKERS}, "
+        f"schedule={SCHEDULE_KIND}"
     )
 
     if NUM_WORKERS <= 1:

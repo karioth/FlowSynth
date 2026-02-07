@@ -508,71 +508,215 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         super().__init__(*args, **kwargs)
         self.mask_prob = mask_prob
         self.batch_mul = batch_mul
-        self.mask_sigma = 64
-        self.mask_expansion = 2
-        self.mask_kappa = 1.0
+        # Hardcoded MNTP-like schedule defaults.
+        self.mask_schedule = "mntp_mixture"
 
-    def _gaussian_lowpass_field(
-        self,
-        total_tokens: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        sigma = int(self.mask_sigma)
-        expansion = int(self.mask_expansion)
+        # Mixture component: high-mask normal + low-mask tail normal, both truncated to [0, 1].
+        self.mask_ratio_mix_high_weight = 0.82
+        self.mask_ratio_high_mean = 0.85
+        self.mask_ratio_high_std = 0.03
+        self.mask_ratio_low_mean = 0.55
+        self.mask_ratio_low_std = 0.20
 
-        if sigma <= 0:
-            raise ValueError(f"mask_sigma must be > 0, got {sigma}.")
-        if expansion <= 0:
-            raise ValueError(f"mask_expansion must be > 0, got {expansion}.")
-        if total_tokens <= 0:
-            raise ValueError(f"total_tokens must be > 0, got {total_tokens}.")
-
-        field_dtype = torch.float32
-        radius = expansion * sigma
-
-        noise = torch.randn(1, 1, total_tokens, device=device, dtype=field_dtype)
-        x = torch.arange(-radius, radius + 1, device=device, dtype=field_dtype)
-        kernel = torch.exp(-(x * x) / (2.0 * sigma * sigma))
-        kernel = (kernel / kernel.sum()).view(1, 1, -1)
-
-        noise = F.pad(noise, (radius, radius), mode="circular")
-        field = F.conv1d(noise, kernel)[0, 0]
-        field = (field - field.mean()) / (field.std(unbiased=False) + 1e-8)
-        return field
+        # Optional alternate schedules (kept for diagnostics without CLI changes).
+        self.mask_ratio_trunc_mean = 0.75
+        self.mask_ratio_trunc_std = 0.12
+        self.mask_ratio_fixed = 0.75
 
     @staticmethod
-    def _sample_gumbel(
-        shape: tuple[int, ...],
+    def _sample_truncated_normal(
+        num_samples: int,
+        mean: float,
+        std: float,
         device: torch.device,
-        dtype: torch.dtype,
+        dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
-        eps = 1e-12
-        u = torch.rand(shape, device=device, dtype=dtype).clamp_(eps, 1 - eps)
-        return -torch.log(-torch.log(u))
+        if num_samples < 0:
+            raise ValueError(f"num_samples must be >= 0, got {num_samples}.")
+        if num_samples == 0:
+            return torch.empty(0, device=device, dtype=dtype)
+        if std <= 0.0:
+            raise ValueError(f"std must be > 0, got {std}.")
 
-    def _sample_mask_indices(
+        out = torch.empty(num_samples, device=device, dtype=dtype)
+        filled = 0
+        while filled < num_samples:
+            need = num_samples - filled
+            draw_count = max(16, 2 * need)
+            draws = torch.randn(draw_count, device=device, dtype=dtype) * std + mean
+            valid = draws[(draws >= 0.0) & (draws <= 1.0)]
+            take = min(need, int(valid.numel()))
+            if take > 0:
+                out[filled : filled + take] = valid[:take]
+                filled += take
+
+        return out
+
+    def _sample_sequence_ratios(
         self,
-        total_tokens: int,
-        num_masked: int,
+        batch_size: int,
         device: torch.device,
     ) -> torch.Tensor:
-        if num_masked <= 0 or num_masked > total_tokens:
-            raise ValueError(
-                f"num_masked must be in [1, {total_tokens}], got {num_masked}."
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}.")
+
+        schedule = self.mask_schedule
+        if schedule == "mntp_mixture":
+            mix_weight = float(self.mask_ratio_mix_high_weight)
+            if not (0.0 <= mix_weight <= 1.0):
+                raise ValueError(
+                    f"mask_ratio_mix_high_weight must be in [0, 1], got {mix_weight}."
+                )
+
+            pick_high = torch.rand(batch_size, device=device) < mix_weight
+            ratios = torch.empty(batch_size, device=device, dtype=torch.float32)
+
+            num_high = int(pick_high.sum().item())
+            if num_high > 0:
+                ratios[pick_high] = self._sample_truncated_normal(
+                    num_samples=num_high,
+                    mean=float(self.mask_ratio_high_mean),
+                    std=float(self.mask_ratio_high_std),
+                    device=device,
+                )
+
+            num_low = batch_size - num_high
+            if num_low > 0:
+                ratios[~pick_high] = self._sample_truncated_normal(
+                    num_samples=num_low,
+                    mean=float(self.mask_ratio_low_mean),
+                    std=float(self.mask_ratio_low_std),
+                    device=device,
+                )
+
+            return ratios
+
+        if schedule == "trunc_normal":
+            return self._sample_truncated_normal(
+                num_samples=batch_size,
+                mean=float(self.mask_ratio_trunc_mean),
+                std=float(self.mask_ratio_trunc_std),
+                device=device,
             )
-        if num_masked == total_tokens:
-            return torch.arange(total_tokens, device=device)
 
-        field = self._gaussian_lowpass_field(total_tokens, device=device)
-        gumbel = self._sample_gumbel((total_tokens,), device=device, dtype=field.dtype)
-        scores = self.mask_kappa * field + gumbel
-        return torch.topk(scores, num_masked, largest=True, sorted=False).indices
+        if schedule == "uniform":
+            return torch.rand(batch_size, device=device, dtype=torch.float32)
 
-    def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
-        bsz, seq_len, latent_size = x0_seq.shape
+        if schedule == "fixed":
+            fixed = float(self.mask_ratio_fixed)
+            if not (0.0 <= fixed <= 1.0):
+                raise ValueError(f"mask_ratio_fixed must be in [0, 1], got {fixed}.")
+            return torch.full((batch_size,), fixed, device=device, dtype=torch.float32)
+
+        raise ValueError(
+            "Unknown mask_schedule. Expected one of "
+            "{'mntp_mixture', 'trunc_normal', 'uniform', 'fixed'}, "
+            f"got {schedule!r}."
+        )
+
+    @staticmethod
+    def _project_sequence_counts_to_global_k(
+        sequence_ratios: torch.Tensor,
+        seq_len: int,
+        num_masked: int,
+    ) -> torch.Tensor:
+        if sequence_ratios.dim() != 1:
+            raise ValueError(
+                "sequence_ratios must be 1D, "
+                f"got shape {tuple(sequence_ratios.shape)}."
+            )
+        if seq_len <= 0:
+            raise ValueError(f"seq_len must be > 0, got {seq_len}.")
+
+        bsz = int(sequence_ratios.shape[0])
+        if bsz <= 0:
+            raise ValueError("sequence_ratios cannot be empty.")
+
         total_tokens = bsz * seq_len
+        if num_masked < 0 or num_masked > total_tokens:
+            raise ValueError(
+                f"num_masked must be in [0, {total_tokens}], got {num_masked}."
+            )
 
-        # 1. Compute fixed num_masked across the flattened batch
+        target = sequence_ratios.clamp(0.0, 1.0) * float(seq_len)
+        target_sum = float(target.sum().item())
+
+        if target_sum <= 0.0:
+            target = torch.full_like(target, float(num_masked) / float(bsz))
+        else:
+            target = target * (float(num_masked) / target_sum)
+        target = target.clamp(0.0, float(seq_len))
+
+        counts = torch.floor(target).to(torch.long)
+        delta = int(num_masked - int(counts.sum().item()))
+        if delta == 0:
+            return counts
+
+        frac = target - counts.to(dtype=target.dtype)
+        tie_break = torch.rand_like(frac) * 1e-6
+
+        if delta > 0:
+            while delta > 0:
+                capacity = counts < seq_len
+                if not bool(capacity.any()):
+                    raise RuntimeError("Unable to add masks while projecting counts to global K.")
+                scores = (frac + tie_break).masked_fill(~capacity, -1e9)
+                add = min(delta, int(capacity.sum().item()))
+                idx = torch.topk(scores, k=add, largest=True, sorted=False).indices
+                counts[idx] += 1
+                delta -= add
+        else:
+            delta = -delta
+            while delta > 0:
+                removable = counts > 0
+                if not bool(removable.any()):
+                    raise RuntimeError("Unable to remove masks while projecting counts to global K.")
+                scores = (frac + tie_break).masked_fill(~removable, 1e9)
+                remove = min(delta, int(removable.sum().item()))
+                idx = torch.topk(scores, k=remove, largest=False, sorted=False).indices
+                counts[idx] -= 1
+                delta -= remove
+
+        return counts
+
+    @staticmethod
+    def _sample_uniform_mask_from_counts(
+        per_sequence_counts: torch.Tensor,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if per_sequence_counts.dim() != 1:
+            raise ValueError(
+                "per_sequence_counts must be 1D, "
+                f"got shape {tuple(per_sequence_counts.shape)}."
+            )
+        if seq_len <= 0:
+            raise ValueError(f"seq_len must be > 0, got {seq_len}.")
+
+        if torch.any(per_sequence_counts < 0) or torch.any(per_sequence_counts > seq_len):
+            raise ValueError(
+                f"per_sequence_counts values must be in [0, {seq_len}]."
+            )
+
+        bsz = int(per_sequence_counts.shape[0])
+        random_scores = torch.rand(bsz, seq_len, device=device)
+        sorted_indices = torch.argsort(random_scores, dim=1)
+
+        mask = torch.zeros((bsz, seq_len), dtype=torch.bool, device=device)
+        for b in range(bsz):
+            count_b = int(per_sequence_counts[b].item())
+            if count_b > 0:
+                mask[b, sorted_indices[b, :count_b]] = True
+
+        return mask
+
+    def _sample_mask(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        total_tokens = batch_size * seq_len
         p = float(self.mask_prob)
         if not (0.0 <= p <= 1.0):
             raise ValueError(f"mask_prob must be in [0, 1], got {p}.")
@@ -584,17 +728,39 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
                 f"Got mask_prob={p}, total_tokens={total_tokens}."
             )
 
-        # 2. Select exact-K masked positions with low-pass field + Gumbel-topK
-        flat_mask_indices = self._sample_mask_indices(
-            total_tokens=total_tokens,
+        sequence_ratios = self._sample_sequence_ratios(batch_size=batch_size, device=device)
+        per_sequence_counts = self._project_sequence_counts_to_global_k(
+            sequence_ratios=sequence_ratios,
+            seq_len=seq_len,
             num_masked=num_masked,
-            device=x0_seq.device,
         )
 
-        # 3. Create boolean mask for backbone (reshape to B, L)
-        mask_flat = torch.zeros(total_tokens, dtype=torch.bool, device=x0_seq.device)
-        mask_flat[flat_mask_indices] = True
-        mask = mask_flat.view(bsz, seq_len)  # (B, L)
+        mask = self._sample_uniform_mask_from_counts(
+            per_sequence_counts=per_sequence_counts,
+            seq_len=seq_len,
+            device=device,
+        )
+
+        flat_mask_indices = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(1)
+        if int(flat_mask_indices.numel()) != num_masked:
+            raise RuntimeError(
+                "Mask sampler produced wrong number of masked tokens. "
+                f"Expected {num_masked}, got {int(flat_mask_indices.numel())}."
+            )
+
+        return mask, flat_mask_indices
+
+    def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
+        bsz, seq_len, latent_size = x0_seq.shape
+        total_tokens = bsz * seq_len
+
+        # 1. Sample per-sequence ratios, project to exact global-K, and mask uniformly per sequence.
+        mask, flat_mask_indices = self._sample_mask(
+            batch_size=bsz,
+            seq_len=seq_len,
+            device=x0_seq.device,
+        )
+        num_masked = int(flat_mask_indices.numel())
 
         # 4. Gather x0 at masked positions only
         x0_flat = x0_seq.reshape(total_tokens, latent_size)  # (B*L, C)
