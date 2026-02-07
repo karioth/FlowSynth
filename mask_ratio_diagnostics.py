@@ -209,14 +209,20 @@ def _plot_results(
 ) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    # 1) Distribution over all sequence ratios across simulated training steps
-    bins = min(100, max(30, int(np.sqrt(per_sequence_ratios.size))))
-    axes[0].hist(per_sequence_ratios, bins=bins, density=True, alpha=0.85)
+    # 1) Distribution over all sequence ratios across simulated training steps.
+    # Ratios are discrete (m / SEQ_LEN), so plot the exact PMF to avoid binning artifacts.
+    masked_counts = np.rint(per_sequence_ratios * SEQ_LEN).astype(np.int32)
+    masked_counts = np.clip(masked_counts, 0, SEQ_LEN)
+    pmf = np.bincount(masked_counts, minlength=SEQ_LEN + 1).astype(np.float64)
+    pmf /= pmf.sum()
+    ratio_grid = np.arange(SEQ_LEN + 1, dtype=np.float64) / float(SEQ_LEN)
+    axes[0].bar(ratio_grid, pmf, width=0.92 / float(SEQ_LEN), alpha=0.85, align="center")
     axes[0].axvline(MASK_PROB, linestyle="--", label="target p_global")
     axes[0].axvline(per_sequence_ratios.mean(), linestyle="-", label="empirical mean")
     axes[0].set_title("Per-sequence mask ratio distribution")
     axes[0].set_xlabel("mask ratio")
-    axes[0].set_ylabel("density")
+    axes[0].set_ylabel("probability mass")
+    axes[0].set_xlim(-0.5 / float(SEQ_LEN), 1.0 + 0.5 / float(SEQ_LEN))
     axes[0].legend()
 
     # 2) Evolution of sequence-level spread over steps
