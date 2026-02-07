@@ -495,8 +495,9 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
     """
     Scheduler for MaskedARTransformer.
 
-    Samples per-sequence masking logits from a logistic-normal prior,
-    then selects an exact global-K mask with Gumbel-TopK.
+    Samples per-sequence empirical mask probabilities from a bounded,
+    mode-controlled beta prior, then selects an exact global-K mask with
+    Gumbel-TopK.
     Computes loss only at masked positions.
     """
 
@@ -510,17 +511,56 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         super().__init__(*args, **kwargs)
         self.mask_prob = mask_prob
         self.batch_mul = batch_mul
-        # Per-sequence logistic-normal prior on row logits.
-        # Under global exact Top-K, global logit shifts are rank-invariant,
-        # so mask_logit_std is the main shape knob.
+        # Empirical ratio prior parameters.
+        # Defaults are derived from mask_prob and are safe for typical
+        # MaskedAR settings (e.g., mask_prob around 0.7-0.8).
         p = float(mask_prob)
-        if 0.0 < p < 1.0:
-            self.mask_logit_mean = math.log(p / (1.0 - p))
-        else:
-            self.mask_logit_mean = 0.0
-        self.mask_logit_std = 1.0
+        eps = 1e-4
+        self.mask_ratio_empirical_min = max(eps, p - 0.45)
+        self.mask_ratio_empirical_max = min(1.0 - eps, p + 0.15)
+        if self.mask_ratio_empirical_max - self.mask_ratio_empirical_min < 1e-3:
+            self.mask_ratio_empirical_min = max(eps, p - 0.10)
+            self.mask_ratio_empirical_max = min(1.0 - eps, p + 0.10)
+        self.mask_ratio_empirical_mode = min(
+            self.mask_ratio_empirical_max - 1e-3,
+            max(self.mask_ratio_empirical_min + 1e-3, p + 0.05),
+        )
 
-    def _sample_sequence_logits(
+    @staticmethod
+    def _solve_beta_shape_from_mean_and_mode(
+        mean_01: float,
+        mode_01: float,
+    ) -> tuple[float, float]:
+        if not (0.0 < mean_01 < 1.0):
+            raise ValueError(f"mean_01 must be in (0, 1), got {mean_01}.")
+        if not (0.0 < mode_01 < 1.0):
+            raise ValueError(f"mode_01 must be in (0, 1), got {mode_01}.")
+
+        denom = mode_01 - mean_01
+        if abs(denom) < 1e-8:
+            raise ValueError(
+                "mode_01 must differ from mean_01 to identify beta shape. "
+                f"Got mean_01={mean_01}, mode_01={mode_01}."
+            )
+
+        s = (2.0 * mode_01 - 1.0) / denom
+        if (not math.isfinite(s)) or s <= 0.0:
+            raise ValueError(
+                "Invalid beta shape from mean/mode. "
+                f"Computed concentration s={s} from mean_01={mean_01}, mode_01={mode_01}."
+            )
+
+        alpha = mean_01 * s
+        beta = (1.0 - mean_01) * s
+        if alpha <= 1.0 or beta <= 1.0:
+            raise ValueError(
+                "Chosen empirical bounds/mode produce non-unimodal boundary-heavy beta. "
+                f"Need alpha>1 and beta>1, got alpha={alpha}, beta={beta}."
+            )
+
+        return float(alpha), float(beta)
+
+    def _sample_sequence_probabilities(
         self,
         batch_size: int,
         device: torch.device,
@@ -528,18 +568,37 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}.")
 
-        mean = float(self.mask_logit_mean)
-        std = float(self.mask_logit_std)
-        if not math.isfinite(mean):
+        min_ratio = float(self.mask_ratio_empirical_min)
+        max_ratio = float(self.mask_ratio_empirical_max)
+        mode_ratio = float(self.mask_ratio_empirical_mode)
+        p = float(self.mask_prob)
+
+        if not (0.0 < min_ratio < max_ratio < 1.0):
             raise ValueError(
-                f"mask_logit_mean must be finite, got {mean}."
+                "mask_ratio_empirical bounds must satisfy 0 < min < max < 1, "
+                f"got min={min_ratio}, max={max_ratio}."
             )
-        if (not math.isfinite(std)) or std <= 0.0:
+        if not (min_ratio < p < max_ratio):
             raise ValueError(
-                f"mask_logit_std must be finite and > 0, got {std}."
+                "mask_prob must lie strictly between empirical bounds. "
+                f"Got mask_prob={p}, min={min_ratio}, max={max_ratio}."
+            )
+        if not (min_ratio < mode_ratio < max_ratio):
+            raise ValueError(
+                "mask_ratio_empirical_mode must lie strictly between empirical bounds. "
+                f"Got mode={mode_ratio}, min={min_ratio}, max={max_ratio}."
             )
 
-        return torch.randn(batch_size, device=device, dtype=torch.float32) * std + mean
+        mean_01 = (p - min_ratio) / (max_ratio - min_ratio)
+        mode_01 = (mode_ratio - min_ratio) / (max_ratio - min_ratio)
+        alpha, beta = self._solve_beta_shape_from_mean_and_mode(mean_01, mode_01)
+
+        base = torch.distributions.Beta(
+            concentration1=torch.tensor(alpha, device=device, dtype=torch.float32),
+            concentration0=torch.tensor(beta, device=device, dtype=torch.float32),
+        ).sample((batch_size,))
+
+        return min_ratio + (max_ratio - min_ratio) * base
 
     def _sample_mask(
         self,
@@ -564,8 +623,12 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
                 f"Got mask_prob={p}, total_tokens={total_tokens}."
             )
 
-        row_logits = self._sample_sequence_logits(batch_size=batch_size, device=device)
-        eps = torch.finfo(row_logits.dtype).eps
+        row_probs = self._sample_sequence_probabilities(batch_size=batch_size, device=device)
+        eps = torch.finfo(row_probs.dtype).eps
+        row_probs = row_probs.clamp(min=eps, max=1.0 - eps)
+        # If score = l + Gumbel(0,1), P(score > 0) = 1 - exp(-exp(l)).
+        # This chooses l so that (at zero threshold) the marginal is row_probs.
+        row_logits = torch.log(-torch.log1p(-row_probs))
 
         uniform = torch.rand((batch_size, seq_len), device=device, dtype=row_logits.dtype)
         uniform = uniform.clamp(min=eps, max=1.0 - eps)
@@ -600,7 +663,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         bsz, seq_len, latent_size = x0_seq.shape
         total_tokens = bsz * seq_len
 
-        # 1. Sample per-sequence logits and select exact global-K tokens via Gumbel-TopK.
+        # 1. Sample per-sequence probabilities and select exact global-K tokens via Gumbel-TopK.
         mask, flat_mask_indices = self._sample_mask(
             batch_size=bsz,
             seq_len=seq_len,

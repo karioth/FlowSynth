@@ -21,11 +21,12 @@ SEQ_LEN = 251
 
 MASK_PROB = 0.75
 
-# Per-sequence logistic-normal prior on row logits.
-# With exact global Top-K, shifting all logits by a constant does not change rankings,
-# so LOGIT_STD is the primary knob for the empirical ratio shape.
-LOGIT_MEAN = float(np.log(MASK_PROB / (1.0 - MASK_PROB)))
-LOGIT_STD = 1.0
+# Empirical mask-ratio prior controls (post-Gumbel semantics).
+# - Bounds are where tails should softly die in observed per-sequence ratios.
+# - Mode controls where the peak sits inside those bounds.
+EMPIRICAL_MIN_RATIO = 0.3
+EMPIRICAL_MAX_RATIO = 0.9
+EMPIRICAL_MODE_RATIO = 0.8
 
 
 # CPU parallelism knobs
@@ -56,39 +57,85 @@ def _resolve_device(device_str: str) -> torch.device:
 def _build_scheduler() -> FlowMatchingSchedulerMaskedAR:
     scheduler = FlowMatchingSchedulerMaskedAR(mask_prob=MASK_PROB, batch_mul=1)
 
-    scheduler.mask_logit_mean = LOGIT_MEAN
-    scheduler.mask_logit_std = LOGIT_STD
+    scheduler.mask_ratio_empirical_min = EMPIRICAL_MIN_RATIO
+    scheduler.mask_ratio_empirical_max = EMPIRICAL_MAX_RATIO
+    scheduler.mask_ratio_empirical_mode = EMPIRICAL_MODE_RATIO
 
     return scheduler
 
 
-def _logistic_normal_ratio_cdf(
-    x: np.ndarray,
-    logit_mean: float,
-    logit_std: float,
-) -> np.ndarray:
-    if (not np.isfinite(logit_mean)):
+def _solve_beta_shape_from_mean_and_mode(
+    mean_01: float,
+    mode_01: float,
+) -> Tuple[float, float]:
+    if not (0.0 < mean_01 < 1.0):
+        raise ValueError(f"mean_01 must be in (0, 1), got {mean_01}.")
+    if not (0.0 < mode_01 < 1.0):
+        raise ValueError(f"mode_01 must be in (0, 1), got {mode_01}.")
+
+    denom = mode_01 - mean_01
+    if abs(denom) < 1e-8:
         raise ValueError(
-            f"logit_mean must be finite, got {logit_mean}."
+            "mode_01 must differ from mean_01 to identify beta shape. "
+            f"Got mean_01={mean_01}, mode_01={mode_01}."
         )
-    if (not np.isfinite(logit_std)) or logit_std <= 0.0:
+
+    s = (2.0 * mode_01 - 1.0) / denom
+    if (not np.isfinite(s)) or s <= 0.0:
         raise ValueError(
-            f"logit_std must be finite and > 0, got {logit_std}."
+            "Invalid beta shape from mean/mode. "
+            f"Computed concentration s={s} from mean_01={mean_01}, mode_01={mode_01}."
+        )
+
+    alpha = mean_01 * s
+    beta = (1.0 - mean_01) * s
+    if alpha <= 1.0 or beta <= 1.0:
+        raise ValueError(
+            "Chosen empirical bounds/mode produce non-unimodal boundary-heavy beta. "
+            f"Need alpha>1 and beta>1, got alpha={alpha}, beta={beta}."
+        )
+
+    return float(alpha), float(beta)
+
+
+def _scaled_beta_cdf(
+    x: np.ndarray,
+    alpha: float,
+    beta: float,
+    lower: float,
+    upper: float,
+) -> np.ndarray:
+    if alpha <= 0.0 or beta <= 0.0:
+        raise ValueError(f"alpha and beta must be > 0, got {alpha}, {beta}.")
+    if not (0.0 <= lower <= upper <= 1.0):
+        raise ValueError(
+            f"Expected 0 <= lower <= upper <= 1, got lower={lower}, upper={upper}."
         )
 
     tx = torch.as_tensor(x, dtype=torch.float64)
-    cdf_x = torch.zeros_like(tx)
+    if abs(upper - lower) < 1e-12:
+        return (tx >= lower).to(torch.float64).cpu().numpy()
 
-    in_unit = (tx > 0.0) & (tx < 1.0)
-    if bool(in_unit.any()):
-        z = torch.logit(tx[in_unit])
-        normal = torch.distributions.Normal(
-            loc=torch.tensor(logit_mean, dtype=torch.float64),
-            scale=torch.tensor(logit_std, dtype=torch.float64),
+    z = (tx - lower) / (upper - lower)
+    z = torch.clamp(z, 0.0, 1.0)
+
+    if hasattr(torch.special, "betainc"):
+        cdf_x = torch.special.betainc(
+            torch.tensor(alpha, dtype=torch.float64),
+            torch.tensor(beta, dtype=torch.float64),
+            z,
         )
-        cdf_x[in_unit] = normal.cdf(z)
+    else:
+        # Fallback for older torch versions: Monte Carlo CDF approximation.
+        rng = np.random.default_rng(SEED)
+        samples = rng.beta(alpha, beta, size=500_000)
+        samples.sort()
+        z_np = z.cpu().numpy()
+        idx = np.searchsorted(samples, z_np, side="right")
+        cdf_x = torch.as_tensor(idx / samples.size, dtype=torch.float64)
 
-    cdf_x = torch.where(tx >= 1.0, torch.ones_like(cdf_x), cdf_x)
+    cdf_x = torch.where(tx < lower, torch.zeros_like(cdf_x), cdf_x)
+    cdf_x = torch.where(tx >= upper, torch.ones_like(cdf_x), cdf_x)
     return cdf_x.cpu().numpy()
 
 
@@ -102,18 +149,44 @@ def _configured_schedule_pmf(seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
     left_edges = np.clip(left_edges, 0.0, 1.0)
     right_edges = np.clip(right_edges, 0.0, 1.0)
 
-    logit_mean = float(LOGIT_MEAN)
-    logit_std = float(LOGIT_STD)
+    lower = float(EMPIRICAL_MIN_RATIO)
+    upper = float(EMPIRICAL_MAX_RATIO)
+    mode = float(EMPIRICAL_MODE_RATIO)
+    target_p = float(MASK_PROB)
 
-    cdf_left = _logistic_normal_ratio_cdf(
+    if not (0.0 < lower < upper < 1.0):
+        raise ValueError(
+            "Expected 0 < EMPIRICAL_MIN_RATIO < EMPIRICAL_MAX_RATIO < 1, "
+            f"got min={lower}, max={upper}."
+        )
+    if not (lower < target_p < upper):
+        raise ValueError(
+            "MASK_PROB must lie strictly between empirical bounds. "
+            f"Got MASK_PROB={target_p}, min={lower}, max={upper}."
+        )
+    if not (lower < mode < upper):
+        raise ValueError(
+            "EMPIRICAL_MODE_RATIO must lie strictly between empirical bounds. "
+            f"Got mode={mode}, min={lower}, max={upper}."
+        )
+
+    mean_01 = (target_p - lower) / (upper - lower)
+    mode_01 = (mode - lower) / (upper - lower)
+    alpha, beta = _solve_beta_shape_from_mean_and_mode(mean_01, mode_01)
+
+    cdf_left = _scaled_beta_cdf(
         left_edges,
-        logit_mean=logit_mean,
-        logit_std=logit_std,
+        alpha=alpha,
+        beta=beta,
+        lower=lower,
+        upper=upper,
     )
-    cdf_right = _logistic_normal_ratio_cdf(
+    cdf_right = _scaled_beta_cdf(
         right_edges,
-        logit_mean=logit_mean,
-        logit_std=logit_std,
+        alpha=alpha,
+        beta=beta,
+        lower=lower,
+        upper=upper,
     )
 
     pmf = np.clip(cdf_right - cdf_left, 0.0, 1.0)
@@ -180,7 +253,8 @@ def run_experiment() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray
     print(
         f"Running mask diagnostic: device={DEVICE}, steps={NUM_STEPS}, "
         f"batch={BATCH_SIZE}, seq_len={SEQ_LEN}, workers={NUM_WORKERS}, "
-        f"logit_normal=(mean={LOGIT_MEAN}, std={LOGIT_STD}; std is primary shape knob)"
+        f"empirical_prior=(min={EMPIRICAL_MIN_RATIO}, max={EMPIRICAL_MAX_RATIO}, "
+        f"mode={EMPIRICAL_MODE_RATIO})"
     )
 
     if NUM_WORKERS <= 1:
@@ -279,7 +353,7 @@ def _plot_results(
     #     configured_pmf,
     #     color="crimson",
     #     linewidth=1.8,
-    #     label="configured logit-normal prior",
+    #     label="configured empirical prior",
     # )
     axes[0].axvline(MASK_PROB, linestyle="--", label="target p_global")
     axes[0].axvline(per_sequence_ratios.mean(), linestyle="-", label="empirical mean")
@@ -332,9 +406,17 @@ def main() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
     configured_ratio_grid, configured_pmf = _configured_schedule_pmf(SEQ_LEN)
     configured_mean = float(np.sum(configured_ratio_grid * configured_pmf))
 
+    mean_01 = (MASK_PROB - EMPIRICAL_MIN_RATIO) / (EMPIRICAL_MAX_RATIO - EMPIRICAL_MIN_RATIO)
+    mode_01 = (EMPIRICAL_MODE_RATIO - EMPIRICAL_MIN_RATIO) / (EMPIRICAL_MAX_RATIO - EMPIRICAL_MIN_RATIO)
+    alpha, beta = _solve_beta_shape_from_mean_and_mode(mean_01, mode_01)
+
     print("\nDiagnostics")
     print(f"  samples: {per_sequence_ratios.size}")
-    print(f"  logit-normal mean/std: ({LOGIT_MEAN:.6f}, {LOGIT_STD:.6f})")
+    print(
+        f"  empirical prior (min, max, mode): "
+        f"({EMPIRICAL_MIN_RATIO:.6f}, {EMPIRICAL_MAX_RATIO:.6f}, {EMPIRICAL_MODE_RATIO:.6f})"
+    )
+    print(f"  implied beta(alpha, beta): ({alpha:.6f}, {beta:.6f})")
     print(f"  target p_global: {MASK_PROB:.6f}")
     print(f"  configured prior mean: {configured_mean:.6f}")
     print(f"  empirical mean:  {per_sequence_ratios.mean():.6f}")
