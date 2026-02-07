@@ -505,9 +505,9 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         self,
         *args,
         mask_prob: float = 0.7,
-        mask_ratio_empirical_min: float = 0.30,
-        mask_ratio_empirical_max: float = 0.90,
-        mask_ratio_empirical_kappa: float = 4.0,
+        min: float = 0.30,
+        max: float = 0.90,
+        kappa: float = 4.0,
         batch_mul: int = 1,
         **kwargs,
     ):
@@ -517,25 +517,24 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
 
         # Empirical ratio prior parameters are explicit (no hidden derivation from
         # mask_prob). This keeps tail behavior stable when only mask_prob changes.
-        self.mask_ratio_empirical_min = float(mask_ratio_empirical_min)
-        self.mask_ratio_empirical_max = float(mask_ratio_empirical_max)
-        self.mask_ratio_empirical_kappa = float(mask_ratio_empirical_kappa)
+        self.min = float(min)
+        self.max = float(max)
+        self.kappa = float(kappa)
         self._beta_shape_cache_key: Optional[tuple[float, float, float, float]] = None
         self._beta_shape_cache_value: Optional[tuple[float, float]] = None
 
     @property
-    def mask_ratio_empirical_mode(self) -> float:
-        min_ratio = float(self.mask_ratio_empirical_min)
-        max_ratio = float(self.mask_ratio_empirical_max)
+    def mode(self) -> float:
+        min_ratio = float(self.min)
+        max_ratio = float(self.max)
         alpha, beta = self._get_beta_shape()
         mode_01 = (alpha - 1.0) / (alpha + beta - 2.0)
         return min_ratio + (max_ratio - min_ratio) * mode_01
 
-    @mask_ratio_empirical_mode.setter
-    def mask_ratio_empirical_mode(self, _: float) -> None:
+    @mode.setter
+    def mode(self, _: float) -> None:
         raise AttributeError(
-            "mask_ratio_empirical_mode is derived from mask_prob, "
-            "mask_ratio_empirical_[min,max], and mask_ratio_empirical_kappa."
+            "mode is derived from mask_prob, min, max, and kappa."
         )
 
     @staticmethod
@@ -563,14 +562,14 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         return float(alpha), float(beta)
 
     def _get_beta_shape(self) -> tuple[float, float]:
-        min_ratio = float(self.mask_ratio_empirical_min)
-        max_ratio = float(self.mask_ratio_empirical_max)
+        min_ratio = float(self.min)
+        max_ratio = float(self.max)
         p = float(self.mask_prob)
-        kappa = float(self.mask_ratio_empirical_kappa)
+        kappa = float(self.kappa)
 
         if not (0.0 < min_ratio < max_ratio < 1.0):
             raise ValueError(
-                "mask_ratio_empirical bounds must satisfy 0 < min < max < 1, "
+                "bounds must satisfy 0 < min < max < 1, "
                 f"got min={min_ratio}, max={max_ratio}."
             )
         if not (min_ratio < p < max_ratio):
@@ -600,8 +599,8 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}.")
 
-        min_ratio = float(self.mask_ratio_empirical_min)
-        max_ratio = float(self.mask_ratio_empirical_max)
+        min_ratio = float(self.min)
+        max_ratio = float(self.max)
         alpha, beta = self._get_beta_shape()
 
         base = torch.distributions.Beta(

@@ -24,9 +24,9 @@ MASK_PROB = 0.7
 # Empirical mask-ratio prior controls (post-Gumbel semantics).
 # - Bounds are where tails should softly die in observed per-sequence ratios.
 # - Kappa controls concentration (larger => narrower peak and lighter tails).
-EMPIRICAL_MIN_RATIO = 0.3
-EMPIRICAL_MAX_RATIO = 0.9
-EMPIRICAL_KAPPA = 4.0
+MIN = 0.3
+MAX = 0.9
+KAPPA = 4.0
 
 
 # CPU parallelism knobs
@@ -57,9 +57,9 @@ def _resolve_device(device_str: str) -> torch.device:
 def _build_scheduler() -> FlowMatchingSchedulerMaskedAR:
     scheduler = FlowMatchingSchedulerMaskedAR(mask_prob=MASK_PROB, batch_mul=1)
 
-    scheduler.mask_ratio_empirical_min = EMPIRICAL_MIN_RATIO
-    scheduler.mask_ratio_empirical_max = EMPIRICAL_MAX_RATIO
-    scheduler.mask_ratio_empirical_kappa = EMPIRICAL_KAPPA
+    scheduler.min = MIN
+    scheduler.max = MAX
+    scheduler.kappa = KAPPA
 
     return scheduler
 
@@ -138,14 +138,14 @@ def _configured_schedule_pmf(seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
     left_edges = np.clip(left_edges, 0.0, 1.0)
     right_edges = np.clip(right_edges, 0.0, 1.0)
 
-    lower = float(EMPIRICAL_MIN_RATIO)
-    upper = float(EMPIRICAL_MAX_RATIO)
-    kappa = float(EMPIRICAL_KAPPA)
+    lower = float(MIN)
+    upper = float(MAX)
+    kappa = float(KAPPA)
     target_p = float(MASK_PROB)
 
     if not (0.0 < lower < upper < 1.0):
         raise ValueError(
-            "Expected 0 < EMPIRICAL_MIN_RATIO < EMPIRICAL_MAX_RATIO < 1, "
+            "Expected 0 < MIN < MAX < 1, "
             f"got min={lower}, max={upper}."
         )
     if not (lower < target_p < upper):
@@ -236,8 +236,7 @@ def run_experiment() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray
     print(
         f"Running mask diagnostic: device={DEVICE}, steps={NUM_STEPS}, "
         f"batch={BATCH_SIZE}, seq_len={SEQ_LEN}, workers={NUM_WORKERS}, "
-        f"empirical_prior=(min={EMPIRICAL_MIN_RATIO}, max={EMPIRICAL_MAX_RATIO}, "
-        f"kappa={EMPIRICAL_KAPPA})"
+        f"empirical_prior=(min={MIN}, max={MAX}, kappa={KAPPA})"
     )
 
     if NUM_WORKERS <= 1:
@@ -389,16 +388,16 @@ def main() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
     configured_ratio_grid, configured_pmf = _configured_schedule_pmf(SEQ_LEN)
     configured_mean = float(np.sum(configured_ratio_grid * configured_pmf))
 
-    mean_01 = (MASK_PROB - EMPIRICAL_MIN_RATIO) / (EMPIRICAL_MAX_RATIO - EMPIRICAL_MIN_RATIO)
-    alpha, beta = _solve_beta_shape_from_mean_and_kappa(mean_01, EMPIRICAL_KAPPA)
+    mean_01 = (MASK_PROB - MIN) / (MAX - MIN)
+    alpha, beta = _solve_beta_shape_from_mean_and_kappa(mean_01, KAPPA)
     inferred_mode_01 = (alpha - 1.0) / (alpha + beta - 2.0)
-    inferred_mode = EMPIRICAL_MIN_RATIO + (EMPIRICAL_MAX_RATIO - EMPIRICAL_MIN_RATIO) * inferred_mode_01
+    inferred_mode = MIN + (MAX - MIN) * inferred_mode_01
 
     print("\nDiagnostics")
     print(f"  samples: {per_sequence_ratios.size}")
     print(
         f"  empirical prior (min, max, kappa): "
-        f"({EMPIRICAL_MIN_RATIO:.6f}, {EMPIRICAL_MAX_RATIO:.6f}, {EMPIRICAL_KAPPA:.6f})"
+        f"({MIN:.6f}, {MAX:.6f}, {KAPPA:.6f})"
     )
     print(f"  implied beta(alpha, beta): ({alpha:.6f}, {beta:.6f})")
     print(f"  implied mode: {inferred_mode:.6f}")
