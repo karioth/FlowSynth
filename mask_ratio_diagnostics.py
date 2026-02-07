@@ -1,4 +1,5 @@
 import os
+import math
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Optional, Tuple
 
@@ -27,6 +28,9 @@ MASK_PROB = 0.75
 EMPIRICAL_MIN_RATIO = 0.3
 EMPIRICAL_MAX_RATIO = 0.9
 EMPIRICAL_MODE_RATIO = 0.8
+
+# Fixed internal shape constant (matches scheduler default).
+SPLIT_SIGMA_DIV = 2.5
 
 
 # CPU parallelism knobs
@@ -60,81 +64,82 @@ def _build_scheduler() -> FlowMatchingSchedulerMaskedAR:
     scheduler.mask_ratio_empirical_min = EMPIRICAL_MIN_RATIO
     scheduler.mask_ratio_empirical_max = EMPIRICAL_MAX_RATIO
     scheduler.mask_ratio_empirical_mode = EMPIRICAL_MODE_RATIO
+    scheduler.mask_ratio_split_sigma_div = SPLIT_SIGMA_DIV
 
     return scheduler
 
 
-def _solve_beta_shape_from_mean_and_mode(
-    mean_01: float,
-    mode_01: float,
-) -> Tuple[float, float]:
-    if not (0.0 < mean_01 < 1.0):
-        raise ValueError(f"mean_01 must be in (0, 1), got {mean_01}.")
-    if not (0.0 < mode_01 < 1.0):
-        raise ValueError(f"mode_01 must be in (0, 1), got {mode_01}.")
-
-    denom = mode_01 - mean_01
-    if abs(denom) < 1e-8:
-        raise ValueError(
-            "mode_01 must differ from mean_01 to identify beta shape. "
-            f"Got mean_01={mean_01}, mode_01={mode_01}."
-        )
-
-    s = (2.0 * mode_01 - 1.0) / denom
-    if (not np.isfinite(s)) or s <= 0.0:
-        raise ValueError(
-            "Invalid beta shape from mean/mode. "
-            f"Computed concentration s={s} from mean_01={mean_01}, mode_01={mode_01}."
-        )
-
-    alpha = mean_01 * s
-    beta = (1.0 - mean_01) * s
-    if alpha <= 1.0 or beta <= 1.0:
-        raise ValueError(
-            "Chosen empirical bounds/mode produce non-unimodal boundary-heavy beta. "
-            f"Need alpha>1 and beta>1, got alpha={alpha}, beta={beta}."
-        )
-
-    return float(alpha), float(beta)
-
-
-def _scaled_beta_cdf(
-    x: np.ndarray,
-    alpha: float,
-    beta: float,
+def _split_normal_params(
     lower: float,
+    mode: float,
     upper: float,
-) -> np.ndarray:
-    if alpha <= 0.0 or beta <= 0.0:
-        raise ValueError(f"alpha and beta must be > 0, got {alpha}, {beta}.")
-    if not (0.0 <= lower <= upper <= 1.0):
+    sigma_div: float,
+) -> Tuple[float, float, float, float, float]:
+    if not (0.0 < lower < mode < upper < 1.0):
         raise ValueError(
-            f"Expected 0 <= lower <= upper <= 1, got lower={lower}, upper={upper}."
+            "Expected 0 < lower < mode < upper < 1, "
+            f"got lower={lower}, mode={mode}, upper={upper}."
         )
+    if (not np.isfinite(sigma_div)) or sigma_div <= 0.0:
+        raise ValueError(f"sigma_div must be finite and > 0, got {sigma_div}.")
+
+    left_span = mode - lower
+    right_span = upper - mode
+    sigma_left = left_span / sigma_div
+    sigma_right = right_span / sigma_div
+    if sigma_left <= 0.0 or sigma_right <= 0.0:
+        raise ValueError(
+            "Invalid split-normal spans. "
+            f"left_span={left_span}, right_span={right_span}."
+        )
+
+    sqrt_two = math.sqrt(2.0)
+    left_erf_max = math.erf(left_span / (sigma_left * sqrt_two))
+    right_erf_max = math.erf(right_span / (sigma_right * sqrt_two))
+    if left_erf_max <= 0.0 or right_erf_max <= 0.0:
+        raise ValueError(
+            "Degenerate split-normal truncation; erf limits must be > 0. "
+            f"Got left={left_erf_max}, right={right_erf_max}."
+        )
+
+    left_area = sigma_left * left_erf_max
+    right_area = sigma_right * right_erf_max
+    total_area = left_area + right_area
+    if total_area <= 0.0:
+        raise ValueError("Degenerate split-normal area; total area must be > 0.")
+
+    p_left = left_area / total_area
+    return sigma_left, sigma_right, left_erf_max, right_erf_max, p_left
+
+
+def _split_normal_ratio_cdf(
+    x: np.ndarray,
+    lower: float,
+    mode: float,
+    upper: float,
+    sigma_div: float,
+) -> np.ndarray:
+    sigma_left, sigma_right, left_erf_max, right_erf_max, p_left = _split_normal_params(
+        lower=lower,
+        mode=mode,
+        upper=upper,
+        sigma_div=sigma_div,
+    )
 
     tx = torch.as_tensor(x, dtype=torch.float64)
-    if abs(upper - lower) < 1e-12:
-        return (tx >= lower).to(torch.float64).cpu().numpy()
+    cdf_x = torch.zeros_like(tx)
 
-    z = (tx - lower) / (upper - lower)
-    z = torch.clamp(z, 0.0, 1.0)
+    sqrt_two = math.sqrt(2.0)
+    left_mask = (tx >= lower) & (tx < mode)
+    if bool(left_mask.any()):
+        z_left = (mode - tx[left_mask]) / (sigma_left * sqrt_two)
+        cdf_x[left_mask] = p_left * (1.0 - torch.erf(z_left) / left_erf_max)
 
-    if hasattr(torch.special, "betainc"):
-        cdf_x = torch.special.betainc(
-            torch.tensor(alpha, dtype=torch.float64),
-            torch.tensor(beta, dtype=torch.float64),
-            z,
-        )
-    else:
-        # Fallback for older torch versions: Monte Carlo CDF approximation.
-        rng = np.random.default_rng(SEED)
-        samples = rng.beta(alpha, beta, size=500_000)
-        samples.sort()
-        z_np = z.cpu().numpy()
-        idx = np.searchsorted(samples, z_np, side="right")
-        cdf_x = torch.as_tensor(idx / samples.size, dtype=torch.float64)
+    right_mask = (tx >= mode) & (tx < upper)
+    if bool(right_mask.any()):
+        z_right = (tx[right_mask] - mode) / (sigma_right * sqrt_two)
+        cdf_x[right_mask] = p_left + (1.0 - p_left) * (torch.erf(z_right) / right_erf_max)
 
-    cdf_x = torch.where(tx < lower, torch.zeros_like(cdf_x), cdf_x)
     cdf_x = torch.where(tx >= upper, torch.ones_like(cdf_x), cdf_x)
     return cdf_x.cpu().numpy()
 
@@ -152,41 +157,20 @@ def _configured_schedule_pmf(seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
     lower = float(EMPIRICAL_MIN_RATIO)
     upper = float(EMPIRICAL_MAX_RATIO)
     mode = float(EMPIRICAL_MODE_RATIO)
-    target_p = float(MASK_PROB)
 
-    if not (0.0 < lower < upper < 1.0):
-        raise ValueError(
-            "Expected 0 < EMPIRICAL_MIN_RATIO < EMPIRICAL_MAX_RATIO < 1, "
-            f"got min={lower}, max={upper}."
-        )
-    if not (lower < target_p < upper):
-        raise ValueError(
-            "MASK_PROB must lie strictly between empirical bounds. "
-            f"Got MASK_PROB={target_p}, min={lower}, max={upper}."
-        )
-    if not (lower < mode < upper):
-        raise ValueError(
-            "EMPIRICAL_MODE_RATIO must lie strictly between empirical bounds. "
-            f"Got mode={mode}, min={lower}, max={upper}."
-        )
-
-    mean_01 = (target_p - lower) / (upper - lower)
-    mode_01 = (mode - lower) / (upper - lower)
-    alpha, beta = _solve_beta_shape_from_mean_and_mode(mean_01, mode_01)
-
-    cdf_left = _scaled_beta_cdf(
+    cdf_left = _split_normal_ratio_cdf(
         left_edges,
-        alpha=alpha,
-        beta=beta,
         lower=lower,
+        mode=mode,
         upper=upper,
+        sigma_div=float(SPLIT_SIGMA_DIV),
     )
-    cdf_right = _scaled_beta_cdf(
+    cdf_right = _split_normal_ratio_cdf(
         right_edges,
-        alpha=alpha,
-        beta=beta,
         lower=lower,
+        mode=mode,
         upper=upper,
+        sigma_div=float(SPLIT_SIGMA_DIV),
     )
 
     pmf = np.clip(cdf_right - cdf_left, 0.0, 1.0)
@@ -254,7 +238,7 @@ def run_experiment() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray
         f"Running mask diagnostic: device={DEVICE}, steps={NUM_STEPS}, "
         f"batch={BATCH_SIZE}, seq_len={SEQ_LEN}, workers={NUM_WORKERS}, "
         f"empirical_prior=(min={EMPIRICAL_MIN_RATIO}, max={EMPIRICAL_MAX_RATIO}, "
-        f"mode={EMPIRICAL_MODE_RATIO})"
+        f"mode={EMPIRICAL_MODE_RATIO}, split_sigma_div={SPLIT_SIGMA_DIV})"
     )
 
     if NUM_WORKERS <= 1:
@@ -406,17 +390,13 @@ def main() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
     configured_ratio_grid, configured_pmf = _configured_schedule_pmf(SEQ_LEN)
     configured_mean = float(np.sum(configured_ratio_grid * configured_pmf))
 
-    mean_01 = (MASK_PROB - EMPIRICAL_MIN_RATIO) / (EMPIRICAL_MAX_RATIO - EMPIRICAL_MIN_RATIO)
-    mode_01 = (EMPIRICAL_MODE_RATIO - EMPIRICAL_MIN_RATIO) / (EMPIRICAL_MAX_RATIO - EMPIRICAL_MIN_RATIO)
-    alpha, beta = _solve_beta_shape_from_mean_and_mode(mean_01, mode_01)
-
     print("\nDiagnostics")
     print(f"  samples: {per_sequence_ratios.size}")
     print(
         f"  empirical prior (min, max, mode): "
         f"({EMPIRICAL_MIN_RATIO:.6f}, {EMPIRICAL_MAX_RATIO:.6f}, {EMPIRICAL_MODE_RATIO:.6f})"
     )
-    print(f"  implied beta(alpha, beta): ({alpha:.6f}, {beta:.6f})")
+    print(f"  split sigma divisor (fixed): {SPLIT_SIGMA_DIV:.6f}")
     print(f"  target p_global: {MASK_PROB:.6f}")
     print(f"  configured prior mean: {configured_mean:.6f}")
     print(f"  empirical mean:  {per_sequence_ratios.mean():.6f}")

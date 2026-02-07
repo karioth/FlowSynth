@@ -496,8 +496,8 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
     Scheduler for MaskedARTransformer.
 
     Samples per-sequence empirical mask probabilities from a bounded,
-    mode-controlled beta prior, then selects an exact global-K mask with
-    Gumbel-TopK.
+    mode-centered split-normal prior, then selects an exact global-K mask
+    with Gumbel-TopK.
     Computes loss only at masked positions.
     """
 
@@ -511,9 +511,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         super().__init__(*args, **kwargs)
         self.mask_prob = mask_prob
         self.batch_mul = batch_mul
-        # Empirical ratio prior parameters.
-        # Defaults are derived from mask_prob and are safe for typical
-        # MaskedAR settings (e.g., mask_prob around 0.7-0.8).
+        # Empirical ratio prior parameters (user-facing).
         p = float(mask_prob)
         eps = 1e-4
         self.mask_ratio_empirical_min = max(eps, p - 0.45)
@@ -525,40 +523,8 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
             self.mask_ratio_empirical_max - 1e-3,
             max(self.mask_ratio_empirical_min + 1e-3, p + 0.05),
         )
-
-    @staticmethod
-    def _solve_beta_shape_from_mean_and_mode(
-        mean_01: float,
-        mode_01: float,
-    ) -> tuple[float, float]:
-        if not (0.0 < mean_01 < 1.0):
-            raise ValueError(f"mean_01 must be in (0, 1), got {mean_01}.")
-        if not (0.0 < mode_01 < 1.0):
-            raise ValueError(f"mode_01 must be in (0, 1), got {mode_01}.")
-
-        denom = mode_01 - mean_01
-        if abs(denom) < 1e-8:
-            raise ValueError(
-                "mode_01 must differ from mean_01 to identify beta shape. "
-                f"Got mean_01={mean_01}, mode_01={mode_01}."
-            )
-
-        s = (2.0 * mode_01 - 1.0) / denom
-        if (not math.isfinite(s)) or s <= 0.0:
-            raise ValueError(
-                "Invalid beta shape from mean/mode. "
-                f"Computed concentration s={s} from mean_01={mean_01}, mode_01={mode_01}."
-            )
-
-        alpha = mean_01 * s
-        beta = (1.0 - mean_01) * s
-        if alpha <= 1.0 or beta <= 1.0:
-            raise ValueError(
-                "Chosen empirical bounds/mode produce non-unimodal boundary-heavy beta. "
-                f"Need alpha>1 and beta>1, got alpha={alpha}, beta={beta}."
-            )
-
-        return float(alpha), float(beta)
+        # Fixed internal shape constant for split-normal spread.
+        self.mask_ratio_split_sigma_div = 2.5
 
     def _sample_sequence_probabilities(
         self,
@@ -589,16 +555,50 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
                 f"Got mode={mode_ratio}, min={min_ratio}, max={max_ratio}."
             )
 
-        mean_01 = (p - min_ratio) / (max_ratio - min_ratio)
-        mode_01 = (mode_ratio - min_ratio) / (max_ratio - min_ratio)
-        alpha, beta = self._solve_beta_shape_from_mean_and_mode(mean_01, mode_01)
+        sigma_div = float(self.mask_ratio_split_sigma_div)
+        if (not math.isfinite(sigma_div)) or sigma_div <= 0.0:
+            raise ValueError(
+                f"mask_ratio_split_sigma_div must be finite and > 0, got {sigma_div}."
+            )
 
-        base = torch.distributions.Beta(
-            concentration1=torch.tensor(alpha, device=device, dtype=torch.float32),
-            concentration0=torch.tensor(beta, device=device, dtype=torch.float32),
-        ).sample((batch_size,))
+        left_span = mode_ratio - min_ratio
+        right_span = max_ratio - mode_ratio
+        sigma_left = left_span / sigma_div
+        sigma_right = right_span / sigma_div
+        if sigma_left <= 0.0 or sigma_right <= 0.0:
+            raise ValueError(
+                "Invalid split-normal spans. "
+                f"Got left_span={left_span}, right_span={right_span}."
+            )
 
-        return min_ratio + (max_ratio - min_ratio) * base
+        sqrt_two = math.sqrt(2.0)
+        left_erf_max = math.erf(left_span / (sigma_left * sqrt_two))
+        right_erf_max = math.erf(right_span / (sigma_right * sqrt_two))
+        if left_erf_max <= 0.0 or right_erf_max <= 0.0:
+            raise ValueError(
+                "Degenerate split-normal truncation; erf limits must be > 0. "
+                f"Got left_erf_max={left_erf_max}, right_erf_max={right_erf_max}."
+            )
+
+        left_area = sigma_left * left_erf_max
+        right_area = sigma_right * right_erf_max
+        total_area = left_area + right_area
+        if total_area <= 0.0:
+            raise ValueError("Degenerate split-normal area; total area must be > 0.")
+        p_left = left_area / total_area
+
+        side_u = torch.rand(batch_size, device=device, dtype=torch.float32)
+        dist_u = torch.rand(batch_size, device=device, dtype=torch.float32)
+        left_mask = side_u < p_left
+
+        erfinv_eps = 1e-7
+        left_arg = (dist_u * left_erf_max).clamp(min=erfinv_eps, max=1.0 - erfinv_eps)
+        right_arg = (dist_u * right_erf_max).clamp(min=erfinv_eps, max=1.0 - erfinv_eps)
+        left_dist = sigma_left * sqrt_two * torch.erfinv(left_arg)
+        right_dist = sigma_right * sqrt_two * torch.erfinv(right_arg)
+
+        probs = torch.where(left_mask, mode_ratio - left_dist, mode_ratio + right_dist)
+        return probs.clamp(min=min_ratio, max=max_ratio)
 
     def _sample_mask(
         self,
