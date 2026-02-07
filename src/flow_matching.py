@@ -515,8 +515,6 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         self.mask_prob = mask_prob
         self.batch_mul = batch_mul
 
-        # Empirical ratio prior parameters are explicit (no hidden derivation from
-        # mask_prob). This keeps tail behavior stable when only mask_prob changes.
         self.min = float(min)
         self.max = float(max)
         self.kappa = float(kappa)
@@ -616,22 +614,13 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         seq_len: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if batch_size <= 0:
-            raise ValueError(f"batch_size must be > 0, got {batch_size}.")
-        if seq_len <= 0:
-            raise ValueError(f"seq_len must be > 0, got {seq_len}.")
 
         total_tokens = batch_size * seq_len
         p = float(self.mask_prob)
-        if not (0.0 <= p <= 1.0):
-            raise ValueError(f"mask_prob must be in [0, 1], got {p}.")
+        if not (0.5 <= p <= 1.0):
+            raise ValueError(f"mask_prob must be in [0.5, 1], got {p}.")
 
         num_masked = round(p * total_tokens)
-        if num_masked <= 0:
-            raise ValueError(
-                "round(mask_prob * total_tokens) must be > 0 for MaskedAR training. "
-                f"Got mask_prob={p}, total_tokens={total_tokens}."
-            )
         num_unmasked = total_tokens - num_masked
 
         row_probs = self._sample_sequence_probabilities(batch_size=batch_size, device=device)
@@ -648,42 +637,19 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         scores = row_logits.unsqueeze(1) + gumbel
         flat_scores = scores.reshape(-1)
 
-        if num_masked >= total_tokens:
-            mask_flat = torch.ones(total_tokens, dtype=torch.bool, device=device)
-            flat_mask_indices = torch.arange(total_tokens, device=device)
-        elif num_unmasked < num_masked:
-            # Equivalent to selecting top-k masked scores, but faster when unmasked
-            # tokens are the minority (e.g., mask_prob > 0.5).
-            flat_unmask_indices = torch.topk(
-                flat_scores,
-                k=num_unmasked,
-                largest=False,
-                sorted=False,
-            ).indices
-            mask_flat = torch.ones(total_tokens, dtype=torch.bool, device=device)
-            mask_flat[flat_unmask_indices] = False
-            flat_mask_indices = torch.nonzero(mask_flat, as_tuple=True)[0]
-        else:
-            flat_mask_indices = torch.topk(
-                flat_scores,
-                k=num_masked,
-                largest=True,
-                sorted=False,
-            ).indices
-            mask_flat = torch.zeros(total_tokens, dtype=torch.bool, device=device)
-            mask_flat[flat_mask_indices] = True
-        mask = mask_flat.view(batch_size, seq_len)
+        # Equivalent to selecting top-k masked scores, but faster when unmasked
+        # tokens are the minority (e.g., mask_prob > 0.5).
+        flat_unmask_indices = torch.topk(
+            flat_scores,
+            k=num_unmasked,
+            largest=False,
+            sorted=False,
+        ).indices
+        mask_flat = torch.ones(total_tokens, dtype=torch.bool, device=device)
+        mask_flat[flat_unmask_indices] = False
+        flat_mask_indices = torch.nonzero(mask_flat, as_tuple=True)[0]
 
-        if int(mask_flat.sum().item()) != num_masked:
-            raise RuntimeError(
-                "Mask sampler produced wrong masked-token count. "
-                f"Expected {num_masked}, got {int(mask_flat.sum().item())}."
-            )
-        if int(flat_mask_indices.numel()) != num_masked:
-            raise RuntimeError(
-                "Mask sampler produced wrong number of masked tokens. "
-                f"Expected {num_masked}, got {int(flat_mask_indices.numel())}."
-            )
+        mask = mask_flat.view(batch_size, seq_len)
 
         return mask, flat_mask_indices
 
