@@ -505,9 +505,9 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         self,
         *args,
         mask_prob: float = 0.7,
-        mask_ratio_empirical_min: Optional[float] = None,
-        mask_ratio_empirical_max: Optional[float] = None,
-        mask_ratio_empirical_kappa: float = 8.0,
+        mask_ratio_empirical_min: float = 0.30,
+        mask_ratio_empirical_max: float = 0.90,
+        mask_ratio_empirical_kappa: float = 4.0,
         batch_mul: int = 1,
         **kwargs,
     ):
@@ -515,30 +515,10 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         self.mask_prob = mask_prob
         self.batch_mul = batch_mul
 
-        # Empirical ratio prior parameters.
-        # Defaults are derived from mask_prob and are safe for typical
-        # MaskedAR settings (e.g., mask_prob around 0.7-0.8).
-        p = float(mask_prob)
-        eps = 1e-4
-        if (mask_ratio_empirical_min is None) != (mask_ratio_empirical_max is None):
-            raise ValueError(
-                "mask_ratio_empirical_min and mask_ratio_empirical_max must be both set or both None."
-            )
-
-        if mask_ratio_empirical_min is None and mask_ratio_empirical_max is None:
-            derived_min = max(eps, p - 0.45)
-            derived_max = min(1.0 - eps, p + 0.15)
-            if derived_max - derived_min < 1e-3:
-                derived_min = max(eps, p - 0.10)
-                derived_max = min(1.0 - eps, p + 0.10)
-            self.mask_ratio_empirical_min = derived_min
-            self.mask_ratio_empirical_max = derived_max
-        else:
-            if mask_ratio_empirical_min is None or mask_ratio_empirical_max is None:
-                raise RuntimeError("Internal empirical-bound validation failed.")
-            self.mask_ratio_empirical_min = float(mask_ratio_empirical_min)
-            self.mask_ratio_empirical_max = float(mask_ratio_empirical_max)
-
+        # Empirical ratio prior parameters are explicit (no hidden derivation from
+        # mask_prob). This keeps tail behavior stable when only mask_prob changes.
+        self.mask_ratio_empirical_min = float(mask_ratio_empirical_min)
+        self.mask_ratio_empirical_max = float(mask_ratio_empirical_max)
         self.mask_ratio_empirical_kappa = float(mask_ratio_empirical_kappa)
         self._beta_shape_cache_key: Optional[tuple[float, float, float, float]] = None
         self._beta_shape_cache_value: Optional[tuple[float, float]] = None
