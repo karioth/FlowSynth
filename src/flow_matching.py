@@ -509,51 +509,11 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         super().__init__(*args, **kwargs)
         self.mask_prob = mask_prob
         self.batch_mul = batch_mul
-        # Hardcoded MNTP-like mixture defaults.
+        # Hardcoded bounded beta schedule defaults.
         self.mask_ratio_min = 0.30
-        self.mask_ratio_mix_high_weight = 0.82
-        self.mask_ratio_high_mean = 0.85
-        self.mask_ratio_high_std = 0.03
-        self.mask_ratio_low_mean = 0.55
-        self.mask_ratio_low_std = 0.20
-
-    @staticmethod
-    def _sample_truncated_normal(
-        num_samples: int,
-        mean: float,
-        std: float,
-        device: torch.device,
-        min_value: float = 0.0,
-        max_value: float = 1.0,
-        dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:
-        if num_samples < 0:
-            raise ValueError(f"num_samples must be >= 0, got {num_samples}.")
-        if num_samples == 0:
-            return torch.empty(0, device=device, dtype=dtype)
-        if std <= 0.0:
-            raise ValueError(f"std must be > 0, got {std}.")
-        if not (0.0 <= min_value <= max_value <= 1.0):
-            raise ValueError(
-                "Truncation bounds must satisfy 0 <= min_value <= max_value <= 1. "
-                f"Got min_value={min_value}, max_value={max_value}."
-            )
-        if min_value == max_value:
-            return torch.full((num_samples,), min_value, device=device, dtype=dtype)
-
-        out = torch.empty(num_samples, device=device, dtype=dtype)
-        filled = 0
-        while filled < num_samples:
-            need = num_samples - filled
-            draw_count = max(16, 2 * need)
-            draws = torch.randn(draw_count, device=device, dtype=dtype) * std + mean
-            valid = draws[(draws >= min_value) & (draws <= max_value)]
-            take = min(need, int(valid.numel()))
-            if take > 0:
-                out[filled : filled + take] = valid[:take]
-                filled += take
-
-        return out
+        self.mask_ratio_max = 0.90
+        self.mask_beta_alpha = 9.0
+        self.mask_beta_beta = 3.0
 
     def _sample_sequence_ratios(
         self,
@@ -564,41 +524,26 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
             raise ValueError(f"batch_size must be > 0, got {batch_size}.")
 
         min_ratio = float(self.mask_ratio_min)
-        if not (0.0 <= min_ratio <= 1.0):
-            raise ValueError(f"mask_ratio_min must be in [0, 1], got {min_ratio}.")
-
-        mix_weight = float(self.mask_ratio_mix_high_weight)
-        if not (0.0 <= mix_weight <= 1.0):
+        max_ratio = float(self.mask_ratio_max)
+        if not (0.0 <= min_ratio <= max_ratio <= 1.0):
             raise ValueError(
-                f"mask_ratio_mix_high_weight must be in [0, 1], got {mix_weight}."
+                "mask_ratio bounds must satisfy 0 <= min <= max <= 1, "
+                f"got min={min_ratio}, max={max_ratio}."
             )
 
-        pick_high = torch.rand(batch_size, device=device) < mix_weight
-        ratios = torch.empty(batch_size, device=device, dtype=torch.float32)
-
-        num_high = int(pick_high.sum().item())
-        if num_high > 0:
-            ratios[pick_high] = self._sample_truncated_normal(
-                num_samples=num_high,
-                mean=float(self.mask_ratio_high_mean),
-                std=float(self.mask_ratio_high_std),
-                min_value=min_ratio,
-                max_value=1.0,
-                device=device,
+        alpha = float(self.mask_beta_alpha)
+        beta = float(self.mask_beta_beta)
+        if alpha <= 0.0 or beta <= 0.0:
+            raise ValueError(
+                f"mask_beta_alpha and mask_beta_beta must be > 0, got {alpha}, {beta}."
             )
 
-        num_low = batch_size - num_high
-        if num_low > 0:
-            ratios[~pick_high] = self._sample_truncated_normal(
-                num_samples=num_low,
-                mean=float(self.mask_ratio_low_mean),
-                std=float(self.mask_ratio_low_std),
-                min_value=min_ratio,
-                max_value=1.0,
-                device=device,
-            )
+        base = torch.distributions.Beta(
+            concentration1=torch.tensor(alpha, device=device, dtype=torch.float32),
+            concentration0=torch.tensor(beta, device=device, dtype=torch.float32),
+        ).sample((batch_size,))
 
-        return ratios
+        return min_ratio + (max_ratio - min_ratio) * base
 
     @staticmethod
     def _project_sequence_counts_to_global_k(
@@ -606,6 +551,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         seq_len: int,
         num_masked: int,
         min_ratio: float = 0.0,
+        max_ratio: float = 1.0,
     ) -> torch.Tensor:
         if sequence_ratios.dim() != 1:
             raise ValueError(
@@ -614,8 +560,11 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
             )
         if seq_len <= 0:
             raise ValueError(f"seq_len must be > 0, got {seq_len}.")
-        if not (0.0 <= min_ratio <= 1.0):
-            raise ValueError(f"min_ratio must be in [0, 1], got {min_ratio}.")
+        if not (0.0 <= min_ratio <= max_ratio <= 1.0):
+            raise ValueError(
+                "ratio bounds must satisfy 0 <= min_ratio <= max_ratio <= 1, "
+                f"got min_ratio={min_ratio}, max_ratio={max_ratio}."
+            )
 
         bsz = int(sequence_ratios.shape[0])
         if bsz <= 0:
@@ -628,7 +577,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
             )
 
         min_count = int(math.ceil(min_ratio * seq_len))
-        max_count = seq_len
+        max_count = int(math.floor(max_ratio * seq_len))
         min_total = bsz * min_count
         max_total = bsz * max_count
         if num_masked < min_total or num_masked > max_total:
@@ -638,7 +587,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
                 f"[{min_total}, {max_total}]."
             )
 
-        target = sequence_ratios.clamp(min_ratio, 1.0) * float(seq_len)
+        target = sequence_ratios.clamp(min_ratio, max_ratio) * float(seq_len)
         target_sum = float(target.sum().item())
 
         if target_sum <= 0.0:
@@ -729,13 +678,22 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
             )
 
         min_ratio = float(self.mask_ratio_min)
+        max_ratio = float(self.mask_ratio_max)
+        if not (0.0 <= min_ratio <= max_ratio <= 1.0):
+            raise ValueError(
+                "mask_ratio bounds must satisfy 0 <= min <= max <= 1, "
+                f"got min={min_ratio}, max={max_ratio}."
+            )
+
         min_count = int(math.ceil(min_ratio * seq_len))
+        max_count = int(math.floor(max_ratio * seq_len))
         min_total = batch_size * min_count
-        if num_masked < min_total:
+        max_total = batch_size * max_count
+        if num_masked < min_total or num_masked > max_total:
             raise ValueError(
                 f"mask_prob={p} with batch_size={batch_size}, seq_len={seq_len} implies "
-                f"num_masked={num_masked}, which is below the minimum required by "
-                f"mask_ratio_min={min_ratio} (min_total={min_total})."
+                f"num_masked={num_masked}, outside feasible range [{min_total}, {max_total}] "
+                f"for mask_ratio_min={min_ratio}, mask_ratio_max={max_ratio}."
             )
 
         sequence_ratios = self._sample_sequence_ratios(batch_size=batch_size, device=device)
@@ -744,6 +702,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
             seq_len=seq_len,
             num_masked=num_masked,
             min_ratio=min_ratio,
+            max_ratio=max_ratio,
         )
 
         mask = self._sample_uniform_mask_from_counts(

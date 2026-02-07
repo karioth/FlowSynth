@@ -21,15 +21,14 @@ SEQ_LEN = 251
 
 MASK_PROB = 0.75
 
-# Minimum per-sequence masking ratio.
+# Per-sequence ratio bounds.
 MIN_MASK_RATIO = 0.30
+MAX_MASK_RATIO = 0.90
 
-# MNTP-like mixture params (truncated normals in [0, 1])
-MIX_HIGH_WEIGHT = 0.82
-MIX_HIGH_MEAN = 0.85
-MIX_HIGH_STD = 0.03
-MIX_LOW_MEAN = 0.55
-MIX_LOW_STD = 0.20
+# Scaled beta params on [MIN_MASK_RATIO, MAX_MASK_RATIO].
+# Mean is MIN + (MAX - MIN) * alpha / (alpha + beta).
+BETA_ALPHA = 9.0
+BETA_BETA = 3.0
 
 # CPU parallelism knobs
 NUM_WORKERS = 62
@@ -60,25 +59,22 @@ def _build_scheduler() -> FlowMatchingSchedulerMaskedAR:
     scheduler = FlowMatchingSchedulerMaskedAR(mask_prob=MASK_PROB, batch_mul=1)
 
     scheduler.mask_ratio_min = MIN_MASK_RATIO
-
-    scheduler.mask_ratio_mix_high_weight = MIX_HIGH_WEIGHT
-    scheduler.mask_ratio_high_mean = MIX_HIGH_MEAN
-    scheduler.mask_ratio_high_std = MIX_HIGH_STD
-    scheduler.mask_ratio_low_mean = MIX_LOW_MEAN
-    scheduler.mask_ratio_low_std = MIX_LOW_STD
+    scheduler.mask_ratio_max = MAX_MASK_RATIO
+    scheduler.mask_beta_alpha = BETA_ALPHA
+    scheduler.mask_beta_beta = BETA_BETA
 
     return scheduler
 
 
-def _truncated_normal_cdf(
+def _scaled_beta_cdf(
     x: np.ndarray,
-    mean: float,
-    std: float,
+    alpha: float,
+    beta: float,
     lower: float,
     upper: float,
 ) -> np.ndarray:
-    if std <= 0.0:
-        raise ValueError(f"std must be > 0, got {std}.")
+    if alpha <= 0.0 or beta <= 0.0:
+        raise ValueError(f"alpha and beta must be > 0, got {alpha}, {beta}.")
     if not (0.0 <= lower <= upper <= 1.0):
         raise ValueError(
             f"Expected 0 <= lower <= upper <= 1, got lower={lower}, upper={upper}."
@@ -88,20 +84,24 @@ def _truncated_normal_cdf(
     if abs(upper - lower) < 1e-12:
         return (tx >= lower).to(torch.float64).cpu().numpy()
 
-    dist = torch.distributions.Normal(
-        loc=torch.tensor(mean, dtype=torch.float64),
-        scale=torch.tensor(std, dtype=torch.float64),
-    )
-    cdf_low = dist.cdf(torch.tensor(lower, dtype=torch.float64))
-    cdf_high = dist.cdf(torch.tensor(upper, dtype=torch.float64))
-    z = cdf_high - cdf_low
-    if float(z.item()) <= 0.0:
-        raise ValueError(
-            "Invalid truncated normal normalization constant. "
-            f"mean={mean}, std={std}, lower={lower}, upper={upper}."
-        )
+    z = (tx - lower) / (upper - lower)
+    z = torch.clamp(z, 0.0, 1.0)
 
-    cdf_x = (dist.cdf(tx) - cdf_low) / z
+    if hasattr(torch.special, "betainc"):
+        cdf_x = torch.special.betainc(
+            torch.tensor(alpha, dtype=torch.float64),
+            torch.tensor(beta, dtype=torch.float64),
+            z,
+        )
+    else:
+        # Fallback for older torch versions: Monte Carlo CDF approximation.
+        rng = np.random.default_rng(SEED)
+        samples = rng.beta(alpha, beta, size=500_000)
+        samples.sort()
+        z_np = z.cpu().numpy()
+        idx = np.searchsorted(samples, z_np, side="right")
+        cdf_x = torch.as_tensor(idx / samples.size, dtype=torch.float64)
+
     cdf_x = torch.where(tx < lower, torch.zeros_like(cdf_x), cdf_x)
     cdf_x = torch.where(tx >= upper, torch.ones_like(cdf_x), cdf_x)
     return cdf_x.cpu().numpy()
@@ -118,42 +118,26 @@ def _configured_schedule_pmf(seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
     right_edges = np.clip(right_edges, 0.0, 1.0)
 
     lower = float(MIN_MASK_RATIO)
-    upper = 1.0
-    mix_weight = float(MIX_HIGH_WEIGHT)
+    upper = float(MAX_MASK_RATIO)
+    alpha = float(BETA_ALPHA)
+    beta = float(BETA_BETA)
 
-    high_cdf_left = _truncated_normal_cdf(
+    cdf_left = _scaled_beta_cdf(
         left_edges,
-        mean=float(MIX_HIGH_MEAN),
-        std=float(MIX_HIGH_STD),
+        alpha=alpha,
+        beta=beta,
         lower=lower,
         upper=upper,
     )
-    high_cdf_right = _truncated_normal_cdf(
+    cdf_right = _scaled_beta_cdf(
         right_edges,
-        mean=float(MIX_HIGH_MEAN),
-        std=float(MIX_HIGH_STD),
+        alpha=alpha,
+        beta=beta,
         lower=lower,
         upper=upper,
     )
 
-    low_cdf_left = _truncated_normal_cdf(
-        left_edges,
-        mean=float(MIX_LOW_MEAN),
-        std=float(MIX_LOW_STD),
-        lower=lower,
-        upper=upper,
-    )
-    low_cdf_right = _truncated_normal_cdf(
-        right_edges,
-        mean=float(MIX_LOW_MEAN),
-        std=float(MIX_LOW_STD),
-        lower=lower,
-        upper=upper,
-    )
-
-    high_mass = np.clip(high_cdf_right - high_cdf_left, 0.0, 1.0)
-    low_mass = np.clip(low_cdf_right - low_cdf_left, 0.0, 1.0)
-    pmf = mix_weight * high_mass + (1.0 - mix_weight) * low_mass
+    pmf = np.clip(cdf_right - cdf_left, 0.0, 1.0)
     pmf /= pmf.sum()
     return ratio_grid, pmf
 
@@ -217,7 +201,7 @@ def run_experiment() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray
     print(
         f"Running mask diagnostic: device={DEVICE}, steps={NUM_STEPS}, "
         f"batch={BATCH_SIZE}, seq_len={SEQ_LEN}, workers={NUM_WORKERS}, "
-        f"mask_ratio_min={MIN_MASK_RATIO}"
+        f"bounds=[{MIN_MASK_RATIO}, {MAX_MASK_RATIO}], beta=({BETA_ALPHA}, {BETA_BETA})"
     )
 
     if NUM_WORKERS <= 1:
@@ -316,7 +300,7 @@ def _plot_results(
         configured_pmf,
         color="crimson",
         linewidth=1.8,
-        label="configured mixture (raw)",
+        label="configured beta (raw)",
     )
     axes[0].axvline(MASK_PROB, linestyle="--", label="target p_global")
     axes[0].axvline(per_sequence_ratios.mean(), linestyle="-", label="empirical mean")
@@ -371,7 +355,8 @@ def main() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
 
     print("\nDiagnostics")
     print(f"  samples: {per_sequence_ratios.size}")
-    print(f"  mask_ratio_min: {MIN_MASK_RATIO:.6f}")
+    print(f"  ratio bounds: [{MIN_MASK_RATIO:.6f}, {MAX_MASK_RATIO:.6f}]")
+    print(f"  beta(alpha, beta): ({BETA_ALPHA:.6f}, {BETA_BETA:.6f})")
     print(f"  target p_global: {MASK_PROB:.6f}")
     print(f"  configured raw mean: {configured_mean:.6f}")
     print(f"  empirical mean:  {per_sequence_ratios.mean():.6f}")
