@@ -504,7 +504,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
     def __init__(
         self,
         *args,
-        mask_prob: float = 0.75,
+        mask_prob: float = 0.7,
         batch_mul: int = 1,
         **kwargs,
     ):

@@ -19,7 +19,7 @@ NUM_STEPS = 5000
 BATCH_SIZE = 256
 SEQ_LEN = 251
 
-MASK_PROB = 0.75
+MASK_PROB = 0.7
 
 # Empirical mask-ratio prior controls (post-Gumbel semantics).
 # - Bounds are where tails should softly die in observed per-sequence ratios.
