@@ -21,7 +21,8 @@ SEQ_LEN = 251
 
 MASK_PROB = 0.75
 
-# Ratio schedule options: "mntp_mixture", "trunc_normal", "uniform", "fixed"
+# Ratio schedule options:
+# "mntp_mixture", "trunc_normal", "uniform", "fixed", "legacy_flat_uniform"
 SCHEDULE_KIND = "mntp_mixture"
 
 # MNTP-like mixture params (truncated normals in [0, 1])

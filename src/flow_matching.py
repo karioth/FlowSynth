@@ -610,7 +610,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
 
         raise ValueError(
             "Unknown mask_schedule. Expected one of "
-            "{'mntp_mixture', 'trunc_normal', 'uniform', 'fixed'}, "
+            "{'mntp_mixture', 'trunc_normal', 'uniform', 'fixed', 'legacy_flat_uniform'}, "
             f"got {schedule!r}."
         )
 
@@ -710,6 +710,30 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
 
         return mask
 
+    @staticmethod
+    def _sample_legacy_flat_uniform_mask(
+        batch_size: int,
+        seq_len: int,
+        num_masked: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        total_tokens = batch_size * seq_len
+        if num_masked < 0 or num_masked > total_tokens:
+            raise ValueError(
+                f"num_masked must be in [0, {total_tokens}], got {num_masked}."
+            )
+
+        flat_mask = torch.zeros(total_tokens, dtype=torch.bool, device=device)
+        if num_masked > 0:
+            perm = torch.randperm(total_tokens, device=device)
+            flat_mask_indices = perm[:num_masked]
+            flat_mask[flat_mask_indices] = True
+        else:
+            flat_mask_indices = torch.empty(0, dtype=torch.long, device=device)
+
+        mask = flat_mask.view(batch_size, seq_len)
+        return mask, flat_mask_indices
+
     def _sample_mask(
         self,
         batch_size: int,
@@ -726,6 +750,14 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
             raise ValueError(
                 "round(mask_prob * total_tokens) must be > 0 for MaskedAR training. "
                 f"Got mask_prob={p}, total_tokens={total_tokens}."
+            )
+
+        if self.mask_schedule == "legacy_flat_uniform":
+            return self._sample_legacy_flat_uniform_mask(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                num_masked=num_masked,
+                device=device,
             )
 
         sequence_ratios = self._sample_sequence_ratios(batch_size=batch_size, device=device)
