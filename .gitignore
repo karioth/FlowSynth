@@ -6,7 +6,7 @@ __pycache__/
 *.pt
 *.ckpt
 *.npz
-
+*.png
 # Logs
 *.out
 *.err

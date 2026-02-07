@@ -16,27 +16,27 @@ SEED = 123
 DEVICE = "cpu"  # "cpu", "mps", or "cuda"
 
 NUM_STEPS = 5000
-BATCH_SIZE = 32
+BATCH_SIZE = 256
 SEQ_LEN = 251
 
-MASK_PROB = 0.77
+MASK_PROB = 0.75
 MASK_SIGMA = 64
 MASK_EXPANSION = 2
-MASK_KAPPA = 1.0
+MASK_KAPPA = 0.3
 
 # CPU parallelism knobs
-NUM_WORKERS = 16
+NUM_WORKERS = 62
 CHUNK_STEPS = 250
-TORCH_THREADS_PER_WORKER = 1
+TORCH_THREADS_PER_WORKER = 2
 
 STORE_ALL_MASK_BATCHES = True
 PLOT_BATCH_INDEX = 0
 
 SAVE_PLOT = True
 SHOW_PLOT = True
-PLOT_PATH = "mask_ratio_distribution.png"
+PLOT_PATH = "mask_ratio_distribution_sigma64_kappa3e-1.png"
 
-SAVE_RATIOS = True
+SAVE_RATIOS = False
 RATIOS_PATH = "mask_ratios.npy"
 
 
