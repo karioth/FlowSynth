@@ -23,10 +23,10 @@ MASK_PROB = 0.7
 
 # Empirical mask-ratio prior controls (post-Gumbel semantics).
 # - Bounds are where tails should softly die in observed per-sequence ratios.
-# - Mode controls where the peak sits inside those bounds.
+# - Kappa controls concentration (larger => narrower peak and lighter tails).
 EMPIRICAL_MIN_RATIO = 0.3
 EMPIRICAL_MAX_RATIO = 0.9
-EMPIRICAL_MODE_RATIO = 0.8
+EMPIRICAL_KAPPA = 4.0
 
 
 # CPU parallelism knobs
@@ -59,40 +59,29 @@ def _build_scheduler() -> FlowMatchingSchedulerMaskedAR:
 
     scheduler.mask_ratio_empirical_min = EMPIRICAL_MIN_RATIO
     scheduler.mask_ratio_empirical_max = EMPIRICAL_MAX_RATIO
-    scheduler.mask_ratio_empirical_mode = EMPIRICAL_MODE_RATIO
+    scheduler.mask_ratio_empirical_kappa = EMPIRICAL_KAPPA
 
     return scheduler
 
 
-def _solve_beta_shape_from_mean_and_mode(
+def _solve_beta_shape_from_mean_and_kappa(
     mean_01: float,
-    mode_01: float,
+    kappa: float,
 ) -> Tuple[float, float]:
     if not (0.0 < mean_01 < 1.0):
         raise ValueError(f"mean_01 must be in (0, 1), got {mean_01}.")
-    if not (0.0 < mode_01 < 1.0):
-        raise ValueError(f"mode_01 must be in (0, 1), got {mode_01}.")
+    if (not np.isfinite(kappa)) or kappa <= 0.0:
+        raise ValueError(f"kappa must be finite and > 0, got {kappa}.")
 
-    denom = mode_01 - mean_01
-    if abs(denom) < 1e-8:
-        raise ValueError(
-            "mode_01 must differ from mean_01 to identify beta shape. "
-            f"Got mean_01={mean_01}, mode_01={mode_01}."
-        )
-
-    s = (2.0 * mode_01 - 1.0) / denom
-    if (not np.isfinite(s)) or s <= 0.0:
-        raise ValueError(
-            "Invalid beta shape from mean/mode. "
-            f"Computed concentration s={s} from mean_01={mean_01}, mode_01={mode_01}."
-        )
-
-    alpha = mean_01 * s
-    beta = (1.0 - mean_01) * s
+    alpha = mean_01 * kappa
+    beta = (1.0 - mean_01) * kappa
     if alpha <= 1.0 or beta <= 1.0:
+        min_kappa = max(1.0 / mean_01, 1.0 / (1.0 - mean_01))
         raise ValueError(
-            "Chosen empirical bounds/mode produce non-unimodal boundary-heavy beta. "
-            f"Need alpha>1 and beta>1, got alpha={alpha}, beta={beta}."
+            "Chosen empirical bounds/mask_prob/kappa produce non-unimodal "
+            "boundary-heavy beta. "
+            f"Need alpha>1 and beta>1, got alpha={alpha}, beta={beta}. "
+            f"Increase kappa above {min_kappa:.6f} or move MASK_PROB away from bounds."
         )
 
     return float(alpha), float(beta)
@@ -151,7 +140,7 @@ def _configured_schedule_pmf(seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
 
     lower = float(EMPIRICAL_MIN_RATIO)
     upper = float(EMPIRICAL_MAX_RATIO)
-    mode = float(EMPIRICAL_MODE_RATIO)
+    kappa = float(EMPIRICAL_KAPPA)
     target_p = float(MASK_PROB)
 
     if not (0.0 < lower < upper < 1.0):
@@ -164,15 +153,9 @@ def _configured_schedule_pmf(seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
             "MASK_PROB must lie strictly between empirical bounds. "
             f"Got MASK_PROB={target_p}, min={lower}, max={upper}."
         )
-    if not (lower < mode < upper):
-        raise ValueError(
-            "EMPIRICAL_MODE_RATIO must lie strictly between empirical bounds. "
-            f"Got mode={mode}, min={lower}, max={upper}."
-        )
 
     mean_01 = (target_p - lower) / (upper - lower)
-    mode_01 = (mode - lower) / (upper - lower)
-    alpha, beta = _solve_beta_shape_from_mean_and_mode(mean_01, mode_01)
+    alpha, beta = _solve_beta_shape_from_mean_and_kappa(mean_01, kappa)
 
     cdf_left = _scaled_beta_cdf(
         left_edges,
@@ -254,7 +237,7 @@ def run_experiment() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray
         f"Running mask diagnostic: device={DEVICE}, steps={NUM_STEPS}, "
         f"batch={BATCH_SIZE}, seq_len={SEQ_LEN}, workers={NUM_WORKERS}, "
         f"empirical_prior=(min={EMPIRICAL_MIN_RATIO}, max={EMPIRICAL_MAX_RATIO}, "
-        f"mode={EMPIRICAL_MODE_RATIO})"
+        f"kappa={EMPIRICAL_KAPPA})"
     )
 
     if NUM_WORKERS <= 1:
@@ -407,16 +390,18 @@ def main() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
     configured_mean = float(np.sum(configured_ratio_grid * configured_pmf))
 
     mean_01 = (MASK_PROB - EMPIRICAL_MIN_RATIO) / (EMPIRICAL_MAX_RATIO - EMPIRICAL_MIN_RATIO)
-    mode_01 = (EMPIRICAL_MODE_RATIO - EMPIRICAL_MIN_RATIO) / (EMPIRICAL_MAX_RATIO - EMPIRICAL_MIN_RATIO)
-    alpha, beta = _solve_beta_shape_from_mean_and_mode(mean_01, mode_01)
+    alpha, beta = _solve_beta_shape_from_mean_and_kappa(mean_01, EMPIRICAL_KAPPA)
+    inferred_mode_01 = (alpha - 1.0) / (alpha + beta - 2.0)
+    inferred_mode = EMPIRICAL_MIN_RATIO + (EMPIRICAL_MAX_RATIO - EMPIRICAL_MIN_RATIO) * inferred_mode_01
 
     print("\nDiagnostics")
     print(f"  samples: {per_sequence_ratios.size}")
     print(
-        f"  empirical prior (min, max, mode): "
-        f"({EMPIRICAL_MIN_RATIO:.6f}, {EMPIRICAL_MAX_RATIO:.6f}, {EMPIRICAL_MODE_RATIO:.6f})"
+        f"  empirical prior (min, max, kappa): "
+        f"({EMPIRICAL_MIN_RATIO:.6f}, {EMPIRICAL_MAX_RATIO:.6f}, {EMPIRICAL_KAPPA:.6f})"
     )
     print(f"  implied beta(alpha, beta): ({alpha:.6f}, {beta:.6f})")
+    print(f"  implied mode: {inferred_mode:.6f}")
     print(f"  target p_global: {MASK_PROB:.6f}")
     print(f"  configured prior mean: {configured_mean:.6f}")
     print(f"  empirical mean:  {per_sequence_ratios.mean():.6f}")

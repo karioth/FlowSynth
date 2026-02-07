@@ -495,9 +495,9 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
     """
     Scheduler for MaskedARTransformer.
 
-    Samples per-sequence empirical mask probabilities from a bounded,
-    mode-controlled beta prior, then selects an exact global-K mask with
-    Gumbel-TopK.
+    Samples per-sequence empirical mask probabilities from a bounded beta
+    prior parameterized by mean + concentration (kappa), then selects an
+    exact global-K mask with Gumbel-TopK.
     Computes loss only at masked positions.
     """
 
@@ -505,73 +505,88 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         self,
         *args,
         mask_prob: float = 0.7,
+        mask_ratio_empirical_min: Optional[float] = None,
+        mask_ratio_empirical_max: Optional[float] = None,
+        mask_ratio_empirical_kappa: float = 8.0,
         batch_mul: int = 1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.mask_prob = mask_prob
         self.batch_mul = batch_mul
+
         # Empirical ratio prior parameters.
         # Defaults are derived from mask_prob and are safe for typical
         # MaskedAR settings (e.g., mask_prob around 0.7-0.8).
         p = float(mask_prob)
         eps = 1e-4
-        self.mask_ratio_empirical_min = max(eps, p - 0.45)
-        self.mask_ratio_empirical_max = min(1.0 - eps, p + 0.15)
-        if self.mask_ratio_empirical_max - self.mask_ratio_empirical_min < 1e-3:
-            self.mask_ratio_empirical_min = max(eps, p - 0.10)
-            self.mask_ratio_empirical_max = min(1.0 - eps, p + 0.10)
-        self.mask_ratio_empirical_mode = min(
-            self.mask_ratio_empirical_max - 1e-3,
-            max(self.mask_ratio_empirical_min + 1e-3, p + 0.05),
+        if (mask_ratio_empirical_min is None) != (mask_ratio_empirical_max is None):
+            raise ValueError(
+                "mask_ratio_empirical_min and mask_ratio_empirical_max must be both set or both None."
+            )
+
+        if mask_ratio_empirical_min is None and mask_ratio_empirical_max is None:
+            derived_min = max(eps, p - 0.45)
+            derived_max = min(1.0 - eps, p + 0.15)
+            if derived_max - derived_min < 1e-3:
+                derived_min = max(eps, p - 0.10)
+                derived_max = min(1.0 - eps, p + 0.10)
+            self.mask_ratio_empirical_min = derived_min
+            self.mask_ratio_empirical_max = derived_max
+        else:
+            if mask_ratio_empirical_min is None or mask_ratio_empirical_max is None:
+                raise RuntimeError("Internal empirical-bound validation failed.")
+            self.mask_ratio_empirical_min = float(mask_ratio_empirical_min)
+            self.mask_ratio_empirical_max = float(mask_ratio_empirical_max)
+
+        self.mask_ratio_empirical_kappa = float(mask_ratio_empirical_kappa)
+        self._beta_shape_cache_key: Optional[tuple[float, float, float, float]] = None
+        self._beta_shape_cache_value: Optional[tuple[float, float]] = None
+
+    @property
+    def mask_ratio_empirical_mode(self) -> float:
+        min_ratio = float(self.mask_ratio_empirical_min)
+        max_ratio = float(self.mask_ratio_empirical_max)
+        alpha, beta = self._get_beta_shape()
+        mode_01 = (alpha - 1.0) / (alpha + beta - 2.0)
+        return min_ratio + (max_ratio - min_ratio) * mode_01
+
+    @mask_ratio_empirical_mode.setter
+    def mask_ratio_empirical_mode(self, _: float) -> None:
+        raise AttributeError(
+            "mask_ratio_empirical_mode is derived from mask_prob, "
+            "mask_ratio_empirical_[min,max], and mask_ratio_empirical_kappa."
         )
 
     @staticmethod
-    def _solve_beta_shape_from_mean_and_mode(
+    def _solve_beta_shape_from_mean_and_kappa(
         mean_01: float,
-        mode_01: float,
+        kappa: float,
     ) -> tuple[float, float]:
         if not (0.0 < mean_01 < 1.0):
             raise ValueError(f"mean_01 must be in (0, 1), got {mean_01}.")
-        if not (0.0 < mode_01 < 1.0):
-            raise ValueError(f"mode_01 must be in (0, 1), got {mode_01}.")
 
-        denom = mode_01 - mean_01
-        if abs(denom) < 1e-8:
-            raise ValueError(
-                "mode_01 must differ from mean_01 to identify beta shape. "
-                f"Got mean_01={mean_01}, mode_01={mode_01}."
-            )
+        if (not math.isfinite(kappa)) or kappa <= 0.0:
+            raise ValueError(f"kappa must be finite and > 0, got {kappa}.")
 
-        s = (2.0 * mode_01 - 1.0) / denom
-        if (not math.isfinite(s)) or s <= 0.0:
-            raise ValueError(
-                "Invalid beta shape from mean/mode. "
-                f"Computed concentration s={s} from mean_01={mean_01}, mode_01={mode_01}."
-            )
-
-        alpha = mean_01 * s
-        beta = (1.0 - mean_01) * s
+        alpha = mean_01 * kappa
+        beta = (1.0 - mean_01) * kappa
         if alpha <= 1.0 or beta <= 1.0:
+            min_kappa = max(1.0 / mean_01, 1.0 / (1.0 - mean_01))
             raise ValueError(
-                "Chosen empirical bounds/mode produce non-unimodal boundary-heavy beta. "
-                f"Need alpha>1 and beta>1, got alpha={alpha}, beta={beta}."
+                "Chosen empirical bounds/mask_prob/kappa produce non-unimodal "
+                "boundary-heavy beta. Need alpha>1 and beta>1. "
+                f"Got alpha={alpha}, beta={beta}. Increase kappa above {min_kappa:.6f} "
+                "or move mask_prob away from bounds."
             )
 
         return float(alpha), float(beta)
 
-    def _sample_sequence_probabilities(
-        self,
-        batch_size: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if batch_size <= 0:
-            raise ValueError(f"batch_size must be > 0, got {batch_size}.")
-
+    def _get_beta_shape(self) -> tuple[float, float]:
         min_ratio = float(self.mask_ratio_empirical_min)
         max_ratio = float(self.mask_ratio_empirical_max)
-        mode_ratio = float(self.mask_ratio_empirical_mode)
         p = float(self.mask_prob)
+        kappa = float(self.mask_ratio_empirical_kappa)
 
         if not (0.0 < min_ratio < max_ratio < 1.0):
             raise ValueError(
@@ -583,15 +598,31 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
                 "mask_prob must lie strictly between empirical bounds. "
                 f"Got mask_prob={p}, min={min_ratio}, max={max_ratio}."
             )
-        if not (min_ratio < mode_ratio < max_ratio):
-            raise ValueError(
-                "mask_ratio_empirical_mode must lie strictly between empirical bounds. "
-                f"Got mode={mode_ratio}, min={min_ratio}, max={max_ratio}."
-            )
 
-        mean_01 = (p - min_ratio) / (max_ratio - min_ratio)
-        mode_01 = (mode_ratio - min_ratio) / (max_ratio - min_ratio)
-        alpha, beta = self._solve_beta_shape_from_mean_and_mode(mean_01, mode_01)
+        cache_key = (min_ratio, max_ratio, p, kappa)
+        if cache_key != self._beta_shape_cache_key:
+            mean_01 = (p - min_ratio) / (max_ratio - min_ratio)
+            self._beta_shape_cache_value = self._solve_beta_shape_from_mean_and_kappa(
+                mean_01,
+                kappa,
+            )
+            self._beta_shape_cache_key = cache_key
+
+        if self._beta_shape_cache_value is None:
+            raise RuntimeError("Internal beta-shape cache was not initialized.")
+        return self._beta_shape_cache_value
+
+    def _sample_sequence_probabilities(
+        self,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}.")
+
+        min_ratio = float(self.mask_ratio_empirical_min)
+        max_ratio = float(self.mask_ratio_empirical_max)
+        alpha, beta = self._get_beta_shape()
 
         base = torch.distributions.Beta(
             concentration1=torch.tensor(alpha, device=device, dtype=torch.float32),
