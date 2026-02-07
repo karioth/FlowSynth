@@ -495,8 +495,9 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
     """
     Scheduler for MaskedARTransformer.
 
-    Handles mask creation and computes loss only at masked positions.
-    Similar to FlowMatchingSchedulerTransformer but with masking.
+    Samples per-sequence masking logits from a logistic-normal prior,
+    then selects an exact global-K mask with Gumbel-TopK.
+    Computes loss only at masked positions.
     """
 
     def __init__(
@@ -509,13 +510,17 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         super().__init__(*args, **kwargs)
         self.mask_prob = mask_prob
         self.batch_mul = batch_mul
-        # Hardcoded bounded beta schedule defaults.
-        self.mask_ratio_min = 0.2
-        self.mask_ratio_max = 0.9
-        self.mask_beta_beta = 1.5
-        self.mask_beta_alpha = 3 * self.mask_beta_beta # for 0.75 mask this is the ratio
+        # Per-sequence logistic-normal prior on row logits.
+        # Under global exact Top-K, global logit shifts are rank-invariant,
+        # so mask_logit_std is the main shape knob.
+        p = float(mask_prob)
+        if 0.0 < p < 1.0:
+            self.mask_logit_mean = math.log(p / (1.0 - p))
+        else:
+            self.mask_logit_mean = 0.0
+        self.mask_logit_std = 1.0
 
-    def _sample_sequence_ratios(
+    def _sample_sequence_logits(
         self,
         batch_size: int,
         device: torch.device,
@@ -523,27 +528,18 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}.")
 
-        min_ratio = float(self.mask_ratio_min)
-        max_ratio = float(self.mask_ratio_max)
-        if not (0.0 <= min_ratio <= max_ratio <= 1.0):
+        mean = float(self.mask_logit_mean)
+        std = float(self.mask_logit_std)
+        if not math.isfinite(mean):
             raise ValueError(
-                "mask_ratio bounds must satisfy 0 <= min <= max <= 1, "
-                f"got min={min_ratio}, max={max_ratio}."
+                f"mask_logit_mean must be finite, got {mean}."
+            )
+        if (not math.isfinite(std)) or std <= 0.0:
+            raise ValueError(
+                f"mask_logit_std must be finite and > 0, got {std}."
             )
 
-        alpha = float(self.mask_beta_alpha)
-        beta = float(self.mask_beta_beta)
-        if alpha <= 0.0 or beta <= 0.0:
-            raise ValueError(
-                f"mask_beta_alpha and mask_beta_beta must be > 0, got {alpha}, {beta}."
-            )
-
-        base = torch.distributions.Beta(
-            concentration1=torch.tensor(alpha, device=device, dtype=torch.float32),
-            concentration0=torch.tensor(beta, device=device, dtype=torch.float32),
-        ).sample((batch_size,))
-
-        return min_ratio + (max_ratio - min_ratio) * base
+        return torch.randn(batch_size, device=device, dtype=torch.float32) * std + mean
 
     def _sample_mask(
         self,
@@ -568,9 +564,8 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
                 f"Got mask_prob={p}, total_tokens={total_tokens}."
             )
 
-        sequence_ratios = self._sample_sequence_ratios(batch_size=batch_size, device=device)
-        eps = torch.finfo(sequence_ratios.dtype).eps
-        row_logits = torch.logit(sequence_ratios.clamp(min=eps, max=1.0 - eps))
+        row_logits = self._sample_sequence_logits(batch_size=batch_size, device=device)
+        eps = torch.finfo(row_logits.dtype).eps
 
         uniform = torch.rand((batch_size, seq_len), device=device, dtype=row_logits.dtype)
         uniform = uniform.clamp(min=eps, max=1.0 - eps)
@@ -605,7 +600,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         bsz, seq_len, latent_size = x0_seq.shape
         total_tokens = bsz * seq_len
 
-        # 1. Sample per-sequence ratios and select exact global-K tokens via Gumbel-TopK.
+        # 1. Sample per-sequence logits and select exact global-K tokens via Gumbel-TopK.
         mask, flat_mask_indices = self._sample_mask(
             batch_size=bsz,
             seq_len=seq_len,

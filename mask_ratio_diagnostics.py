@@ -21,14 +21,11 @@ SEQ_LEN = 251
 
 MASK_PROB = 0.75
 
-# Per-sequence ratio prior bounds (for sampled beta ratios before global Top-K).
-MIN_MASK_RATIO = 0.2
-MAX_MASK_RATIO = 0.9
-
-# Scaled beta params on [MIN_MASK_RATIO, MAX_MASK_RATIO].
-# Mean is MIN + (MAX - MIN) * alpha / (alpha + beta).
-BETA_BETA = 1.5
-BETA_ALPHA = 3 * BETA_BETA
+# Per-sequence logistic-normal prior on row logits.
+# With exact global Top-K, shifting all logits by a constant does not change rankings,
+# so LOGIT_STD is the primary knob for the empirical ratio shape.
+LOGIT_MEAN = float(np.log(MASK_PROB / (1.0 - MASK_PROB)))
+LOGIT_STD = 1.0
 
 
 # CPU parallelism knobs
@@ -59,52 +56,39 @@ def _resolve_device(device_str: str) -> torch.device:
 def _build_scheduler() -> FlowMatchingSchedulerMaskedAR:
     scheduler = FlowMatchingSchedulerMaskedAR(mask_prob=MASK_PROB, batch_mul=1)
 
-    scheduler.mask_ratio_min = MIN_MASK_RATIO
-    scheduler.mask_ratio_max = MAX_MASK_RATIO
-    scheduler.mask_beta_alpha = BETA_ALPHA
-    scheduler.mask_beta_beta = BETA_BETA
+    scheduler.mask_logit_mean = LOGIT_MEAN
+    scheduler.mask_logit_std = LOGIT_STD
 
     return scheduler
 
 
-def _scaled_beta_cdf(
+def _logistic_normal_ratio_cdf(
     x: np.ndarray,
-    alpha: float,
-    beta: float,
-    lower: float,
-    upper: float,
+    logit_mean: float,
+    logit_std: float,
 ) -> np.ndarray:
-    if alpha <= 0.0 or beta <= 0.0:
-        raise ValueError(f"alpha and beta must be > 0, got {alpha}, {beta}.")
-    if not (0.0 <= lower <= upper <= 1.0):
+    if (not np.isfinite(logit_mean)):
         raise ValueError(
-            f"Expected 0 <= lower <= upper <= 1, got lower={lower}, upper={upper}."
+            f"logit_mean must be finite, got {logit_mean}."
+        )
+    if (not np.isfinite(logit_std)) or logit_std <= 0.0:
+        raise ValueError(
+            f"logit_std must be finite and > 0, got {logit_std}."
         )
 
     tx = torch.as_tensor(x, dtype=torch.float64)
-    if abs(upper - lower) < 1e-12:
-        return (tx >= lower).to(torch.float64).cpu().numpy()
+    cdf_x = torch.zeros_like(tx)
 
-    z = (tx - lower) / (upper - lower)
-    z = torch.clamp(z, 0.0, 1.0)
-
-    if hasattr(torch.special, "betainc"):
-        cdf_x = torch.special.betainc(
-            torch.tensor(alpha, dtype=torch.float64),
-            torch.tensor(beta, dtype=torch.float64),
-            z,
+    in_unit = (tx > 0.0) & (tx < 1.0)
+    if bool(in_unit.any()):
+        z = torch.logit(tx[in_unit])
+        normal = torch.distributions.Normal(
+            loc=torch.tensor(logit_mean, dtype=torch.float64),
+            scale=torch.tensor(logit_std, dtype=torch.float64),
         )
-    else:
-        # Fallback for older torch versions: Monte Carlo CDF approximation.
-        rng = np.random.default_rng(SEED)
-        samples = rng.beta(alpha, beta, size=500_000)
-        samples.sort()
-        z_np = z.cpu().numpy()
-        idx = np.searchsorted(samples, z_np, side="right")
-        cdf_x = torch.as_tensor(idx / samples.size, dtype=torch.float64)
+        cdf_x[in_unit] = normal.cdf(z)
 
-    cdf_x = torch.where(tx < lower, torch.zeros_like(cdf_x), cdf_x)
-    cdf_x = torch.where(tx >= upper, torch.ones_like(cdf_x), cdf_x)
+    cdf_x = torch.where(tx >= 1.0, torch.ones_like(cdf_x), cdf_x)
     return cdf_x.cpu().numpy()
 
 
@@ -118,24 +102,18 @@ def _configured_schedule_pmf(seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
     left_edges = np.clip(left_edges, 0.0, 1.0)
     right_edges = np.clip(right_edges, 0.0, 1.0)
 
-    lower = float(MIN_MASK_RATIO)
-    upper = float(MAX_MASK_RATIO)
-    alpha = float(BETA_ALPHA)
-    beta = float(BETA_BETA)
+    logit_mean = float(LOGIT_MEAN)
+    logit_std = float(LOGIT_STD)
 
-    cdf_left = _scaled_beta_cdf(
+    cdf_left = _logistic_normal_ratio_cdf(
         left_edges,
-        alpha=alpha,
-        beta=beta,
-        lower=lower,
-        upper=upper,
+        logit_mean=logit_mean,
+        logit_std=logit_std,
     )
-    cdf_right = _scaled_beta_cdf(
+    cdf_right = _logistic_normal_ratio_cdf(
         right_edges,
-        alpha=alpha,
-        beta=beta,
-        lower=lower,
-        upper=upper,
+        logit_mean=logit_mean,
+        logit_std=logit_std,
     )
 
     pmf = np.clip(cdf_right - cdf_left, 0.0, 1.0)
@@ -202,7 +180,7 @@ def run_experiment() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray
     print(
         f"Running mask diagnostic: device={DEVICE}, steps={NUM_STEPS}, "
         f"batch={BATCH_SIZE}, seq_len={SEQ_LEN}, workers={NUM_WORKERS}, "
-        f"bounds=[{MIN_MASK_RATIO}, {MAX_MASK_RATIO}], beta=({BETA_ALPHA}, {BETA_BETA})"
+        f"logit_normal=(mean={LOGIT_MEAN}, std={LOGIT_STD}; std is primary shape knob)"
     )
 
     if NUM_WORKERS <= 1:
@@ -301,7 +279,7 @@ def _plot_results(
     #     configured_pmf,
     #     color="crimson",
     #     linewidth=1.8,
-    #     label="configured beta (raw)",
+    #     label="configured logit-normal prior",
     # )
     axes[0].axvline(MASK_PROB, linestyle="--", label="target p_global")
     axes[0].axvline(per_sequence_ratios.mean(), linestyle="-", label="empirical mean")
@@ -356,10 +334,9 @@ def main() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
 
     print("\nDiagnostics")
     print(f"  samples: {per_sequence_ratios.size}")
-    print(f"  ratio prior bounds: [{MIN_MASK_RATIO:.6f}, {MAX_MASK_RATIO:.6f}]")
-    print(f"  beta(alpha, beta): ({BETA_ALPHA:.6f}, {BETA_BETA:.6f})")
+    print(f"  logit-normal mean/std: ({LOGIT_MEAN:.6f}, {LOGIT_STD:.6f})")
     print(f"  target p_global: {MASK_PROB:.6f}")
-    print(f"  configured raw mean: {configured_mean:.6f}")
+    print(f"  configured prior mean: {configured_mean:.6f}")
     print(f"  empirical mean:  {per_sequence_ratios.mean():.6f}")
     print(f"  empirical std:   {per_sequence_ratios.std():.6f}")
     print(
