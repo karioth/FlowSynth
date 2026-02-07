@@ -27,8 +27,6 @@ MASK_PROB = 0.75
 EMPIRICAL_MIN_RATIO = 0.3
 EMPIRICAL_MAX_RATIO = 0.9
 EMPIRICAL_MODE_RATIO = 0.8
-# > 1 broadens only the left side of the mode; 1 disables the warp.
-LEFT_TAIL_WARP = 1.5
 
 
 # CPU parallelism knobs
@@ -62,7 +60,6 @@ def _build_scheduler() -> FlowMatchingSchedulerMaskedAR:
     scheduler.mask_ratio_empirical_min = EMPIRICAL_MIN_RATIO
     scheduler.mask_ratio_empirical_max = EMPIRICAL_MAX_RATIO
     scheduler.mask_ratio_empirical_mode = EMPIRICAL_MODE_RATIO
-    scheduler.mask_left_tail_warp = LEFT_TAIL_WARP
 
     return scheduler
 
@@ -142,24 +139,6 @@ def _scaled_beta_cdf(
     return cdf_x.cpu().numpy()
 
 
-def _left_warp_inverse(
-    x: np.ndarray,
-    lower: float,
-    mode: float,
-    gamma: float,
-) -> np.ndarray:
-    tx = torch.as_tensor(x, dtype=torch.float64)
-    if abs(gamma - 1.0) < 1e-12:
-        return tx.cpu().numpy()
-
-    out = tx.clone()
-    mask = (tx > lower) & (tx < mode)
-    if bool(mask.any()):
-        u = (tx[mask] - lower) / (mode - lower)
-        out[mask] = lower + (mode - lower) * torch.pow(u, 1.0 / gamma)
-    return out.cpu().numpy()
-
-
 def _configured_schedule_pmf(seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
     if seq_len <= 0:
         raise ValueError(f"seq_len must be > 0, got {seq_len}.")
@@ -173,7 +152,6 @@ def _configured_schedule_pmf(seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
     lower = float(EMPIRICAL_MIN_RATIO)
     upper = float(EMPIRICAL_MAX_RATIO)
     mode = float(EMPIRICAL_MODE_RATIO)
-    left_tail_warp = float(LEFT_TAIL_WARP)
     target_p = float(MASK_PROB)
 
     if not (0.0 < lower < upper < 1.0):
@@ -191,38 +169,20 @@ def _configured_schedule_pmf(seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
             "EMPIRICAL_MODE_RATIO must lie strictly between empirical bounds. "
             f"Got mode={mode}, min={lower}, max={upper}."
         )
-    if (not np.isfinite(left_tail_warp)) or left_tail_warp <= 0.0:
-        raise ValueError(
-            "LEFT_TAIL_WARP must be finite and > 0, "
-            f"got {left_tail_warp}."
-        )
 
     mean_01 = (target_p - lower) / (upper - lower)
     mode_01 = (mode - lower) / (upper - lower)
     alpha, beta = _solve_beta_shape_from_mean_and_mode(mean_01, mode_01)
 
-    left_query = _left_warp_inverse(
-        left_edges,
-        lower=lower,
-        mode=mode,
-        gamma=left_tail_warp,
-    )
-    right_query = _left_warp_inverse(
-        right_edges,
-        lower=lower,
-        mode=mode,
-        gamma=left_tail_warp,
-    )
-
     cdf_left = _scaled_beta_cdf(
-        left_query,
+        left_edges,
         alpha=alpha,
         beta=beta,
         lower=lower,
         upper=upper,
     )
     cdf_right = _scaled_beta_cdf(
-        right_query,
+        right_edges,
         alpha=alpha,
         beta=beta,
         lower=lower,
@@ -294,7 +254,7 @@ def run_experiment() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray
         f"Running mask diagnostic: device={DEVICE}, steps={NUM_STEPS}, "
         f"batch={BATCH_SIZE}, seq_len={SEQ_LEN}, workers={NUM_WORKERS}, "
         f"empirical_prior=(min={EMPIRICAL_MIN_RATIO}, max={EMPIRICAL_MAX_RATIO}, "
-        f"mode={EMPIRICAL_MODE_RATIO}, left_tail_warp={LEFT_TAIL_WARP})"
+        f"mode={EMPIRICAL_MODE_RATIO})"
     )
 
     if NUM_WORKERS <= 1:
@@ -456,7 +416,6 @@ def main() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
         f"  empirical prior (min, max, mode): "
         f"({EMPIRICAL_MIN_RATIO:.6f}, {EMPIRICAL_MAX_RATIO:.6f}, {EMPIRICAL_MODE_RATIO:.6f})"
     )
-    print(f"  left-tail warp gamma: {LEFT_TAIL_WARP:.6f}")
     print(f"  implied beta(alpha, beta): ({alpha:.6f}, {beta:.6f})")
     print(f"  target p_global: {MASK_PROB:.6f}")
     print(f"  configured prior mean: {configured_mean:.6f}")

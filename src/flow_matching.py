@@ -496,8 +496,8 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
     Scheduler for MaskedARTransformer.
 
     Samples per-sequence empirical mask probabilities from a bounded,
-    mode-controlled beta prior with an optional left-tail warp, then selects
-    an exact global-K mask with Gumbel-TopK.
+    mode-controlled beta prior, then selects an exact global-K mask with
+    Gumbel-TopK.
     Computes loss only at masked positions.
     """
 
@@ -525,8 +525,6 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
             self.mask_ratio_empirical_max - 1e-3,
             max(self.mask_ratio_empirical_min + 1e-3, p + 0.05),
         )
-        # > 1 broadens only the left side of the mode; 1 disables the warp.
-        self.mask_left_tail_warp = 1.5
 
     @staticmethod
     def _solve_beta_shape_from_mean_and_mode(
@@ -574,7 +572,6 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         max_ratio = float(self.mask_ratio_empirical_max)
         mode_ratio = float(self.mask_ratio_empirical_mode)
         p = float(self.mask_prob)
-        left_tail_warp = float(self.mask_left_tail_warp)
 
         if not (0.0 < min_ratio < max_ratio < 1.0):
             raise ValueError(
@@ -591,11 +588,6 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
                 "mask_ratio_empirical_mode must lie strictly between empirical bounds. "
                 f"Got mode={mode_ratio}, min={min_ratio}, max={max_ratio}."
             )
-        if (not math.isfinite(left_tail_warp)) or left_tail_warp <= 0.0:
-            raise ValueError(
-                "mask_left_tail_warp must be finite and > 0. "
-                f"Got {left_tail_warp}."
-            )
 
         mean_01 = (p - min_ratio) / (max_ratio - min_ratio)
         mode_01 = (mode_ratio - min_ratio) / (max_ratio - min_ratio)
@@ -606,19 +598,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
             concentration0=torch.tensor(beta, device=device, dtype=torch.float32),
         ).sample((batch_size,))
 
-        probs = min_ratio + (max_ratio - min_ratio) * base
-
-        if abs(left_tail_warp - 1.0) > 1e-6:
-            left_mask = probs < mode_ratio
-            if bool(left_mask.any()):
-                left_u = (probs[left_mask] - min_ratio) / (mode_ratio - min_ratio)
-                left_u = left_u.clamp(min=0.0, max=1.0)
-                probs[left_mask] = min_ratio + (mode_ratio - min_ratio) * torch.pow(
-                    left_u,
-                    left_tail_warp,
-                )
-
-        return probs
+        return min_ratio + (max_ratio - min_ratio) * base
 
     def _sample_mask(
         self,
