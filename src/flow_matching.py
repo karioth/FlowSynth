@@ -653,6 +653,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
                 "round(mask_prob * total_tokens) must be > 0 for MaskedAR training. "
                 f"Got mask_prob={p}, total_tokens={total_tokens}."
             )
+        num_unmasked = total_tokens - num_masked
 
         row_probs = self._sample_sequence_probabilities(batch_size=batch_size, device=device)
         eps = torch.finfo(row_probs.dtype).eps
@@ -669,7 +670,20 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         flat_scores = scores.reshape(-1)
 
         if num_masked >= total_tokens:
+            mask_flat = torch.ones(total_tokens, dtype=torch.bool, device=device)
             flat_mask_indices = torch.arange(total_tokens, device=device)
+        elif num_unmasked < num_masked:
+            # Equivalent to selecting top-k masked scores, but faster when unmasked
+            # tokens are the minority (e.g., mask_prob > 0.5).
+            flat_unmask_indices = torch.topk(
+                flat_scores,
+                k=num_unmasked,
+                largest=False,
+                sorted=False,
+            ).indices
+            mask_flat = torch.ones(total_tokens, dtype=torch.bool, device=device)
+            mask_flat[flat_unmask_indices] = False
+            flat_mask_indices = torch.nonzero(mask_flat, as_tuple=True)[0]
         else:
             flat_mask_indices = torch.topk(
                 flat_scores,
@@ -677,11 +691,15 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
                 largest=True,
                 sorted=False,
             ).indices
-
-        mask_flat = torch.zeros(total_tokens, dtype=torch.bool, device=device)
-        mask_flat[flat_mask_indices] = True
+            mask_flat = torch.zeros(total_tokens, dtype=torch.bool, device=device)
+            mask_flat[flat_mask_indices] = True
         mask = mask_flat.view(batch_size, seq_len)
 
+        if int(mask_flat.sum().item()) != num_masked:
+            raise RuntimeError(
+                "Mask sampler produced wrong masked-token count. "
+                f"Expected {num_masked}, got {int(mask_flat.sum().item())}."
+            )
         if int(flat_mask_indices.numel()) != num_masked:
             raise RuntimeError(
                 "Mask sampler produced wrong number of masked tokens. "
