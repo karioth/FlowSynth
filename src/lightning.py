@@ -31,7 +31,7 @@ class LitModule(L.LightningModule):
         t_m: float = 0.0,
         t_s: float = 1.0,
         batch_mul: int = 4,
-        mask_prob: float = 0.7,
+        mask_prob: float = 0.75,
         lr: float = 1e-4,
         weight_decay: float = 0.01,
         lr_scheduler: str = "cosine",

@@ -12,7 +12,7 @@ from src.flow_matching import FlowMatchingSchedulerMaskedAR
 # -----------------------------------------------------------------------------
 # Hardcoded experiment config (edit these manually)
 # -----------------------------------------------------------------------------
-SEED = 123
+SEED = 1234
 DEVICE = "cpu"  # "cpu", "mps", or "cuda"
 
 NUM_STEPS = 5000
@@ -22,13 +22,14 @@ SEQ_LEN = 251
 MASK_PROB = 0.75
 
 # Per-sequence ratio bounds.
-MIN_MASK_RATIO = 0.30
-MAX_MASK_RATIO = 0.90
+MIN_MASK_RATIO = 0.2
+MAX_MASK_RATIO = 0.9
 
 # Scaled beta params on [MIN_MASK_RATIO, MAX_MASK_RATIO].
 # Mean is MIN + (MAX - MIN) * alpha / (alpha + beta).
-BETA_ALPHA = 9.0
-BETA_BETA = 3.0
+BETA_BETA = 1.5
+BETA_ALPHA = 3 * BETA_BETA
+
 
 # CPU parallelism knobs
 NUM_WORKERS = 62
@@ -295,13 +296,13 @@ def _plot_results(
     pmf /= pmf.sum()
     ratio_grid = np.arange(SEQ_LEN + 1, dtype=np.float64) / float(SEQ_LEN)
     axes[0].bar(ratio_grid, pmf, width=0.92 / float(SEQ_LEN), alpha=0.85, align="center")
-    axes[0].plot(
-        configured_ratio_grid,
-        configured_pmf,
-        color="crimson",
-        linewidth=1.8,
-        label="configured beta (raw)",
-    )
+    # axes[0].plot(
+    #     configured_ratio_grid,
+    #     configured_pmf,
+    #     color="crimson",
+    #     linewidth=1.8,
+    #     label="configured beta (raw)",
+    # )
     axes[0].axvline(MASK_PROB, linestyle="--", label="target p_global")
     axes[0].axvline(per_sequence_ratios.mean(), linestyle="-", label="empirical mean")
     axes[0].set_title("Per-sequence mask ratio distribution")

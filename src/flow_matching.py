@@ -502,7 +502,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
     def __init__(
         self,
         *args,
-        mask_prob: float = 0.7,
+        mask_prob: float = 0.75,
         batch_mul: int = 1,
         **kwargs,
     ):
@@ -510,10 +510,10 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         self.mask_prob = mask_prob
         self.batch_mul = batch_mul
         # Hardcoded bounded beta schedule defaults.
-        self.mask_ratio_min = 0.30
-        self.mask_ratio_max = 0.90
-        self.mask_beta_alpha = 9.0
-        self.mask_beta_beta = 3.0
+        self.mask_ratio_min = 0.2
+        self.mask_ratio_max = 0.9
+        self.mask_beta_beta = 1.5
+        self.mask_beta_alpha = 3 * self.mask_beta_beta # for 0.75 mask this is the ratio
 
     def _sample_sequence_ratios(
         self,
