@@ -545,126 +545,17 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
 
         return min_ratio + (max_ratio - min_ratio) * base
 
-    @staticmethod
-    def _project_sequence_counts_to_global_k(
-        sequence_ratios: torch.Tensor,
-        seq_len: int,
-        num_masked: int,
-        min_ratio: float = 0.0,
-        max_ratio: float = 1.0,
-    ) -> torch.Tensor:
-        if sequence_ratios.dim() != 1:
-            raise ValueError(
-                "sequence_ratios must be 1D, "
-                f"got shape {tuple(sequence_ratios.shape)}."
-            )
-        if seq_len <= 0:
-            raise ValueError(f"seq_len must be > 0, got {seq_len}.")
-        if not (0.0 <= min_ratio <= max_ratio <= 1.0):
-            raise ValueError(
-                "ratio bounds must satisfy 0 <= min_ratio <= max_ratio <= 1, "
-                f"got min_ratio={min_ratio}, max_ratio={max_ratio}."
-            )
-
-        bsz = int(sequence_ratios.shape[0])
-        if bsz <= 0:
-            raise ValueError("sequence_ratios cannot be empty.")
-
-        total_tokens = bsz * seq_len
-        if num_masked < 0 or num_masked > total_tokens:
-            raise ValueError(
-                f"num_masked must be in [0, {total_tokens}], got {num_masked}."
-            )
-
-        min_count = int(math.ceil(min_ratio * seq_len))
-        max_count = int(math.floor(max_ratio * seq_len))
-        min_total = bsz * min_count
-        max_total = bsz * max_count
-        if num_masked < min_total or num_masked > max_total:
-            raise ValueError(
-                f"num_masked={num_masked} is infeasible for min_ratio={min_ratio} "
-                f"with batch_size={bsz}, seq_len={seq_len}. Feasible range is "
-                f"[{min_total}, {max_total}]."
-            )
-
-        target = sequence_ratios.clamp(min_ratio, max_ratio) * float(seq_len)
-        target_sum = float(target.sum().item())
-
-        if target_sum <= 0.0:
-            target = torch.full_like(target, float(num_masked) / float(bsz))
-        else:
-            target = target * (float(num_masked) / target_sum)
-        target = target.clamp(float(min_count), float(max_count))
-
-        counts = torch.floor(target).to(torch.long).clamp(min=min_count, max=max_count)
-        delta = int(num_masked - int(counts.sum().item()))
-        if delta == 0:
-            return counts
-
-        frac = target - counts.to(dtype=target.dtype)
-        tie_break = torch.rand_like(frac) * 1e-6
-
-        if delta > 0:
-            while delta > 0:
-                capacity = counts < max_count
-                if not bool(capacity.any()):
-                    raise RuntimeError("Unable to add masks while projecting counts to global K.")
-                scores = (frac + tie_break).masked_fill(~capacity, -1e9)
-                add = min(delta, int(capacity.sum().item()))
-                idx = torch.topk(scores, k=add, largest=True, sorted=False).indices
-                counts[idx] += 1
-                delta -= add
-        else:
-            delta = -delta
-            while delta > 0:
-                removable = counts > min_count
-                if not bool(removable.any()):
-                    raise RuntimeError("Unable to remove masks while projecting counts to global K.")
-                scores = (frac + tie_break).masked_fill(~removable, 1e9)
-                remove = min(delta, int(removable.sum().item()))
-                idx = torch.topk(scores, k=remove, largest=False, sorted=False).indices
-                counts[idx] -= 1
-                delta -= remove
-
-        return counts
-
-    @staticmethod
-    def _sample_uniform_mask_from_counts(
-        per_sequence_counts: torch.Tensor,
-        seq_len: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if per_sequence_counts.dim() != 1:
-            raise ValueError(
-                "per_sequence_counts must be 1D, "
-                f"got shape {tuple(per_sequence_counts.shape)}."
-            )
-        if seq_len <= 0:
-            raise ValueError(f"seq_len must be > 0, got {seq_len}.")
-
-        if torch.any(per_sequence_counts < 0) or torch.any(per_sequence_counts > seq_len):
-            raise ValueError(
-                f"per_sequence_counts values must be in [0, {seq_len}]."
-            )
-
-        bsz = int(per_sequence_counts.shape[0])
-        random_scores = torch.rand(bsz, seq_len, device=device)
-        sorted_indices = torch.argsort(random_scores, dim=1)
-
-        mask = torch.zeros((bsz, seq_len), dtype=torch.bool, device=device)
-        for b in range(bsz):
-            count_b = int(per_sequence_counts[b].item())
-            if count_b > 0:
-                mask[b, sorted_indices[b, :count_b]] = True
-
-        return mask
-
     def _sample_mask(
         self,
         batch_size: int,
         seq_len: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}.")
+        if seq_len <= 0:
+            raise ValueError(f"seq_len must be > 0, got {seq_len}.")
+
         total_tokens = batch_size * seq_len
         p = float(self.mask_prob)
         if not (0.0 <= p <= 1.0):
@@ -677,41 +568,31 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
                 f"Got mask_prob={p}, total_tokens={total_tokens}."
             )
 
-        min_ratio = float(self.mask_ratio_min)
-        max_ratio = float(self.mask_ratio_max)
-        if not (0.0 <= min_ratio <= max_ratio <= 1.0):
-            raise ValueError(
-                "mask_ratio bounds must satisfy 0 <= min <= max <= 1, "
-                f"got min={min_ratio}, max={max_ratio}."
-            )
-
-        min_count = int(math.ceil(min_ratio * seq_len))
-        max_count = int(math.floor(max_ratio * seq_len))
-        min_total = batch_size * min_count
-        max_total = batch_size * max_count
-        if num_masked < min_total or num_masked > max_total:
-            raise ValueError(
-                f"mask_prob={p} with batch_size={batch_size}, seq_len={seq_len} implies "
-                f"num_masked={num_masked}, outside feasible range [{min_total}, {max_total}] "
-                f"for mask_ratio_min={min_ratio}, mask_ratio_max={max_ratio}."
-            )
-
         sequence_ratios = self._sample_sequence_ratios(batch_size=batch_size, device=device)
-        per_sequence_counts = self._project_sequence_counts_to_global_k(
-            sequence_ratios=sequence_ratios,
-            seq_len=seq_len,
-            num_masked=num_masked,
-            min_ratio=min_ratio,
-            max_ratio=max_ratio,
-        )
+        eps = torch.finfo(sequence_ratios.dtype).eps
+        row_logits = torch.logit(sequence_ratios.clamp(min=eps, max=1.0 - eps))
 
-        mask = self._sample_uniform_mask_from_counts(
-            per_sequence_counts=per_sequence_counts,
-            seq_len=seq_len,
-            device=device,
-        )
+        uniform = torch.rand((batch_size, seq_len), device=device, dtype=row_logits.dtype)
+        uniform = uniform.clamp(min=eps, max=1.0 - eps)
+        gumbel = -torch.log(-torch.log(uniform))
 
-        flat_mask_indices = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(1)
+        scores = row_logits.unsqueeze(1) + gumbel
+        flat_scores = scores.reshape(-1)
+
+        if num_masked >= total_tokens:
+            flat_mask_indices = torch.arange(total_tokens, device=device)
+        else:
+            flat_mask_indices = torch.topk(
+                flat_scores,
+                k=num_masked,
+                largest=True,
+                sorted=False,
+            ).indices
+
+        mask_flat = torch.zeros(total_tokens, dtype=torch.bool, device=device)
+        mask_flat[flat_mask_indices] = True
+        mask = mask_flat.view(batch_size, seq_len)
+
         if int(flat_mask_indices.numel()) != num_masked:
             raise RuntimeError(
                 "Mask sampler produced wrong number of masked tokens. "
@@ -724,7 +605,7 @@ class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
         bsz, seq_len, latent_size = x0_seq.shape
         total_tokens = bsz * seq_len
 
-        # 1. Sample per-sequence ratios, project to exact global-K, and mask uniformly per sequence.
+        # 1. Sample per-sequence ratios and select exact global-K tokens via Gumbel-TopK.
         mask, flat_mask_indices = self._sample_mask(
             batch_size=bsz,
             seq_len=seq_len,

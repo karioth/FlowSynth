@@ -21,7 +21,7 @@ SEQ_LEN = 251
 
 MASK_PROB = 0.75
 
-# Per-sequence ratio bounds.
+# Per-sequence ratio prior bounds (for sampled beta ratios before global Top-K).
 MIN_MASK_RATIO = 0.2
 MAX_MASK_RATIO = 0.9
 
@@ -356,7 +356,7 @@ def main() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
 
     print("\nDiagnostics")
     print(f"  samples: {per_sequence_ratios.size}")
-    print(f"  ratio bounds: [{MIN_MASK_RATIO:.6f}, {MAX_MASK_RATIO:.6f}]")
+    print(f"  ratio prior bounds: [{MIN_MASK_RATIO:.6f}, {MAX_MASK_RATIO:.6f}]")
     print(f"  beta(alpha, beta): ({BETA_ALPHA:.6f}, {BETA_BETA:.6f})")
     print(f"  target p_global: {MASK_PROB:.6f}")
     print(f"  configured raw mean: {configured_mean:.6f}")
