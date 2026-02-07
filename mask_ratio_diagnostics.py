@@ -21,9 +21,8 @@ SEQ_LEN = 251
 
 MASK_PROB = 0.75
 
-# Ratio schedule options:
-# "mntp_mixture", "trunc_normal", "uniform", "fixed", "legacy_flat_uniform"
-SCHEDULE_KIND = "mntp_mixture"
+# Minimum per-sequence masking ratio.
+MIN_MASK_RATIO = 0.30
 
 # MNTP-like mixture params (truncated normals in [0, 1])
 MIX_HIGH_WEIGHT = 0.82
@@ -31,13 +30,6 @@ MIX_HIGH_MEAN = 0.85
 MIX_HIGH_STD = 0.03
 MIX_LOW_MEAN = 0.55
 MIX_LOW_STD = 0.20
-
-# Single truncated normal params (used when SCHEDULE_KIND == "trunc_normal")
-TRUNC_MEAN = 0.75
-TRUNC_STD = 0.12
-
-# Fixed ratio value (used when SCHEDULE_KIND == "fixed")
-FIXED_RATIO = 0.75
 
 # CPU parallelism knobs
 NUM_WORKERS = 62
@@ -67,7 +59,7 @@ def _resolve_device(device_str: str) -> torch.device:
 def _build_scheduler() -> FlowMatchingSchedulerMaskedAR:
     scheduler = FlowMatchingSchedulerMaskedAR(mask_prob=MASK_PROB, batch_mul=1)
 
-    scheduler.mask_schedule = SCHEDULE_KIND
+    scheduler.mask_ratio_min = MIN_MASK_RATIO
 
     scheduler.mask_ratio_mix_high_weight = MIX_HIGH_WEIGHT
     scheduler.mask_ratio_high_mean = MIX_HIGH_MEAN
@@ -75,11 +67,95 @@ def _build_scheduler() -> FlowMatchingSchedulerMaskedAR:
     scheduler.mask_ratio_low_mean = MIX_LOW_MEAN
     scheduler.mask_ratio_low_std = MIX_LOW_STD
 
-    scheduler.mask_ratio_trunc_mean = TRUNC_MEAN
-    scheduler.mask_ratio_trunc_std = TRUNC_STD
-    scheduler.mask_ratio_fixed = FIXED_RATIO
-
     return scheduler
+
+
+def _truncated_normal_cdf(
+    x: np.ndarray,
+    mean: float,
+    std: float,
+    lower: float,
+    upper: float,
+) -> np.ndarray:
+    if std <= 0.0:
+        raise ValueError(f"std must be > 0, got {std}.")
+    if not (0.0 <= lower <= upper <= 1.0):
+        raise ValueError(
+            f"Expected 0 <= lower <= upper <= 1, got lower={lower}, upper={upper}."
+        )
+
+    tx = torch.as_tensor(x, dtype=torch.float64)
+    if abs(upper - lower) < 1e-12:
+        return (tx >= lower).to(torch.float64).cpu().numpy()
+
+    dist = torch.distributions.Normal(
+        loc=torch.tensor(mean, dtype=torch.float64),
+        scale=torch.tensor(std, dtype=torch.float64),
+    )
+    cdf_low = dist.cdf(torch.tensor(lower, dtype=torch.float64))
+    cdf_high = dist.cdf(torch.tensor(upper, dtype=torch.float64))
+    z = cdf_high - cdf_low
+    if float(z.item()) <= 0.0:
+        raise ValueError(
+            "Invalid truncated normal normalization constant. "
+            f"mean={mean}, std={std}, lower={lower}, upper={upper}."
+        )
+
+    cdf_x = (dist.cdf(tx) - cdf_low) / z
+    cdf_x = torch.where(tx < lower, torch.zeros_like(cdf_x), cdf_x)
+    cdf_x = torch.where(tx >= upper, torch.ones_like(cdf_x), cdf_x)
+    return cdf_x.cpu().numpy()
+
+
+def _configured_schedule_pmf(seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be > 0, got {seq_len}.")
+
+    ratio_grid = np.arange(seq_len + 1, dtype=np.float64) / float(seq_len)
+    left_edges = (np.arange(seq_len + 1, dtype=np.float64) - 0.5) / float(seq_len)
+    right_edges = (np.arange(seq_len + 1, dtype=np.float64) + 0.5) / float(seq_len)
+    left_edges = np.clip(left_edges, 0.0, 1.0)
+    right_edges = np.clip(right_edges, 0.0, 1.0)
+
+    lower = float(MIN_MASK_RATIO)
+    upper = 1.0
+    mix_weight = float(MIX_HIGH_WEIGHT)
+
+    high_cdf_left = _truncated_normal_cdf(
+        left_edges,
+        mean=float(MIX_HIGH_MEAN),
+        std=float(MIX_HIGH_STD),
+        lower=lower,
+        upper=upper,
+    )
+    high_cdf_right = _truncated_normal_cdf(
+        right_edges,
+        mean=float(MIX_HIGH_MEAN),
+        std=float(MIX_HIGH_STD),
+        lower=lower,
+        upper=upper,
+    )
+
+    low_cdf_left = _truncated_normal_cdf(
+        left_edges,
+        mean=float(MIX_LOW_MEAN),
+        std=float(MIX_LOW_STD),
+        lower=lower,
+        upper=upper,
+    )
+    low_cdf_right = _truncated_normal_cdf(
+        right_edges,
+        mean=float(MIX_LOW_MEAN),
+        std=float(MIX_LOW_STD),
+        lower=lower,
+        upper=upper,
+    )
+
+    high_mass = np.clip(high_cdf_right - high_cdf_left, 0.0, 1.0)
+    low_mass = np.clip(low_cdf_right - low_cdf_left, 0.0, 1.0)
+    pmf = mix_weight * high_mass + (1.0 - mix_weight) * low_mass
+    pmf /= pmf.sum()
+    return ratio_grid, pmf
 
 
 def _sample_mask_batch(
@@ -141,7 +217,7 @@ def run_experiment() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray
     print(
         f"Running mask diagnostic: device={DEVICE}, steps={NUM_STEPS}, "
         f"batch={BATCH_SIZE}, seq_len={SEQ_LEN}, workers={NUM_WORKERS}, "
-        f"schedule={SCHEDULE_KIND}"
+        f"mask_ratio_min={MIN_MASK_RATIO}"
     )
 
     if NUM_WORKERS <= 1:
@@ -222,6 +298,8 @@ def _plot_results(
     all_masks: Optional[List[np.ndarray]],
     per_sequence_ratios: np.ndarray,
     per_step_quantiles: np.ndarray,
+    configured_ratio_grid: np.ndarray,
+    configured_pmf: np.ndarray,
 ) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
@@ -233,6 +311,13 @@ def _plot_results(
     pmf /= pmf.sum()
     ratio_grid = np.arange(SEQ_LEN + 1, dtype=np.float64) / float(SEQ_LEN)
     axes[0].bar(ratio_grid, pmf, width=0.92 / float(SEQ_LEN), alpha=0.85, align="center")
+    axes[0].plot(
+        configured_ratio_grid,
+        configured_pmf,
+        color="crimson",
+        linewidth=1.8,
+        label="configured mixture (raw)",
+    )
     axes[0].axvline(MASK_PROB, linestyle="--", label="target p_global")
     axes[0].axvline(per_sequence_ratios.mean(), linestyle="-", label="empirical mean")
     axes[0].set_title("Per-sequence mask ratio distribution")
@@ -281,10 +366,14 @@ def _plot_results(
 
 def main() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
     all_masks, per_sequence_ratios, per_step_quantiles = run_experiment()
+    configured_ratio_grid, configured_pmf = _configured_schedule_pmf(SEQ_LEN)
+    configured_mean = float(np.sum(configured_ratio_grid * configured_pmf))
 
     print("\nDiagnostics")
     print(f"  samples: {per_sequence_ratios.size}")
+    print(f"  mask_ratio_min: {MIN_MASK_RATIO:.6f}")
     print(f"  target p_global: {MASK_PROB:.6f}")
+    print(f"  configured raw mean: {configured_mean:.6f}")
     print(f"  empirical mean:  {per_sequence_ratios.mean():.6f}")
     print(f"  empirical std:   {per_sequence_ratios.std():.6f}")
     print(
@@ -296,7 +385,13 @@ def main() -> Tuple[Optional[List[np.ndarray]], np.ndarray, np.ndarray]:
         np.save(RATIOS_PATH, per_sequence_ratios)
         print(f"Saved ratios to: {RATIOS_PATH}")
 
-    _plot_results(all_masks, per_sequence_ratios, per_step_quantiles)
+    _plot_results(
+        all_masks,
+        per_sequence_ratios,
+        per_step_quantiles,
+        configured_ratio_grid,
+        configured_pmf,
+    )
     return all_masks, per_sequence_ratios, per_step_quantiles
 
 
