@@ -51,6 +51,4 @@ srun python train.py \
   --results-dir audio_logs/AUDIO_NTP_Transformer_B_80e_bf16 \
   --model Transformer-B \
   --batch-size 128 \
-  --epochs 80 \
-  --lr-warmup-steps 300 \
-  --precision bf16-mixed 
+  --epochs 80 

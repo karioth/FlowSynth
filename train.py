@@ -159,8 +159,8 @@ if __name__ == "__main__":
     p.add_argument("--batch-mul", type=int, default=2)
     p.add_argument("--mask-prob", type=float, default=0.7)
 
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
     p.add_argument("--global-seed", type=int, default=0)
     p.add_argument(
