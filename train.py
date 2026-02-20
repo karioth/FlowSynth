@@ -9,26 +9,12 @@ from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
 
 from src.lightning import LitModule, EMAWeightAveraging
-from src.data_utils.datamodule import CachedAudioDataModule
-
-
-def _parse_manifest_paths(values: list[str] | None) -> list[str]:
-    if not values:
-        raise ValueError("No manifest paths provided")
-    manifest_paths = []
-    for value in values:
-        if value is None:
-            continue
-        for item in value.split(","):
-            item = item.strip()
-            if item:
-                manifest_paths.append(item)
-    if not manifest_paths:
-        raise ValueError("No manifest paths provided")
-    for path in manifest_paths:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Missing manifest: {path}")
-    return manifest_paths
+from src.data_utils.datamodule import CachedAudioDataModule, parse_manifest_paths
+from src.data_utils.datamodule_consolidated import (
+    ConsolidatedAudioDataModule,
+    ConsolidatedCacheWarmupCallback,
+    parse_consolidated_paths,
+)
 
 
 def main(args):
@@ -37,9 +23,6 @@ def main(args):
 
     seed_everything(args.global_seed, workers=True)
 
-    manifest_paths = _parse_manifest_paths(args.manifest_paths)
-    data_root = args.data_root
-
     silence_path = args.silence_latent_path
     if not os.path.isabs(silence_path):
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -47,15 +30,34 @@ def main(args):
     if not os.path.exists(silence_path):
         raise FileNotFoundError(f"Missing silence latent: {silence_path}")
 
-    dm = CachedAudioDataModule(
-        manifest_paths=manifest_paths,
-        data_root=data_root,
-        silence_latent_path=silence_path,
-        batch_size=args.batch_size,
-        target_seq_len=args.seq_len,
-        max_t5_tokens=args.prompt_seq_len - 1,
-        num_workers=args.num_workers,
-    )
+    if args.data_mode == "manifest":
+        manifest_paths = parse_manifest_paths(
+            args.manifest_paths,
+            required=True,
+        )
+        dm = CachedAudioDataModule(
+            manifest_paths=manifest_paths,
+            data_root=args.data_root,
+            silence_latent_path=silence_path,
+            batch_size=args.batch_size,
+            target_seq_len=args.seq_len,
+            max_t5_tokens=args.prompt_seq_len - 1,
+            num_workers=args.num_workers,
+        )
+    elif args.data_mode == "consolidated":
+        consolidated_paths = parse_consolidated_paths(args.data_root)
+        dm = ConsolidatedAudioDataModule(
+            consolidated_paths=consolidated_paths,
+            silence_latent_path=silence_path,
+            batch_size=args.batch_size,
+            target_seq_len=args.seq_len,
+            max_t5_tokens=args.prompt_seq_len - 1,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            mmap=True,
+        )
+    else:
+        raise ValueError(f"Unsupported data mode: {args.data_mode}")
 
     lit = LitModule(
         model_name=args.model,
@@ -87,6 +89,10 @@ def main(args):
 
     ema_cb = EMAWeightAveraging()
     pbar = TQDMProgressBar(refresh_rate=args.log_every)
+    callbacks = [ckpt_cb, ema_cb, pbar]
+
+    if args.data_mode == "consolidated":
+        callbacks.append(ConsolidatedCacheWarmupCallback())
 
     trainer = L.Trainer(
         default_root_dir=args.results_dir,
@@ -99,7 +105,7 @@ def main(args):
         accumulate_grad_batches=args.gradient_accumulation_steps,
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
-        callbacks=[ckpt_cb, ema_cb, pbar],
+        callbacks=callbacks,
         log_every_n_steps=args.log_every,
     )
 
@@ -109,16 +115,26 @@ def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument(
+        "--data-mode",
+        type=str,
+        default="consolidated",
+        choices=["manifest", "consolidated"],
+        help="Dataset mode: manifest-based per-file loading or consolidated cache loading.",
+    )
+    p.add_argument(
         "--manifest-paths",
         action="append",
-        default=["/share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl"],
-        help="JSONL manifest paths (repeatable or comma-separated)",
+        default=None,
+        help="JSONL manifest paths (repeatable or comma-separated). Used when --data-mode manifest.",
     )
     p.add_argument(
         "--data-root",
         type=str,
         default="/share/users/student/f/friverossego/datasets",
-        help="Base directory for relative manifest entries",
+        help=(
+            "Manifest mode: base directory for relative manifest entries. "
+            "Consolidated mode: recursively searched for 'consolidated_latents_bf16.pt'."
+        ),
     )
     p.add_argument(
         "--silence-latent-path",
@@ -147,7 +163,12 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
     p.add_argument("--global-seed", type=int, default=0)
-    p.add_argument("--num-workers", type=int, default=12)
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=3,
+        help="DataLoader workers (recommend 2-4 when using --data-mode consolidated, 10-12 on manifest).",
+    )
 
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--ckpt-every", type=int, default=10000)

@@ -9,6 +9,32 @@ from torch.utils.data import Dataset
 from torchdata.stateful_dataloader import StatefulDataLoader as DataLoader
 
 
+def parse_manifest_paths(values: list[str] | None, *, required: bool = True) -> list[str]:
+    if not values:
+        if required:
+            raise ValueError("No manifest paths provided")
+        return []
+
+    manifest_paths: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        for item in value.split(","):
+            path_str = item.strip()
+            if not path_str:
+                continue
+            path_obj = Path(path_str).expanduser().resolve()
+            if not path_obj.exists():
+                raise FileNotFoundError(f"Missing manifest path: {path_obj}")
+            if not path_obj.is_file():
+                raise ValueError(f"Manifest path must be a file: {path_obj}")
+            manifest_paths.append(path_obj.as_posix())
+
+    if required and not manifest_paths:
+        raise ValueError("No manifest paths provided")
+    return manifest_paths
+
+
 class MultiSourceAudioDataset(Dataset):
     """
     Loads merged audio latents + text embeddings from JSONL manifests.
@@ -196,19 +222,8 @@ class CachedAudioDataModule(L.LightningDataModule):
             in_order=False, ## we need this beacuse some latents are very big, and take longer to load. So the gpu starves waiting for those batches.
         )
 
-
-def _parse_manifest_paths(value: str) -> list[str]:
-    if value is None:
-        return []
-    cleaned = value.strip()
-    if cleaned == "" or cleaned.lower() in {"none", "null"}:
-        return []
-    return [item.strip() for item in cleaned.split(",") if item.strip()]
-
-
 def _run_smoke_tests(args: argparse.Namespace) -> None:
-    manifest_paths = _parse_manifest_paths(args.manifest_paths)
-    assert manifest_paths, "No manifest paths provided"
+    manifest_paths = parse_manifest_paths([args.manifest_paths], required=True)
 
     dataset = MultiSourceAudioDataset(
         manifest_paths=manifest_paths,
