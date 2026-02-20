@@ -522,9 +522,9 @@ def MaskedAR_B(**kwargs) -> MaskedARTransformer:
         depth=24,
         hidden_size=768,
         num_heads=12,
-        diffusion_depth=6,
-        intermediate_size=3072,
-        diffusion_intermediate_size=3072,
+        diffusion_depth=4,
+        intermediate_size=2048,
+        #diffusion_intermediate_size=3072,
         **kwargs,
     )
 

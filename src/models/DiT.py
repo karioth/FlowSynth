@@ -250,11 +250,15 @@ def DiT_Medium(**kwargs) -> DiT:
 def DiT_Base(**kwargs) -> DiT:
     return DiT(depth=12, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)
 
+def DiT_B(**kwargs) -> DiT:
+    return DiT(depth=24, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)
+
 DiT_models = {
     "DiT-XL": DiT_XL,
     "DiT-Large": DiT_Large,
     "DiT-Medium": DiT_Medium,
     "DiT-Base": DiT_Base,
+    "DiT-B": DiT_B,
 }
 
 

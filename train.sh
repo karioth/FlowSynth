@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -p gpu
 #SBATCH --nodes=1                           # e.g. 1 for l40s and H100, 2 for A100 
-#SBATCH --gpus-per-node=H100.80gb:1         # e.g. H100.80gb:8, A100:4 or L40S:4
-#SBATCH --ntasks-per-node=1                 # set = GPUs per node
+#SBATCH --gpus-per-node=H100.80gb:2         # e.g. H100.80gb:8, A100:4 or L40S:4
+#SBATCH --ntasks-per-node=2                 # set = GPUs per node
 #SBATCH --cpus-per-task=14                   # 14 CPUs per GPU (because 1 task == 1 GPU)
 #SBATCH --mem=200G
 #SBATCH --time=48:00:00
@@ -83,10 +83,9 @@ srun python train.py \
   --manifest-paths "$MANIFEST_PATHS" \
   --data-root "$DATA_ROOT" \
   --silence-latent-path "$SILENCE_LATENT_PATH" \
-  --results-dir audio_logs/Transformer_B_40e \
+  --results-dir audio_logs/AUDIO_NTP_Transformer_B_80e \
   --model Transformer-B \
   --batch-size 128 \
-  --epochs 40 \
+  --epochs 80 \
   --lr-warmup-steps 300 \
-  --precision bf16-mixed \
-  --gradient-accumulation-steps 2 
+  --precision bf16-mixed 

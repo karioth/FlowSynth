@@ -288,11 +288,15 @@ def AR_DiT_Medium(**kwargs) -> AR_DiT:
 def AR_DiT_Base(**kwargs) -> AR_DiT:
     return AR_DiT(depth=12, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)
 
+def AR_DiT_B(**kwargs) -> AR_DiT:
+    return AR_DiT(depth=24, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)
+
 AR_DiT_models = {
     "AR-DiT-XL": AR_DiT_XL,
     "AR-DiT-Large": AR_DiT_Large,
     "AR-DiT-Medium": AR_DiT_Medium,
     "AR-DiT-Base": AR_DiT_Base,
+    "AR-DiT-B": AR_DiT_B
 }
 
 
