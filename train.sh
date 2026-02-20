@@ -3,10 +3,10 @@
 #SBATCH --nodes=1                           # e.g. 1 for l40s and H100, 2 for A100 
 #SBATCH --gpus-per-node=H100.80gb:2         # e.g. H100.80gb:8, A100:4 or L40S:4
 #SBATCH --ntasks-per-node=2                 # set = GPUs per node
-#SBATCH --cpus-per-task=14                   # 14 CPUs per GPU (because 1 task == 1 GPU)
+#SBATCH --cpus-per-task=8                   # 8 CPUs per GPU (because 1 task == 1 GPU)
 #SBATCH --mem=350G
 #SBATCH --time=48:00:00
-#SBATCH --job-name=Audio_AR
+#SBATCH --job-name=Audio_NTP
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
 

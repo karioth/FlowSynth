@@ -177,7 +177,7 @@ if __name__ == "__main__":
 
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
-    p.add_argument("--lr-scheduler", type=str, default="cosine")
+    p.add_argument("--lr-scheduler", type=str, default="constant_with_warmup")
     p.add_argument("--lr-warmup-steps", type=int, default=1000)
 
     p.add_argument(
