@@ -48,7 +48,7 @@ srun python train.py \
   --devices "$TASKS_PER_NODE" \
   --data-root "$DATA_ROOT" \
   --silence-latent-path "$SILENCE_LATENT_PATH" \
-  --results-dir audio_logs/AUDIO_NTP_Transformer_B_80e_bf16 \
-  --model Transformer-B \
+  --results-dir audio_logs/AUDIO_NTP_MaskedAR_B_80e_bf16 \
+  --model MaskedAR-B \
   --batch-size 128 \
   --epochs 80 
