@@ -65,6 +65,9 @@ python train.py \
 ```
 
 ### 3) Sample
+Run from the repo root (`EqSynth/`).
+
+Single-process:
 ```bash
 python sample.py \
   --checkpoint logs/run_01/checkpoints/last.ckpt \
@@ -72,9 +75,57 @@ python sample.py \
   --clap-model laion/larger_clap_music \
   --cfg-scale 4.0 \
   --num-inference-steps 250 \
+  --batch-size 8 \
   --output-dir audio_samples
 ```
-You can also pass `--text`, `--text-file`, or `--embedding` to control prompts.
+Multi-GPU with torchrun (rank-sharded prompts, no duplicated work):
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 sample.py \
+  --checkpoint logs/run_01/checkpoints/last.ckpt \
+  --prompt-json /path/to/filename_to_caption_mapping.json \
+  --cfg-scale 3.0 \
+  --batch-size 8 \
+  --output-dir samples_audio/run_name
+```
+
+Prompt sources are mutually exclusive (use exactly one):
+- `--text`
+- `--text-file`
+- `--embedding`
+- `--prompt-json`
+
+Output format:
+- `--prompt-json`: writes `.wav` files using JSON keys as filenames.
+- other modes: writes `.mp3` files with global-index filename prefix.
+
+Notes:
+- `--output-dir` is created automatically if it does not exist.
+- JSON mode expects a mapping: `output_filename.wav -> caption`.
+
+### 4) Evaluate
+`evaluate.py` is single-process/single-device only.
+
+```bash
+python evaluate.py \
+  --gen /path/to/generated_wavs \
+  --gt /path/to/ground_truth_wavs \
+  --sr 16000 \
+  --backbone cnn14
+```
+
+Optional smoke test:
+```bash
+python evaluate.py \
+  --gen /path/to/generated_wavs \
+  --gt /path/to/ground_truth_wavs \
+  --sr 16000 \
+  --backbone cnn14 \
+  --limit 100
+```
+
+Important:
+- `evaluate.py` compares by basename and requires overlapping `.wav` filenames between `--gen` and `--gt`.
+- For AudioCaps-style eval, use `--prompt-json` in sampling so generated names match GT names.
 
 ## Notes
 - The Lightning module is sequence-first; any reshaping happens in `src/data_utils`.
