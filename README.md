@@ -1,69 +1,132 @@
-# PyTorch implementation of LatentLM
+# EqSynth (PyTorch)
 
-Unofficial research codebase. No pretrained models are provided.
+Audio-only research codebase for modeling DACVAE latents as sequences (B, T, C).
 
-## Setup & Usage
+## Audio (DACVAE + CLAP/T5)
 
-This repo uses cached latents for training. The typical workflow is:
+Training expects JSONL manifests whose entries point to `.pt` files containing:
+- `posterior_params`: [2C, T] mean+logvar from DACVAE
+- `clap_embedding`: [D] CLAP pooled text embedding
+- `t5_last_hidden`: [L, D]
+- `t5_len`: int
+- `latent_length`: int (optional, kept for metadata)
 
-### 1) Cache latents
+### 1) Preprocess audio + captions
+Default run (WavCaps + AudioCaps, writes merged manifest):
 ```bash
-python cache_image_latents.py \
-  --vae pretrained_models/kl16.ckpt \
-  --data_dir /path/to/imagenet/train \
-  --batch_size 256 \
-  --num_workers 6
+python preprocess.py \
+  --data-root /path/to/datasets \
+  --wavcaps-json-root /path/to/jsons \
+  --wavcaps-audio-root /path/to/audio \
+  --device cpu --processes 8 --threads-per-process 4
 ```
-By default this writes to `<data_dir>_cached`. Use `--cached_path` to override.
 
-### 2) Train (Lightning, cached latents only)
+WavCaps only:
+```bash
+python preprocess.py \
+  --dataset wavcaps \
+  --data-root /path/to/datasets \
+  --wavcaps-json-root /path/to/jsons \
+  --wavcaps-audio-root /path/to/audio \
+  --device cpu --processes 8 --threads-per-process 4
+```
+
+AudioCaps only:
+```bash
+python preprocess.py \
+  --dataset audiocaps \
+  --data-root /path/to/datasets \
+  --device cuda --processes 4
+```
+
+Merged manifest only:
+```bash
+python preprocess.py \
+  --merge-manifests \
+  --data-root /path/to/datasets \
+  --output /path/to/datasets/audio_manifest_train.jsonl
+```
+
+Latents are written under `latents/<md5[:2]>/<key>.pt` for each subset/split.
+
+### 2) Train
 ```bash
 python train.py \
-  --data-path /path/to/imagenet/train_cached \
-  --results-dir logs/lightning_transformer_medium_40e \
-  --model Transformer-Medium \
-  --input-size 16 \
-  --latent-size 16 \
-  --prediction-type flow \
-  --batch-size 128 \
-  --epochs 40 \
+  --manifest-paths /path/to/datasets/audio_manifest_train.jsonl \
+  --data-root /path/to/datasets \
+  --results-dir logs/run_01 \
+  --model MaskedAR-L \
+  --seq-len 251 \
+  --latent-size 128 \
+  --batch-size 32 \
+  --epochs 1 \
   --lr 1e-4 \
-  --weight-decay 0.1 \
-  --lr-scheduler cosine \
-  --lr-warmup-steps 100 \
-  --batch-mul 2 \
   --precision bf16-mixed
 ```
-For KL16 + 256px images, use `--input-size 16 --latent-size 16`.
 
 ### 3) Sample
+Run from the repo root (`EqSynth/`).
+
+Single-process:
 ```bash
 python sample.py \
-  --checkpoint logs/transformer_medium_40e/checkpoints/last.ckpt \
-  --vae pretrained_models/kl16.ckpt \
-  --image_size 256 \
-  --cfg-scale 3.0 \
-  --num_inference_steps 20 \
-  --output_dir visuals/visuals_transformer120k
+  --checkpoint logs/run_01/checkpoints/last.ckpt \
+  --dacvae-weights facebook/dacvae-watermarked \
+  --clap-model laion/larger_clap_music \
+  --cfg-scale 4.0 \
+  --num-inference-steps 250 \
+  --batch-size 8 \
+  --output-dir audio_samples
 ```
-Defaults to a fixed class list; use `--num_images` for random classes or `--class_labels 281,282,...` to specify classes.
+Multi-GPU with torchrun (rank-sharded prompts, no duplicated work):
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 sample.py \
+  --checkpoint logs/run_01/checkpoints/last.ckpt \
+  --prompt-json /path/to/filename_to_caption_mapping.json \
+  --cfg-scale 3.0 \
+  --batch-size 8 \
+  --output-dir samples_audio/run_name
+```
+
+Prompt sources are mutually exclusive (use exactly one):
+- `--text`
+- `--text-file`
+- `--embedding`
+- `--prompt-json`
+
+Output format:
+- `--prompt-json`: writes `.wav` files using JSON keys as filenames.
+- other modes: writes `.mp3` files with global-index filename prefix.
+
+Notes:
+- `--output-dir` is created automatically if it does not exist.
+- JSON mode expects a mapping: `output_filename.wav -> caption`.
 
 ### 4) Evaluate
-FID/IS from generated images:
+`evaluate.py` is single-process/single-device only.
+
 ```bash
 python evaluate.py \
-  --images_path visuals \
-  --ref_stat_path /path/to/imagenet_256_val.npz \
-  --batch_size 64 \
-  --fid \
-  --is
+  --gen /path/to/generated_wavs \
+  --gt /path/to/ground_truth_wavs \
+  --sr 16000 \
+  --backbone cnn14
 ```
-Optional torch_fidelity metrics against a reference dataset:
+
+Optional smoke test:
 ```bash
 python evaluate.py \
-  --images_path visuals \
-  --train_data_dir /path/to/imagenet/train \
-  --image_size 256 \
-  --batch_size 64 \
-  --fidelity
+  --gen /path/to/generated_wavs \
+  --gt /path/to/ground_truth_wavs \
+  --sr 16000 \
+  --backbone cnn14 \
+  --limit 100
 ```
+
+Important:
+- `evaluate.py` compares by basename and requires overlapping `.wav` filenames between `--gen` and `--gt`.
+- For AudioCaps-style eval, use `--prompt-json` in sampling so generated names match GT names.
+
+## Notes
+- The Lightning module is sequence-first; any reshaping happens in `src/data_utils`.
+- Output latents are `(B, T, C)`; DACVAE decoding expects `(B, C, T)`.

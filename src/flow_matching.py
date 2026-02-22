@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -186,14 +187,14 @@ class FlowMatchingBase(nn.Module):
 
 
 class FlowMatchingSchedulerDiT(FlowMatchingBase):
-    def get_losses(self, model, x0_seq, labels) -> torch.Tensor:
+    def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
         bsz = x0_seq.shape[0]
         noise = torch.randn_like(x0_seq)
         timesteps = self.sample_timesteps(bsz, device=x0_seq.device, dtype=x0_seq.dtype)
 
         x_noisy = self.add_noise(x0_seq, noise, timesteps)
         velocity = self.get_velocity(x0_seq, noise, timesteps)
-        model_output = model(x_noisy, timesteps, labels=labels)
+        model_output = model(x_noisy, timesteps, prompt=prompt)
         return F.mse_loss(model_output.float(), velocity.float())
 
 
@@ -202,7 +203,7 @@ class FlowMatchingSchedulerTransformer(FlowMatchingBase):
         super().__init__(*args, **kwargs)
         self.batch_mul = batch_mul
 
-    def get_losses(self, model, x0_seq, labels) -> torch.Tensor:
+    def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
         bsz, seq_len, latent_size = x0_seq.shape
         noise = torch.randn(
             (bsz * self.batch_mul * seq_len, latent_size),
@@ -228,7 +229,7 @@ class FlowMatchingSchedulerTransformer(FlowMatchingBase):
             x_noisy,
             timesteps,
             x_start=x0_seq,
-            labels=labels,
+            prompt=prompt,
             batch_mul=self.batch_mul,
         )
         return F.mse_loss(model_output.float(), velocity.float())
@@ -325,7 +326,7 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
         
         return u
 
-    def get_losses(self, model, x0_seq, labels) -> torch.Tensor:
+    def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
         bsz, seq_len = x0_seq.shape[:2]
         noise = torch.randn_like(x0_seq)
         t_vec = self.sample_monotone_anchor_times(
@@ -334,7 +335,7 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
 
         x_noisy = self.add_noise(x0_seq, noise, t_vec)
         velocity = self.get_velocity(x0_seq, noise, t_vec)
-        model_output = model(x_noisy, t_vec, labels=labels)
+        model_output = model(x_noisy, t_vec, prompt=prompt)
         return F.mse_loss(model_output.float(), velocity.float())
 
     def set_timesteps(
@@ -488,3 +489,214 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
             sample[:, valid_s:valid_e, ...] = x_slice
 
         return sample
+
+
+class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
+    """
+    Scheduler for MaskedARTransformer.
+
+    Samples per-sequence empirical mask probabilities from a bounded beta
+    prior parameterized by mean + concentration (kappa), then selects an
+    exact global-K mask with Gumbel-TopK.
+    Computes loss only at masked positions.
+    """
+
+    def __init__(
+        self,
+        *args,
+        mask_prob: float = 0.7,
+        min: float = 0.30,
+        max: float = 0.90,
+        kappa: float = 4.0,
+        batch_mul: int = 1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.mask_prob = mask_prob
+        self.batch_mul = batch_mul
+
+        self.min = float(min)
+        self.max = float(max)
+        self.kappa = float(kappa)
+        self._beta_shape_cache_key: Optional[tuple[float, float, float, float]] = None
+        self._beta_shape_cache_value: Optional[tuple[float, float]] = None
+
+    @property
+    def mode(self) -> float:
+        min_ratio = float(self.min)
+        max_ratio = float(self.max)
+        alpha, beta = self._get_beta_shape()
+        mode_01 = (alpha - 1.0) / (alpha + beta - 2.0)
+        return min_ratio + (max_ratio - min_ratio) * mode_01
+
+    @mode.setter
+    def mode(self, _: float) -> None:
+        raise AttributeError(
+            "mode is derived from mask_prob, min, max, and kappa."
+        )
+
+    @staticmethod
+    def _solve_beta_shape_from_mean_and_kappa(
+        mean_01: float,
+        kappa: float,
+    ) -> tuple[float, float]:
+        if not (0.0 < mean_01 < 1.0):
+            raise ValueError(f"mean_01 must be in (0, 1), got {mean_01}.")
+
+        if (not math.isfinite(kappa)) or kappa <= 0.0:
+            raise ValueError(f"kappa must be finite and > 0, got {kappa}.")
+
+        alpha = mean_01 * kappa
+        beta = (1.0 - mean_01) * kappa
+        if alpha <= 1.0 or beta <= 1.0:
+            min_kappa = max(1.0 / mean_01, 1.0 / (1.0 - mean_01))
+            raise ValueError(
+                "Chosen empirical bounds/mask_prob/kappa produce non-unimodal "
+                "boundary-heavy beta. Need alpha>1 and beta>1. "
+                f"Got alpha={alpha}, beta={beta}. Increase kappa above {min_kappa:.6f} "
+                "or move mask_prob away from bounds."
+            )
+
+        return float(alpha), float(beta)
+
+    def _get_beta_shape(self) -> tuple[float, float]:
+        min_ratio = float(self.min)
+        max_ratio = float(self.max)
+        p = float(self.mask_prob)
+        kappa = float(self.kappa)
+
+        if not (0.0 < min_ratio < max_ratio < 1.0):
+            raise ValueError(
+                "bounds must satisfy 0 < min < max < 1, "
+                f"got min={min_ratio}, max={max_ratio}."
+            )
+        if not (min_ratio < p < max_ratio):
+            raise ValueError(
+                "mask_prob must lie strictly between empirical bounds. "
+                f"Got mask_prob={p}, min={min_ratio}, max={max_ratio}."
+            )
+
+        cache_key = (min_ratio, max_ratio, p, kappa)
+        if cache_key != self._beta_shape_cache_key:
+            mean_01 = (p - min_ratio) / (max_ratio - min_ratio)
+            self._beta_shape_cache_value = self._solve_beta_shape_from_mean_and_kappa(
+                mean_01,
+                kappa,
+            )
+            self._beta_shape_cache_key = cache_key
+
+        if self._beta_shape_cache_value is None:
+            raise RuntimeError("Internal beta-shape cache was not initialized.")
+        return self._beta_shape_cache_value
+
+    def _sample_sequence_probabilities(
+        self,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}.")
+
+        min_ratio = float(self.min)
+        max_ratio = float(self.max)
+        alpha, beta = self._get_beta_shape()
+
+        base = torch.distributions.Beta(
+            concentration1=torch.tensor(alpha, device=device, dtype=torch.float32),
+            concentration0=torch.tensor(beta, device=device, dtype=torch.float32),
+        ).sample((batch_size,))
+
+        return min_ratio + (max_ratio - min_ratio) * base
+
+    def _sample_mask(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        total_tokens = batch_size * seq_len
+        p = float(self.mask_prob)
+        if not (0.5 <= p <= 1.0):
+            raise ValueError(f"mask_prob must be in [0.5, 1], got {p}.")
+
+        num_masked = round(p * total_tokens)
+        num_unmasked = total_tokens - num_masked
+
+        row_probs = self._sample_sequence_probabilities(batch_size=batch_size, device=device)
+        eps = torch.finfo(row_probs.dtype).eps
+        row_probs = row_probs.clamp(min=eps, max=1.0 - eps)
+        # If score = l + Gumbel(0,1), P(score > 0) = 1 - exp(-exp(l)).
+        # This chooses l so that (at zero threshold) the marginal is row_probs.
+        row_logits = torch.log(-torch.log1p(-row_probs))
+
+        uniform = torch.rand((batch_size, seq_len), device=device, dtype=row_logits.dtype)
+        uniform = uniform.clamp(min=eps, max=1.0 - eps)
+        gumbel = -torch.log(-torch.log(uniform))
+
+        scores = row_logits.unsqueeze(1) + gumbel
+        flat_scores = scores.reshape(-1)
+
+        # Equivalent to selecting top-k masked scores, but faster when unmasked
+        # tokens are the minority (e.g., mask_prob > 0.5).
+        flat_unmask_indices = torch.topk(
+            flat_scores,
+            k=num_unmasked,
+            largest=False,
+            sorted=False,
+        ).indices
+        mask_flat = torch.ones(total_tokens, dtype=torch.bool, device=device)
+        mask_flat[flat_unmask_indices] = False
+        flat_mask_indices = torch.nonzero(mask_flat, as_tuple=True)[0]
+
+        mask = mask_flat.view(batch_size, seq_len)
+
+        return mask, flat_mask_indices
+
+    def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
+        bsz, seq_len, latent_size = x0_seq.shape
+        total_tokens = bsz * seq_len
+
+        # 1. Sample per-sequence probabilities and select exact global-K tokens via Gumbel-TopK.
+        mask, flat_mask_indices = self._sample_mask(
+            batch_size=bsz,
+            seq_len=seq_len,
+            device=x0_seq.device,
+        )
+        num_masked = int(flat_mask_indices.numel())
+
+        # 4. Gather x0 at masked positions only
+        x0_flat = x0_seq.reshape(total_tokens, latent_size)  # (B*L, C)
+        x0_masked = x0_flat[flat_mask_indices]  # (num_masked, C)
+
+        # 5. Create noise and timesteps only for num_masked * batch_mul
+        noise = torch.randn(
+            num_masked * self.batch_mul,
+            latent_size,
+            device=x0_seq.device,
+            dtype=x0_seq.dtype,
+        )
+        timesteps = self.sample_timesteps(
+            num_masked * self.batch_mul,
+            device=x0_seq.device,
+            dtype=x0_seq.dtype,
+        )
+
+        # 6. Create noisy tokens and velocity targets
+        x0_rep = x0_masked.repeat_interleave(self.batch_mul, dim=0)  # (num_masked * batch_mul, C)
+        x_noisy = self.add_noise(x0_rep, noise, timesteps)
+        velocity = self.get_velocity(x0_rep, noise, timesteps)
+
+        # 7. Forward pass - model returns (num_masked * batch_mul, C)
+        model_output = model(
+            x_noisy,
+            timesteps,
+            x_start=x0_seq,
+            prompt=prompt,
+            mask=mask,
+            flat_mask_indices=flat_mask_indices,
+            batch_mul=self.batch_mul,
+        )
+
+        # 8. Loss on all outputs (all are masked positions)
+        return F.mse_loss(model_output.float(), velocity.float())

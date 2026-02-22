@@ -6,22 +6,22 @@ __pycache__/
 *.pt
 *.ckpt
 *.npz
-
+*.png
 # Logs
 *.out
 *.err
-*.sh
+
 lightning_logs/
 wandb/
-logs*/
+
 
 # Experiment outputs
 results*/
-samples*/
+*samples*/
 pretrained_models/
-visuals*/
 
+smoke*/
 # Docs
-*.md
-!README.md
 ardit_animation.py
+*logs*/
+*debug*/
