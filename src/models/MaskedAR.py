@@ -331,6 +331,18 @@ class MaskedARTransformer(nn.Module):
         hidden_states = self.final_layer(hidden_states, conditioning)
         return hidden_states
 
+    @staticmethod
+    def cfg_omega_at_token(token_idx: int, seq_len: int, cfg_scale: float) -> float:
+        """
+        Position-dependent paper CFG weight omega_i for token index i.
+
+        cfg_scale is interpreted as the initial omega_0.
+        """
+        if seq_len <= 1:
+            return float(cfg_scale)
+        pos = float(token_idx) / float(seq_len - 1)
+        return 1.0 + (float(cfg_scale) - 1.0) * (1.0 - pos)
+
     def sample_with_cfg(
         self,
         prompt: dict,
@@ -340,15 +352,12 @@ class MaskedARTransformer(nn.Module):
         """
         AR sampling with classifier-free guidance.
 
+        cfg_scale is interpreted as paper omega_0.
+
         For each position:
           1) Pass [MASK] through backbone to get conditioning.
           2) Denoise via diffusion head.
           3) Cache the predicted token for the next iteration.
-
-        TODO: Currently, code writes the mask into KV at `i+1` and overwrites it on the next step.
-        To avoid that extra cache write, add a only cache first token passed in
-        `Attention._update_kv_cache` (e.g., a `cache_write_len` or boolean mask) so only
-        the generated token updates KV while the MASK tokens are only used for queries.
         """
         # Build [cond, uncond] prompt batch for classifier-free guidance.
         clap = prompt["clap"]
@@ -411,13 +420,15 @@ class MaskedARTransformer(nn.Module):
                 prompt_drop_ids=prompt_drop_ids,
             )
             conditioning = conditioning[:, -1:]  # Mask position readout.
+            omega_i = self.cfg_omega_at_token(token_idx=i, seq_len=self.seq_len, cfg_scale=cfg_scale)
+            guidance_scale = omega_i + 1.0
 
             # Denoise
             prev_token = sample_func(
                 functools.partial(
                     self.forward_with_cfg,
                     conditioning=conditioning,
-                    cfg_scale=cfg_scale,
+                    guidance_scale=guidance_scale,
                 ),
                 noise,
             )
@@ -431,16 +442,18 @@ class MaskedARTransformer(nn.Module):
         hidden_states: torch.Tensor,
         timesteps: torch.Tensor,
         conditioning: torch.Tensor,
-        cfg_scale: float,
+        guidance_scale: float,
     ) -> torch.Tensor:
         """
         Forward pass with classifier-free guidance.
+        guidance_scale follows standard CFG form:
+            eps = eps_u + guidance_scale * (eps_c - eps_u).
         """
         half = hidden_states[: len(hidden_states) // 2]
         combined = torch.cat([half, half], dim=0)
         eps = self.forward_diffusion(combined, timesteps, conditioning)
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        guided_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        guided_eps = uncond_eps + guidance_scale * (cond_eps - uncond_eps)
         return torch.cat([guided_eps, guided_eps], dim=0)
 
 
@@ -588,6 +601,24 @@ if __name__ == "__main__":
     with autocast:
         conditioning = model.forward_backbone(hidden_states, prompt, mask)
     assert conditioning.shape == (batch_size, seq_len, hidden_size), f"Unexpected conditioning shape: {conditioning.shape}"
+
+    # Paper-style CFG schedule checks (cfg_scale interpreted as omega_0).
+    cfg_scale = 3.0
+    omega_first = model.cfg_omega_at_token(token_idx=0, seq_len=seq_len, cfg_scale=cfg_scale)
+    omega_last = model.cfg_omega_at_token(token_idx=seq_len - 1, seq_len=seq_len, cfg_scale=cfg_scale)
+    omega_single = model.cfg_omega_at_token(token_idx=0, seq_len=1, cfg_scale=cfg_scale)
+    assert omega_first == cfg_scale, f"Expected omega_first={cfg_scale}, got {omega_first}"
+    assert omega_last == 1.0, f"Expected omega_last=1.0, got {omega_last}"
+    assert omega_single == cfg_scale, f"Expected omega_single={cfg_scale}, got {omega_single}"
+
+    # Eq. (4) form and standard CFG form are equivalent when s = omega + 1.
+    cond_eps = torch.tensor([1.25], device=device, dtype=torch.float32)
+    uncond_eps = torch.tensor([-0.75], device=device, dtype=torch.float32)
+    omega = 2.5
+    s = omega + 1.0
+    guided_paper = cond_eps + omega * (cond_eps - uncond_eps)
+    guided_standard = uncond_eps + s * (cond_eps - uncond_eps)
+    assert torch.allclose(guided_paper, guided_standard), "CFG forms are not equivalent"
 
     start_positions = []
     original_forward_recurrent = model.forward_recurrent

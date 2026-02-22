@@ -46,7 +46,12 @@ def parse_args():
         choices=["bf16-mixed", "16-mixed", "32"],
         help="Autocast precision.",
     )
-    parser.add_argument("--cfg-scale", type=float, default=3.0)
+    parser.add_argument(
+        "--cfg-scale",
+        type=float,
+        default=3.0,
+        help="Initial paper CFG omega_0 (not a constant standard CFG scale).",
+    )
     parser.add_argument("--num-inference-steps", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
     prompt_source = parser.add_mutually_exclusive_group()
