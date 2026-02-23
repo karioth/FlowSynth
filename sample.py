@@ -436,7 +436,6 @@ def main():
     # Load DACVAE for decoding
     print("Loading DACVAE...")
     dacvae_model = load_dacvae(args.dacvae_weights, device)
-
     os.makedirs(args.output_dir, exist_ok=True)
     local_positions = list(range(len(global_indices)))
     num_batches = (len(local_positions) + args.batch_size - 1) // args.batch_size

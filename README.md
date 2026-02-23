@@ -116,11 +116,8 @@ python evaluate.py \
 Optional smoke test:
 ```bash
 python evaluate.py \
-  --gen /path/to/generated_wavs \
-  --gt /path/to/ground_truth_wavs \
-  --sr 16000 \
-  --backbone cnn14 \
-  --limit 100
+  --gt samples_audio/audiocaps_test_gt \
+  --gen samples_audio/generated_wavs 
 ```
 
 Important:
