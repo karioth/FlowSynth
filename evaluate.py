@@ -12,284 +12,87 @@ This script is intentionally separate from kadtk's CLI pipeline:
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-import os
+import json
 from pathlib import Path
-from typing import Callable, Optional
 
-import numpy as np
 import torch
-import torchaudio
-from tqdm.auto import tqdm
-
-from kadtk.fad import calc_frechet_distance
-from kadtk.kad import calc_kernel_audio_distance
-from kadtk.model_loader import (
-    CLAPLaionModel,
-    CLAPModel,
-    CdpamModel,
-    DACModel,
-    EncodecEmbModel,
-    HuBERTModel,
-    MERTModel,
-    ModelLoader,
-    PANNsModel,
-    PaSSTModel,
-    VGGishModel,
-    W2V2Model,
-    WavLMModel,
-    WhisperModel,
+from src.data_utils.evaluation_utils import (
+    build_model_registry,
+    collect_wavs,
+    compute_embeddings,
+    compute_scores,
+    configure_numba_cache_dir,
+    prepare_model_for_inference,
+    resolve_device,
+)
+from src.data_utils.stable_metrics_utils import (
+    CLAP_SCORE_REGISTRY_MODELS,
+    DEFAULT_CLAP_SCORE_MODEL,
+    DEFAULT_KLD_MODEL,
+    KLD_REGISTRY_MODELS,
+    compute_clap_score,
+    compute_passt_kld,
+    resolve_audiocaps_pairs,
 )
 
 
-def configure_numba_cache_dir() -> str:
-    """
-    Route numba cache to a user-writable location.
-    This avoids laion_clap defaulting NUMBA cache to /tmp (can be quota-limited).
-    """
-    cache_dir = os.environ.get("NUMBA_CACHE_DIR")
-    if not cache_dir:
-        xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
-        if xdg_cache_home:
-            cache_dir = os.path.join(xdg_cache_home, "numba")
-        else:
-            cache_dir = os.path.join(str(Path.home()), ".cache", "numba")
-
-    os.makedirs(cache_dir, exist_ok=True)
-    os.environ["NUMBA_CACHE_DIR"] = cache_dir
-    try:
-        import numba  # pylint: disable=import-outside-toplevel
-
-        numba.config.CACHE_DIR = cache_dir
-    except Exception:
-        # numba may not be imported yet in this process.
-        pass
-    return cache_dir
-
-
-def build_model_registry() -> dict[str, Callable[[Optional[float]], ModelLoader]]:
-    registry: dict[str, Callable[[Optional[float]], ModelLoader]] = {
-        "clap-2023": lambda audio_len: CLAPModel("2023", audio_len=audio_len),
-        "clap-laion-audio": lambda audio_len: CLAPLaionModel("audio", audio_len=audio_len),
-        "clap-laion-music": lambda audio_len: CLAPLaionModel("music", audio_len=audio_len),
-        "vggish": lambda audio_len: VGGishModel(audio_len=audio_len),
-        "panns-cnn14-32k": lambda audio_len: PANNsModel("cnn14-32k", audio_len=audio_len),
-        "panns-cnn14-16k": lambda audio_len: PANNsModel("cnn14-16k", audio_len=audio_len),
-        "panns-wavegram-logmel": lambda audio_len: PANNsModel("wavegram-logmel", audio_len=audio_len),
-        "encodec-emb": lambda audio_len: EncodecEmbModel("24k", audio_len=audio_len),
-        "encodec-emb-48k": lambda audio_len: EncodecEmbModel("48k", audio_len=audio_len),
-        "dac-44kHz": lambda audio_len: DACModel(audio_len=audio_len),
-        "cdpam-acoustic": lambda audio_len: CdpamModel("acoustic", audio_len=audio_len),
-        "cdpam-content": lambda audio_len: CdpamModel("content", audio_len=audio_len),
-        "whisper-tiny": lambda audio_len: WhisperModel("tiny", audio_len=audio_len),
-        "whisper-small": lambda audio_len: WhisperModel("small", audio_len=audio_len),
-        "whisper-base": lambda audio_len: WhisperModel("base", audio_len=audio_len),
-        "whisper-medium": lambda audio_len: WhisperModel("medium", audio_len=audio_len),
-        "whisper-large": lambda audio_len: WhisperModel("large", audio_len=audio_len),
-        "passt-base-10s": lambda audio_len: PaSSTModel("base-10s", audio_len=audio_len),
-        "passt-base-20s": lambda audio_len: PaSSTModel("base-20s", audio_len=audio_len),
-        "passt-base-30s": lambda audio_len: PaSSTModel("base-30s", audio_len=audio_len),
-        "passt-openmic": lambda audio_len: PaSSTModel("openmic", audio_len=audio_len),
-        "passt-fsd50k": lambda audio_len: PaSSTModel("fsd50k", audio_len=audio_len),
-    }
-
-    for layer in range(1, 13):
-        model_name = f"MERT-v1-95M-{layer}" if layer != 12 else "MERT-v1-95M"
-        registry[model_name] = lambda audio_len, _layer=layer: MERTModel("v1-95M", layer=_layer, audio_len=audio_len)
-
-    for layer in range(1, 13):
-        model_name = f"w2v2-base-{layer}" if layer != 12 else "w2v2-base"
-        registry[model_name] = lambda audio_len, _layer=layer: W2V2Model("base", layer=_layer, audio_len=audio_len)
-
-    for layer in range(1, 25):
-        model_name = f"w2v2-large-{layer}" if layer != 24 else "w2v2-large"
-        registry[model_name] = lambda audio_len, _layer=layer: W2V2Model("large", layer=_layer, audio_len=audio_len)
-
-    for layer in range(1, 13):
-        model_name = f"hubert-base-{layer}" if layer != 12 else "hubert-base"
-        registry[model_name] = lambda audio_len, _layer=layer: HuBERTModel("base", layer=_layer, audio_len=audio_len)
-
-    for layer in range(1, 25):
-        model_name = f"hubert-large-{layer}" if layer != 24 else "hubert-large"
-        registry[model_name] = lambda audio_len, _layer=layer: HuBERTModel("large", layer=_layer, audio_len=audio_len)
-
-    for layer in range(1, 13):
-        model_name = f"wavlm-base-{layer}" if layer != 12 else "wavlm-base"
-        registry[model_name] = lambda audio_len, _layer=layer: WavLMModel("base", layer=_layer, audio_len=audio_len)
-
-    for layer in range(1, 13):
-        model_name = f"wavlm-base-plus-{layer}" if layer != 12 else "wavlm-base-plus"
-        registry[model_name] = lambda audio_len, _layer=layer: WavLMModel("base-plus", layer=_layer, audio_len=audio_len)
-
-    for layer in range(1, 25):
-        model_name = f"wavlm-large-{layer}" if layer != 24 else "wavlm-large"
-        registry[model_name] = lambda audio_len, _layer=layer: WavLMModel("large", layer=_layer, audio_len=audio_len)
-
-    return registry
-
-
-def resolve_device(device_arg: Optional[str]) -> torch.device:
-    if device_arg is None:
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    device = torch.device(device_arg)
-    if device.type == "cuda":
-        if not torch.cuda.is_available():
-            raise SystemExit(f"CUDA device requested ({device_arg}) but CUDA is not available.")
-        if device.index is not None and device.index >= torch.cuda.device_count():
-            raise SystemExit(
-                f"Invalid CUDA device index {device.index}; found {torch.cuda.device_count()} CUDA device(s)."
-            )
-    return device
-
-
-def collect_wavs(audio_dir: Path, limit: int) -> list[Path]:
-    if not audio_dir.is_dir():
-        raise SystemExit(f"Directory not found: {audio_dir}")
-    files = sorted(audio_dir.glob("*.wav"))
-    if len(files) == 0:
-        raise SystemExit(f"No .wav files found in: {audio_dir}")
-    if limit > 0:
-        files = files[:limit]
-    return files
-
-
-def load_audio_with_torchaudio(path: Path, target_sr: int, audio_len: Optional[float]) -> np.ndarray:
-    wav, sr = torchaudio.load(str(path))
-    if wav.ndim == 1:
-        wav = wav.unsqueeze(0)
-    wav = wav.mean(dim=0, keepdim=True)
-    if sr != target_sr:
-        wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
-    audio = wav.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
-
-    if audio_len is not None:
-        expected_len = int(audio_len * target_sr)
-        if audio.shape[0] != expected_len:
-            raise RuntimeError(
-                f"Audio length mismatch ({audio.shape[0] / target_sr:.2f} seconds != {audio_len} seconds).\n\t- {path}"
-            )
-    return audio
-
-
-def load_audio_for_model(path: Path, model: ModelLoader, use_custom_loader: bool) -> np.ndarray:
-    if use_custom_loader:
-        return model.load_wav(path)
-    return load_audio_with_torchaudio(path, target_sr=model.sr, audio_len=model.audio_len)
-
-
-def load_one_file(path: Path, model: ModelLoader, use_custom_loader: bool) -> tuple[Path, np.ndarray]:
-    audio = load_audio_for_model(path, model, use_custom_loader)
-    return path, audio
-
-
-def iter_loaded_audio(
-    files: list[Path],
-    model: ModelLoader,
-    workers: int,
-    use_custom_loader: bool,
-):
-    if workers <= 1:
-        for path in files:
-            yield load_one_file(path, model, use_custom_loader)
-        return
-
-    max_pending = max(1, workers * 2)
-    file_iter = iter(files)
-    pending: dict = {}
-
-    def submit(executor: ThreadPoolExecutor) -> bool:
-        try:
-            path = next(file_iter)
-        except StopIteration:
-            return False
-        future = executor.submit(load_one_file, path, model, use_custom_loader)
-        pending[future] = path
-        return True
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for _ in range(min(max_pending, len(files))):
-            submit(executor)
-
-        while pending:
-            done, _ = wait(tuple(pending.keys()), return_when=FIRST_COMPLETED)
-            for future in done:
-                pending.pop(future)
-                yield future.result()
-                submit(executor)
-
-
-def compute_embeddings(
-    files: list[Path],
-    model: ModelLoader,
-    workers: int,
-    label: str,
-) -> np.ndarray:
-    # Models overriding load_wav can keep their own shape-specific loading semantics.
-    use_custom_loader = model.__class__.load_wav is not ModelLoader.load_wav
-    embeddings: list[np.ndarray] = []
-
-    iterator = iter_loaded_audio(files, model=model, workers=workers, use_custom_loader=use_custom_loader)
-    with tqdm(total=len(files), desc=f"{label}", unit="file") as pbar:
-        for path, audio in iterator:
-            with torch.no_grad():
-                emb = model.get_embedding(audio)
-
-            if emb.ndim == 1:
-                emb = np.expand_dims(emb, axis=0)
-            elif emb.ndim != 2:
-                raise RuntimeError(
-                    f"Expected 1D/2D embedding from model '{model.name}' for '{path}', got shape {emb.shape}."
-                )
-
-            embeddings.append(emb)
-            pbar.update(1)
-
-    if len(embeddings) == 0:
-        raise RuntimeError(f"No embeddings produced for '{label}'.")
-    return np.concatenate(embeddings, axis=0)
-
-
-def compute_scores(gt_emb: np.ndarray, gen_emb: np.ndarray, device: torch.device) -> tuple[float, float]:
-    with torch.no_grad():
-        fad_score = calc_frechet_distance(
-            gt_emb,
-            gen_emb,
-            cache_dirs=(None, None),
-            device=device,
-        )
-        kad_score = calc_kernel_audio_distance(
-            torch.from_numpy(gt_emb),
-            torch.from_numpy(gen_emb),
-            cache_dirs=(None, None),
-            device=device,
-            bandwidth=None,
-        )
-
-    if isinstance(fad_score, torch.Tensor):
-        fad_score = float(fad_score.item())
-    else:
-        fad_score = float(fad_score)
-
-    if isinstance(kad_score, torch.Tensor):
-        kad_score = float(kad_score.item())
-    else:
-        kad_score = float(kad_score)
-
-    return fad_score, kad_score
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_PROMPTS_CSV = PROJECT_ROOT / "audiocaps-test.csv"
+DEFAULT_GT_DIR = PROJECT_ROOT / "audio_samples" / "audiocaps_test_gt"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate KAD/FAD with kadtk PyTorch models using a no-cache, single-process embedding pipeline."
+        description="Evaluate FAD/KAD/CLAP score/PaSST KLD for AudioCaps-style runs."
     )
-    parser.add_argument("--model", type=str, required=True, help="kadtk model name (PyTorch models only).")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="panns-wavegram-logmel",
+        help="kadtk model name (PyTorch models only).",
+    )
     parser.add_argument("--gen", type=Path, required=True, help="Directory with generated .wav files.")
-    parser.add_argument("--gt", type=Path, required=True, help="Directory with ground-truth .wav files.")
+    parser.add_argument(
+        "--gt",
+        type=Path,
+        default=DEFAULT_GT_DIR,
+        help=f"Directory with ground-truth .wav files (default: {DEFAULT_GT_DIR}).",
+    )
+    parser.add_argument(
+        "--prompts-csv",
+        type=Path,
+        default=DEFAULT_PROMPTS_CSV,
+        help=f"AudioCaps CSV with audiocap_id,youtube_id,caption (default: {DEFAULT_PROMPTS_CSV}).",
+    )
+    parser.add_argument(
+        "--clap-model",
+        type=str,
+        default=DEFAULT_CLAP_SCORE_MODEL,
+        choices=sorted(CLAP_SCORE_REGISTRY_MODELS),
+        help="Registry CLAP model used by CLAP score metric.",
+    )
+    parser.add_argument(
+        "--kld-model",
+        type=str,
+        default=DEFAULT_KLD_MODEL,
+        choices=sorted(KLD_REGISTRY_MODELS),
+        help="Registry PaSST classification model used by KLD metric.",
+    )
     parser.add_argument("--workers", type=int, default=4, help="CPU worker threads for decode/resample prefetch.")
     parser.add_argument("--device", type=str, default=None, help="Torch device (e.g., cuda, cuda:0, cpu).")
     parser.add_argument("--audio-len", type=float, default=None, help="Expected clip length in seconds.")
-    parser.add_argument("--limit", type=int, default=0, help="If >0, evaluate only first N sorted WAV files per folder.")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="If >0, limit FAD/KAD to first N sorted WAV files per folder and CLAP/KLD to first N matched CSV rows.",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Path to write metrics JSON (default: <parent of --gen>/<gen_dir_name>.json).",
+    )
     return parser.parse_args()
 
 
@@ -299,6 +102,9 @@ def main() -> None:
         raise SystemExit("--workers must be >= 1.")
     torch.set_grad_enabled(False)
 
+    prompts_csv = args.prompts_csv.resolve()
+    gen_dir = args.gen.resolve()
+    gt_dir = args.gt.resolve()
     registry = build_model_registry()
     available_models = sorted(registry.keys())
 
@@ -323,22 +129,11 @@ def main() -> None:
         configure_numba_cache_dir()
 
     # Keep explicit device control in this process (no model duplication across workers).
-    if device.type == "cuda":
-        if device.index is not None:
-            torch.cuda.set_device(device.index)
-        # CLAPModel's internal CUDA toggle checks equality against torch.device('cuda').
-        if isinstance(model, CLAPModel):
-            model.device = torch.device("cuda")
-        else:
-            model.device = device
-    else:
-        model.device = torch.device("cpu")
+    prepare_model_for_inference(model, device)
 
-    with torch.no_grad():
-        model.load_model()
-
-    gt_files = collect_wavs(args.gt.resolve(), args.limit)
-    gen_files = collect_wavs(args.gen.resolve(), args.limit)
+    # Keep FAD/KAD behavior folder-based (independent from CSV pairing).
+    gt_files = collect_wavs(gt_dir, args.limit)
+    gen_files = collect_wavs(gen_dir, args.limit)
 
     with torch.no_grad():
         gt_emb = compute_embeddings(
@@ -354,8 +149,60 @@ def main() -> None:
             label=f"Embedding GEN ({len(gen_files)} files)",
         )
         fad_score, kad_score = compute_scores(gt_emb=gt_emb, gen_emb=gen_emb, device=device)
+    
+    print(
+        f'"{model.name}" fad: {fad_score:.2f} kad: {kad_score:.2f} '
+    )
+    pairs, pairing_stats = resolve_audiocaps_pairs(
+        prompts_csv=prompts_csv,
+        gen_dir=gen_dir,
+        gt_dir=gt_dir,
+        limit=args.limit,
+    )
+    if pairing_stats.used_rows == 0:
+        raise SystemExit(
+            "No matched AudioCaps rows found for CLAP/KLD metric computation. "
+            f"CSV rows={pairing_stats.total_rows}, matched={pairing_stats.matched_rows}, "
+            f"missing_gen={pairing_stats.missing_gen}, missing_gt={pairing_stats.missing_gt}, "
+            f"missing_ids={pairing_stats.missing_ids}, missing_caption={pairing_stats.missing_caption}."
+        )
 
-    print(f'"{model.name}" fad: {fad_score:.2f} kad: {kad_score:.2f}')
+    clap_score = compute_clap_score(
+        pairs,
+        registry=registry,
+        model_name=args.clap_model,
+        device=device,
+    )
+    passt_kld = compute_passt_kld(
+        pairs,
+        registry=registry,
+        model_name=args.kld_model,
+        device=device,
+        collect="mean",
+    )
+
+    output_json_path = args.output_json.resolve() if args.output_json else gen_dir.parent / f"{gen_dir.name}.json"
+    output_json_path.parent.mkdir(parents=True, exist_ok=True)
+
+    results = {
+        "generated_path": str(gen_dir),
+        "fad_model": model.name,
+        "clap_model": args.clap_model,
+        "kld_model": args.kld_model,
+        "num_pairs": pairing_stats.used_rows,
+        "fad": float(fad_score),
+        "kad": float(kad_score),
+        "clap_score": float(clap_score),
+        "passt_kld": float(passt_kld),
+    }
+    with output_json_path.open("w", encoding="utf-8") as fp:
+        json.dump(results, fp, indent=2)
+
+    print(
+        f'"{model.name}" fad: {fad_score:.2f} kad: {kad_score:.2f} '
+        f'clap_score: {clap_score:.4f} passt_kld: {passt_kld:.4f}'
+    )
+    print(f"Saved metrics JSON: {output_json_path}")
 
 
 if __name__ == "__main__":
