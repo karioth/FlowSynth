@@ -1,8 +1,9 @@
 import argparse
+import csv
 import inspect
-import json
-import os
 import types
+import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -13,13 +14,16 @@ from tqdm import tqdm
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate audio with AudioLDM2 from a JSON filename->caption mapping."
+        description="Generate audio with AudioLDM2 from an AudioCaps CSV."
     )
     parser.add_argument(
-        "--prompt-json",
+        "--prompt-csv",
         type=str,
         required=True,
-        help="Path to JSON mapping: output_filename.wav -> caption.",
+        help=(
+            "Path to AudioCaps CSV with columns audiocap_id,youtube_id,caption. "
+            "Outputs are saved as {audiocap_id}.wav."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -74,30 +78,91 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of prompts to generate per forward pass.",
     )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="bf16-mixed",
+        choices=["bf16-mixed", "16-mixed", "32"],
+        help="Autocast precision.",
+    )
+    parser.add_argument("--local-rank", "--local_rank", type=int, default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
-def load_mapping(path: str) -> list[tuple[str, str]]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def load_audiocaps_csv(path: str) -> list[tuple[int, str]]:
+    required_columns = {"audiocap_id", "youtube_id", "caption"}
+    items: list[tuple[int, str]] = []
+    seen_ids: set[int] = set()
 
-    if not isinstance(data, dict):
-        raise ValueError("prompt JSON must be a dict of filename -> caption")
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"Prompt CSV has no header row: {path}")
+        missing_columns = required_columns.difference(reader.fieldnames)
+        if missing_columns:
+            missing = ", ".join(sorted(missing_columns))
+            raise ValueError(f"Prompt CSV missing required column(s): {missing}")
 
-    items: list[tuple[str, str]] = []
-    for filename, caption in data.items():
-        if not isinstance(filename, str):
-            raise ValueError(f"filename key must be str, got {type(filename).__name__}")
-        if not isinstance(caption, str):
-            raise ValueError(f"caption value for {filename!r} must be str")
-        items.append((filename, caption))
+        for row_number, row in enumerate(reader, start=2):
+            raw_id = (row.get("audiocap_id") or "").strip()
+            caption = (row.get("caption") or "").strip()
+            if not raw_id:
+                raise ValueError(f"Row {row_number}: audiocap_id is empty.")
+            if not caption:
+                raise ValueError(f"Row {row_number}: caption is empty.")
+
+            try:
+                audiocap_id = int(raw_id)
+            except ValueError as exc:
+                raise ValueError(f"Row {row_number}: invalid audiocap_id '{raw_id}'.") from exc
+
+            if audiocap_id in seen_ids:
+                raise ValueError(f"Row {row_number}: duplicate audiocap_id {audiocap_id}.")
+            seen_ids.add(audiocap_id)
+            items.append((audiocap_id, caption))
+
+    if not items:
+        raise ValueError("Prompt CSV is empty.")
     return items
 
 
-def choose_device() -> tuple[torch.device, torch.dtype]:
-    if torch.cuda.is_available():
-        return torch.device("cuda"), torch.float16
-    return torch.device("cpu"), torch.float32
+def _parse_env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer, got {value!r}") from exc
+
+
+def get_dist_context(local_rank_arg: int | None) -> tuple[int, int, int]:
+    rank = _parse_env_int("RANK", 0)
+    world_size = _parse_env_int("WORLD_SIZE", 1)
+    local_rank = local_rank_arg if local_rank_arg is not None else _parse_env_int("LOCAL_RANK", 0)
+
+    if world_size < 1:
+        raise ValueError(f"WORLD_SIZE must be >= 1, got {world_size}")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"RANK must be in [0, {world_size - 1}], got {rank}")
+    if local_rank < 0:
+        raise ValueError(f"LOCAL_RANK must be >= 0, got {local_rank}")
+
+    return rank, world_size, local_rank
+
+
+def shard_indices(total: int, rank: int, world_size: int) -> list[int]:
+    return list(range(rank, total, world_size))
+
+
+def get_autocast_dtype(precision: str, device: torch.device):
+    if device.type != "cuda":
+        return None
+    if precision == "bf16-mixed":
+        return torch.bfloat16
+    if precision == "16-mixed":
+        return torch.float16
+    return None
 
 
 def iter_chunks(items: list[tuple[int, Path, str]], chunk_size: int):
@@ -160,45 +225,70 @@ def patch_language_model_generation(pipe: AudioLDM2Pipeline) -> None:
 
 def main() -> None:
     args = parse_args()
+    rank, world_size, local_rank = get_dist_context(args.local_rank)
 
     if args.batch_size < 1:
         raise ValueError(f"--batch-size must be >= 1, got {args.batch_size}")
 
-    device, dtype = choose_device()
-    prompt_items = load_mapping(args.prompt_json)
+    if torch.cuda.is_available():
+        cuda_count = torch.cuda.device_count()
+        if local_rank >= cuda_count:
+            raise ValueError(
+                f"LOCAL_RANK {local_rank} is out of range for {cuda_count} visible CUDA device(s)."
+            )
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
+
+    amp_dtype = get_autocast_dtype(args.precision, device)
+    autocast = (
+        torch.autocast(device_type=device.type, dtype=amp_dtype)
+        if amp_dtype is not None
+        else nullcontext()
+    )
+
+    # Keep model weights in fp32; precision mode is controlled by autocast like EqSynth/sample.py.
+    dtype = torch.float32
+
+    prompt_items_all = load_audiocaps_csv(args.prompt_csv)
     if args.limit is not None:
-        prompt_items = prompt_items[: args.limit]
+        prompt_items_all = prompt_items_all[: args.limit]
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading {args.model_id} on {device} ({dtype}) ...")
+    print(f"Loading {args.model_id} on {device} (weights={dtype}, precision={args.precision}) ...")
     pipe = load_pipeline(args.model_id, dtype)
     pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
     patch_language_model_generation(pipe)
+
+    global_total = len(prompt_items_all)
+    global_indices = shard_indices(global_total, rank, world_size)
+    prompt_items = [prompt_items_all[idx] for idx in global_indices]
+    print(f"[rank {rank}/{world_size}] handling {len(prompt_items)} of {global_total} prompts")
 
     sample_rate = 16000
     generated = 0
     skipped = 0
 
     pending_items: list[tuple[int, Path, str]] = []
-    for idx, (filename, caption) in enumerate(prompt_items):
-        out_path = out_dir / os.path.basename(filename)
-        if out_path.suffix.lower() != ".wav":
-            out_path = out_path.with_suffix(".wav")
+    for global_idx, (audiocap_id, caption) in zip(global_indices, prompt_items):
+        out_path = out_dir / f"{audiocap_id}.wav"
 
         if args.resume and out_path.exists():
             skipped += 1
             continue
 
-        pending_items.append((idx, out_path, caption))
+        pending_items.append((global_idx, out_path, caption))
 
     num_batches = (len(pending_items) + args.batch_size - 1) // args.batch_size
     for chunk in tqdm(
         iter_chunks(pending_items, args.batch_size),
         total=num_batches,
         desc="Generating",
+        disable=rank != 0,
     ):
         prompts = [caption for _, _, caption in chunk]
         out_paths = [out_path for _, out_path, _ in chunk]
@@ -207,13 +297,14 @@ def main() -> None:
             for idx, _, _ in chunk
         ]
 
-        output = pipe(
-            prompts,
-            num_inference_steps=args.steps,
-            audio_length_in_s=args.audio_length,
-            guidance_scale=args.guidance_scale,
-            generator=generators,
-        )
+        with autocast:
+            output = pipe(
+                prompts,
+                num_inference_steps=args.steps,
+                audio_length_in_s=args.audio_length,
+                guidance_scale=args.guidance_scale,
+                generator=generators,
+            )
         audios = output.audios
         if len(audios) != len(out_paths):
             raise RuntimeError(f"Pipeline returned {len(audios)} audios for {len(out_paths)} prompts")
@@ -223,7 +314,7 @@ def main() -> None:
             wavfile.write(out_path, sample_rate, audio)
             generated += 1
 
-    print(f"Done. generated={generated} skipped={skipped} output_dir={out_dir}")
+    print(f"[rank {rank}/{world_size}] Done. generated={generated} skipped={skipped} output_dir={out_dir}")
 
 
 if __name__ == "__main__":

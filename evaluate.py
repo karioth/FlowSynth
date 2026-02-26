@@ -1,166 +1,361 @@
 #!/usr/bin/env python3
 """
-Run AudioLDM-style objective eval (audioldm_eval) on two folders of WAVs.
-Usage:
-  python evaluate.py --gen /path/to/gen_wavs --gt /path/to/gt_wavs
+GPU-optimized KAD/FAD evaluation with kadtk models, without embedding/stat caching.
+
+This script is intentionally separate from kadtk's CLI pipeline:
+- No embedding cache files.
+- No stats cache files.
+- Single model instance in one process for deterministic GPU use.
+- Optional CPU thread prefetch for decode/resample.
 """
 
+from __future__ import annotations
+
 import argparse
-from contextlib import contextmanager
-import json
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import os
 from pathlib import Path
-import urllib.request
+from typing import Callable, Optional
 
+import numpy as np
 import torch
-from audioldm_eval import EvaluationHelper
+import torchaudio
+from tqdm.auto import tqdm
+
+from kadtk.fad import calc_frechet_distance
+from kadtk.kad import calc_kernel_audio_distance
+from kadtk.model_loader import (
+    CLAPLaionModel,
+    CLAPModel,
+    CdpamModel,
+    DACModel,
+    EncodecEmbModel,
+    HuBERTModel,
+    MERTModel,
+    ModelLoader,
+    PANNsModel,
+    PaSSTModel,
+    VGGishModel,
+    W2V2Model,
+    WavLMModel,
+    WhisperModel,
+)
 
 
-def list_wavs(d: Path) -> set[str]:
-    return {p.name for p in d.glob("*.wav")}
+def configure_numba_cache_dir() -> str:
+    """
+    Route numba cache to a user-writable location.
+    This avoids laion_clap defaulting NUMBA cache to /tmp (can be quota-limited).
+    """
+    cache_dir = os.environ.get("NUMBA_CACHE_DIR")
+    if not cache_dir:
+        xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+        if xdg_cache_home:
+            cache_dir = os.path.join(xdg_cache_home, "numba")
+        else:
+            cache_dir = os.path.join(str(Path.home()), ".cache", "numba")
 
-
-CNN14_CKPT_URLS = {
-    "Cnn14_mAP=0.431.pth": "https://zenodo.org/record/3576403/files/Cnn14_mAP%3D0.431.pth",
-    "Cnn14_16k_mAP=0.438.pth": "https://zenodo.org/record/3987831/files/Cnn14_16k_mAP%3D0.438.pth",
-}
-
-MERT_MODEL_ID = "m-a-p/MERT-v1-95M"
-
-
-def torch_is_below_2_6() -> bool:
-    # Avoid extra dependencies for version parsing.
-    version = torch.__version__.split("+", 1)[0]
-    nums = []
-    for part in version.split("."):
-        digits = "".join(ch for ch in part if ch.isdigit())
-        if not digits:
-            break
-        nums.append(int(digits))
-    while len(nums) < 3:
-        nums.append(0)
-    return tuple(nums[:3]) < (2, 6, 0)
-
-
-def ensure_mert_safetensors_snapshot(model_id: str = MERT_MODEL_ID) -> Path:
-    from huggingface_hub import snapshot_download
-
-    snapshot_dir = Path(snapshot_download(repo_id=model_id))
-    safe_file = snapshot_dir / "model.safetensors"
-    if safe_file.exists():
-        return snapshot_dir
-
-    bin_file = snapshot_dir / "pytorch_model.bin"
-    if not bin_file.exists():
-        raise RuntimeError(f"Missing checkpoint file: {bin_file}")
-
-    from safetensors.torch import save_file
-
-    print(f"[info] converting {bin_file.name} -> {safe_file.name} (one-time setup)")
-    state_dict = torch.load(bin_file, map_location="cpu")
-    if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
-        state_dict = state_dict["state_dict"]
-    if not isinstance(state_dict, dict):
-        raise RuntimeError("Unexpected checkpoint format while converting MERT weights.")
-
-    tensor_state = {k: v.detach().cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
-    if not tensor_state:
-        raise RuntimeError("No tensors found in MERT checkpoint during conversion.")
-
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ["NUMBA_CACHE_DIR"] = cache_dir
     try:
-        save_file(tensor_state, str(safe_file))
-    except RuntimeError as exc:
-        # Some checkpoints have tied/shared storage; cloned tensors avoid save errors.
-        if "share" not in str(exc).lower():
-            raise
-        print("[info] retrying safetensors export with cloned tensors")
-        save_file({k: v.clone() for k, v in tensor_state.items()}, str(safe_file))
+        import numba  # pylint: disable=import-outside-toplevel
 
-    return snapshot_dir
+        numba.config.CACHE_DIR = cache_dir
+    except Exception:
+        # numba may not be imported yet in this process.
+        pass
+    return cache_dir
 
 
-@contextmanager
-def patch_mert_loader_for_safetensors(snapshot_dir: Path | None):
-    if snapshot_dir is None:
-        yield
+def build_model_registry() -> dict[str, Callable[[Optional[float]], ModelLoader]]:
+    registry: dict[str, Callable[[Optional[float]], ModelLoader]] = {
+        "clap-2023": lambda audio_len: CLAPModel("2023", audio_len=audio_len),
+        "clap-laion-audio": lambda audio_len: CLAPLaionModel("audio", audio_len=audio_len),
+        "clap-laion-music": lambda audio_len: CLAPLaionModel("music", audio_len=audio_len),
+        "vggish": lambda audio_len: VGGishModel(audio_len=audio_len),
+        "panns-cnn14-32k": lambda audio_len: PANNsModel("cnn14-32k", audio_len=audio_len),
+        "panns-cnn14-16k": lambda audio_len: PANNsModel("cnn14-16k", audio_len=audio_len),
+        "panns-wavegram-logmel": lambda audio_len: PANNsModel("wavegram-logmel", audio_len=audio_len),
+        "encodec-emb": lambda audio_len: EncodecEmbModel("24k", audio_len=audio_len),
+        "encodec-emb-48k": lambda audio_len: EncodecEmbModel("48k", audio_len=audio_len),
+        "dac-44kHz": lambda audio_len: DACModel(audio_len=audio_len),
+        "cdpam-acoustic": lambda audio_len: CdpamModel("acoustic", audio_len=audio_len),
+        "cdpam-content": lambda audio_len: CdpamModel("content", audio_len=audio_len),
+        "whisper-tiny": lambda audio_len: WhisperModel("tiny", audio_len=audio_len),
+        "whisper-small": lambda audio_len: WhisperModel("small", audio_len=audio_len),
+        "whisper-base": lambda audio_len: WhisperModel("base", audio_len=audio_len),
+        "whisper-medium": lambda audio_len: WhisperModel("medium", audio_len=audio_len),
+        "whisper-large": lambda audio_len: WhisperModel("large", audio_len=audio_len),
+        "passt-base-10s": lambda audio_len: PaSSTModel("base-10s", audio_len=audio_len),
+        "passt-base-20s": lambda audio_len: PaSSTModel("base-20s", audio_len=audio_len),
+        "passt-base-30s": lambda audio_len: PaSSTModel("base-30s", audio_len=audio_len),
+        "passt-openmic": lambda audio_len: PaSSTModel("openmic", audio_len=audio_len),
+        "passt-fsd50k": lambda audio_len: PaSSTModel("fsd50k", audio_len=audio_len),
+    }
+
+    for layer in range(1, 13):
+        model_name = f"MERT-v1-95M-{layer}" if layer != 12 else "MERT-v1-95M"
+        registry[model_name] = lambda audio_len, _layer=layer: MERTModel("v1-95M", layer=_layer, audio_len=audio_len)
+
+    for layer in range(1, 13):
+        model_name = f"w2v2-base-{layer}" if layer != 12 else "w2v2-base"
+        registry[model_name] = lambda audio_len, _layer=layer: W2V2Model("base", layer=_layer, audio_len=audio_len)
+
+    for layer in range(1, 25):
+        model_name = f"w2v2-large-{layer}" if layer != 24 else "w2v2-large"
+        registry[model_name] = lambda audio_len, _layer=layer: W2V2Model("large", layer=_layer, audio_len=audio_len)
+
+    for layer in range(1, 13):
+        model_name = f"hubert-base-{layer}" if layer != 12 else "hubert-base"
+        registry[model_name] = lambda audio_len, _layer=layer: HuBERTModel("base", layer=_layer, audio_len=audio_len)
+
+    for layer in range(1, 25):
+        model_name = f"hubert-large-{layer}" if layer != 24 else "hubert-large"
+        registry[model_name] = lambda audio_len, _layer=layer: HuBERTModel("large", layer=_layer, audio_len=audio_len)
+
+    for layer in range(1, 13):
+        model_name = f"wavlm-base-{layer}" if layer != 12 else "wavlm-base"
+        registry[model_name] = lambda audio_len, _layer=layer: WavLMModel("base", layer=_layer, audio_len=audio_len)
+
+    for layer in range(1, 13):
+        model_name = f"wavlm-base-plus-{layer}" if layer != 12 else "wavlm-base-plus"
+        registry[model_name] = lambda audio_len, _layer=layer: WavLMModel("base-plus", layer=_layer, audio_len=audio_len)
+
+    for layer in range(1, 25):
+        model_name = f"wavlm-large-{layer}" if layer != 24 else "wavlm-large"
+        registry[model_name] = lambda audio_len, _layer=layer: WavLMModel("large", layer=_layer, audio_len=audio_len)
+
+    return registry
+
+
+def resolve_device(device_arg: Optional[str]) -> torch.device:
+    if device_arg is None:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    device = torch.device(device_arg)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemExit(f"CUDA device requested ({device_arg}) but CUDA is not available.")
+        if device.index is not None and device.index >= torch.cuda.device_count():
+            raise SystemExit(
+                f"Invalid CUDA device index {device.index}; found {torch.cuda.device_count()} CUDA device(s)."
+            )
+    return device
+
+
+def collect_wavs(audio_dir: Path, limit: int) -> list[Path]:
+    if not audio_dir.is_dir():
+        raise SystemExit(f"Directory not found: {audio_dir}")
+    files = sorted(audio_dir.glob("*.wav"))
+    if len(files) == 0:
+        raise SystemExit(f"No .wav files found in: {audio_dir}")
+    if limit > 0:
+        files = files[:limit]
+    return files
+
+
+def load_audio_with_torchaudio(path: Path, target_sr: int, audio_len: Optional[float]) -> np.ndarray:
+    wav, sr = torchaudio.load(str(path))
+    if wav.ndim == 1:
+        wav = wav.unsqueeze(0)
+    wav = wav.mean(dim=0, keepdim=True)
+    if sr != target_sr:
+        wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
+    audio = wav.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
+
+    if audio_len is not None:
+        expected_len = int(audio_len * target_sr)
+        if audio.shape[0] != expected_len:
+            raise RuntimeError(
+                f"Audio length mismatch ({audio.shape[0] / target_sr:.2f} seconds != {audio_len} seconds).\n\t- {path}"
+            )
+    return audio
+
+
+def load_audio_for_model(path: Path, model: ModelLoader, use_custom_loader: bool) -> np.ndarray:
+    if use_custom_loader:
+        return model.load_wav(path)
+    return load_audio_with_torchaudio(path, target_sr=model.sr, audio_len=model.audio_len)
+
+
+def load_one_file(path: Path, model: ModelLoader, use_custom_loader: bool) -> tuple[Path, np.ndarray]:
+    audio = load_audio_for_model(path, model, use_custom_loader)
+    return path, audio
+
+
+def iter_loaded_audio(
+    files: list[Path],
+    model: ModelLoader,
+    workers: int,
+    use_custom_loader: bool,
+):
+    if workers <= 1:
+        for path in files:
+            yield load_one_file(path, model, use_custom_loader)
         return
 
-    import audioldm_eval.eval as eval_impl
+    max_pending = max(1, workers * 2)
+    file_iter = iter(files)
+    pending: dict = {}
 
-    original_auto_from_pretrained = eval_impl.AutoModel.from_pretrained
+    def submit(executor: ThreadPoolExecutor) -> bool:
+        try:
+            path = next(file_iter)
+        except StopIteration:
+            return False
+        future = executor.submit(load_one_file, path, model, use_custom_loader)
+        pending[future] = path
+        return True
 
-    def patched_auto_from_pretrained(pretrained_model_name_or_path, *args, **kwargs):
-        if str(pretrained_model_name_or_path).rstrip("/") == MERT_MODEL_ID:
-            kwargs = dict(kwargs)
-            kwargs["use_safetensors"] = True
-            return original_auto_from_pretrained(str(snapshot_dir), *args, **kwargs)
-        return original_auto_from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for _ in range(min(max_pending, len(files))):
+            submit(executor)
 
-    eval_impl.AutoModel.from_pretrained = patched_auto_from_pretrained
-    try:
-        yield
-    finally:
-        eval_impl.AutoModel.from_pretrained = original_auto_from_pretrained
-
-
-def ensure_cnn14_checkpoints() -> None:
-    ckpt_dir = Path.home() / ".cache" / "audioldm_eval" / "ckpt"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    for filename, url in CNN14_CKPT_URLS.items():
-        target = ckpt_dir / filename
-        if target.exists():
-            continue
-        tmp_target = target.with_suffix(target.suffix + ".tmp")
-        print(f"[info] downloading {filename} ...")
-        urllib.request.urlretrieve(url, tmp_target)
-        tmp_target.replace(target)
+        while pending:
+            done, _ = wait(tuple(pending.keys()), return_when=FIRST_COMPLETED)
+            for future in done:
+                pending.pop(future)
+                yield future.result()
+                submit(executor)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--gen", type=Path, required=True, help="Folder with generated .wav files")
-    ap.add_argument("--gt", type=Path, required=True, help="Folder with ground-truth .wav files")
-    ap.add_argument("--sr", type=int, default=16000, help="Eval sample rate (use 16000 for AudioCaps protocol)")
-    ap.add_argument("--backbone", type=str, default="cnn14", choices=["cnn14", "mert"])
-    ap.add_argument("--limit", type=int, default=0, help="If >0, evaluate only this many files (smoke test)")
-    args = ap.parse_args()
+def compute_embeddings(
+    files: list[Path],
+    model: ModelLoader,
+    workers: int,
+    label: str,
+) -> np.ndarray:
+    # Models overriding load_wav can keep their own shape-specific loading semantics.
+    use_custom_loader = model.__class__.load_wav is not ModelLoader.load_wav
+    embeddings: list[np.ndarray] = []
 
-    if args.backbone == "cnn14":
-        ensure_cnn14_checkpoints()
+    iterator = iter_loaded_audio(files, model=model, workers=workers, use_custom_loader=use_custom_loader)
+    with tqdm(total=len(files), desc=f"{label}", unit="file") as pbar:
+        for path, audio in iterator:
+            with torch.no_grad():
+                emb = model.get_embedding(audio)
 
-    gen_dir = args.gen.resolve()
-    gt_dir = args.gt.resolve()
-    if not gen_dir.is_dir() or not gt_dir.is_dir():
-        raise SystemExit(f"gen_dir or gt_dir does not exist: {gen_dir} {gt_dir}")
+            if emb.ndim == 1:
+                emb = np.expand_dims(emb, axis=0)
+            elif emb.ndim != 2:
+                raise RuntimeError(
+                    f"Expected 1D/2D embedding from model '{model.name}' for '{path}', got shape {emb.shape}."
+                )
 
-    gen_names = list_wavs(gen_dir)
-    gt_names = list_wavs(gt_dir)
-    inter = gen_names & gt_names
+            embeddings.append(emb)
+            pbar.update(1)
 
-    if len(inter) == 0:
-        raise SystemExit("No overlapping .wav basenames between --gen and --gt (paired mode requires matching names).")
+    if len(embeddings) == 0:
+        raise RuntimeError(f"No embeddings produced for '{label}'.")
+    return np.concatenate(embeddings, axis=0)
 
-    if gen_names != gt_names:
-        print(f"[warn] gen wavs: {len(gen_names)}, gt wavs: {len(gt_names)}, intersection: {len(inter)}")
-        missing_in_gen = sorted(gt_names - gen_names)[:10]
-        missing_in_gt = sorted(gen_names - gt_names)[:10]
-        if missing_in_gen:
-            print("[warn] examples missing in --gen:", missing_in_gen)
-        if missing_in_gt:
-            print("[warn] examples missing in --gt:", missing_in_gt)
 
-    limit_num = args.limit if args.limit > 0 else None
+def compute_scores(gt_emb: np.ndarray, gen_emb: np.ndarray, device: torch.device) -> tuple[float, float]:
+    with torch.no_grad():
+        fad_score = calc_frechet_distance(
+            gt_emb,
+            gen_emb,
+            cache_dirs=(None, None),
+            device=device,
+        )
+        kad_score = calc_kernel_audio_distance(
+            torch.from_numpy(gt_emb),
+            torch.from_numpy(gen_emb),
+            cache_dirs=(None, None),
+            device=device,
+            bandwidth=None,
+        )
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    mert_snapshot = None
-    if args.backbone == "mert" and torch_is_below_2_6():
-        mert_snapshot = ensure_mert_safetensors_snapshot()
+    if isinstance(fad_score, torch.Tensor):
+        fad_score = float(fad_score.item())
+    else:
+        fad_score = float(fad_score)
 
-    with patch_mert_loader_for_safetensors(mert_snapshot):
-        evaluator = EvaluationHelper(args.sr, device, backbone=args.backbone)
-    metrics = evaluator.main(str(gen_dir), str(gt_dir), limit_num=limit_num)
+    if isinstance(kad_score, torch.Tensor):
+        kad_score = float(kad_score.item())
+    else:
+        kad_score = float(kad_score)
 
-    print(json.dumps(metrics, indent=2, sort_keys=True))
+    return fad_score, kad_score
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate KAD/FAD with kadtk PyTorch models using a no-cache, single-process embedding pipeline."
+    )
+    parser.add_argument("--model", type=str, required=True, help="kadtk model name (PyTorch models only).")
+    parser.add_argument("--gen", type=Path, required=True, help="Directory with generated .wav files.")
+    parser.add_argument("--gt", type=Path, required=True, help="Directory with ground-truth .wav files.")
+    parser.add_argument("--workers", type=int, default=4, help="CPU worker threads for decode/resample prefetch.")
+    parser.add_argument("--device", type=str, default=None, help="Torch device (e.g., cuda, cuda:0, cpu).")
+    parser.add_argument("--audio-len", type=float, default=None, help="Expected clip length in seconds.")
+    parser.add_argument("--limit", type=int, default=0, help="If >0, evaluate only first N sorted WAV files per folder.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.workers < 1:
+        raise SystemExit("--workers must be >= 1.")
+    torch.set_grad_enabled(False)
+
+    registry = build_model_registry()
+    available_models = sorted(registry.keys())
+
+    if args.model.startswith("openl3-"):
+        raise SystemExit(
+            f"Model '{args.model}' is not supported by this script: TF/Keras-based OpenL3 models are excluded."
+        )
+    if args.model not in registry:
+        raise SystemExit(
+            f"Unknown model '{args.model}'.\nAvailable PyTorch models:\n" + "\n".join(available_models)
+        )
+
+    if args.model.startswith("clap-laion-"):
+        configure_numba_cache_dir()
+
+    device = resolve_device(args.device)
+    model = registry[args.model](args.audio_len)
+
+    if args.model.startswith("clap-laion-"):
+        # CLAP import path in laion_clap may overwrite NUMBA_CACHE_DIR to /tmp;
+        # enforce our user-writable cache target right before model load.
+        configure_numba_cache_dir()
+
+    # Keep explicit device control in this process (no model duplication across workers).
+    if device.type == "cuda":
+        if device.index is not None:
+            torch.cuda.set_device(device.index)
+        # CLAPModel's internal CUDA toggle checks equality against torch.device('cuda').
+        if isinstance(model, CLAPModel):
+            model.device = torch.device("cuda")
+        else:
+            model.device = device
+    else:
+        model.device = torch.device("cpu")
+
+    with torch.no_grad():
+        model.load_model()
+
+    gt_files = collect_wavs(args.gt.resolve(), args.limit)
+    gen_files = collect_wavs(args.gen.resolve(), args.limit)
+
+    with torch.no_grad():
+        gt_emb = compute_embeddings(
+            gt_files,
+            model=model,
+            workers=args.workers,
+            label=f"Embedding GT ({len(gt_files)} files)",
+        )
+        gen_emb = compute_embeddings(
+            gen_files,
+            model=model,
+            workers=args.workers,
+            label=f"Embedding GEN ({len(gen_files)} files)",
+        )
+        fad_score, kad_score = compute_scores(gt_emb=gt_emb, gen_emb=gen_emb, device=device)
+
+    print(f'"{model.name}" fad: {fad_score:.2f} kad: {kad_score:.2f}')
 
 
 if __name__ == "__main__":

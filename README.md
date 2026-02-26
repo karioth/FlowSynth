@@ -121,7 +121,7 @@ python evaluate.py \
 ```
 
 Important:
-- `evaluate.py` compares by basename and requires overlapping `.wav` filenames between `--gen` and `--gt`.
+- `evaluate.py` compares by basename and warns when there is no overlap, but still runs in unpaired mode.
 - For AudioCaps-style eval, use `--prompt-json` in sampling so generated names match GT names.
 
 ## Notes

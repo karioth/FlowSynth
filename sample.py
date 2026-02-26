@@ -1,10 +1,9 @@
 # sample.py
 import argparse
-import json
+import csv
 import os
 import random
 from contextlib import nullcontext
-from pathlib import PurePosixPath, PureWindowsPath
 
 import numpy as np
 import torch
@@ -74,10 +73,13 @@ def parse_args():
         help="Path to pre-computed prompt embeddings (.pt dict with clap/t5/t5_mask)",
     )
     prompt_source.add_argument(
-        "--prompt-json",
+        "--prompt-csv",
         type=str,
         default=None,
-        help="Path to JSON mapping of output_filename.wav -> caption prompt",
+        help=(
+            "Path to AudioCaps CSV with columns audiocap_id,youtube_id,caption. "
+            "Outputs are saved as {audiocap_id}.wav."
+        ),
     )
     parser.add_argument("--output-dir", type=str, default="audio_samples")
     parser.add_argument("--sample-rate", type=int, default=48000,
@@ -226,40 +228,42 @@ def load_dacvae(weights_path: str, device: torch.device):
     return model
 
 
-def load_prompt_json_mapping(path: str) -> tuple[list[str], list[str]]:
-    with open(path, "r", encoding="utf-8") as f:
-        try:
-            mapping = json.load(f)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON in prompt mapping file: {path}") from exc
-
-    if not isinstance(mapping, dict):
-        raise ValueError("Prompt mapping JSON must be an object: {\"filename.wav\": \"caption\"}")
-    if not mapping:
-        raise ValueError("Prompt mapping JSON is empty.")
-
+def load_audiocaps_prompt_csv(path: str) -> tuple[list[str], list[str]]:
+    required_columns = {"audiocap_id", "youtube_id", "caption"}
     output_filenames: list[str] = []
     prompts: list[str] = []
-    for idx, (filename, caption) in enumerate(mapping.items()):
-        if not isinstance(filename, str):
-            raise ValueError(f"Mapping key at index {idx} is not a string filename.")
-        if not isinstance(caption, str):
-            raise ValueError(f"Caption for '{filename}' must be a string.")
-        if not caption.strip():
-            raise ValueError(f"Caption for '{filename}' is empty.")
-        if not filename.lower().endswith(".wav"):
-            raise ValueError(f"Filename '{filename}' must end with .wav")
-        if os.path.isabs(filename):
-            raise ValueError(f"Filename '{filename}' must be relative.")
-        if "/" in filename or "\\" in filename:
-            raise ValueError(f"Filename '{filename}' must not contain path separators.")
-        if any(part == ".." for part in PurePosixPath(filename).parts):
-            raise ValueError(f"Filename '{filename}' is not safe.")
-        if any(part == ".." for part in PureWindowsPath(filename).parts):
-            raise ValueError(f"Filename '{filename}' is not safe.")
+    seen_ids: set[int] = set()
 
-        output_filenames.append(filename)
-        prompts.append(caption.strip())
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"Prompt CSV has no header row: {path}")
+        missing_columns = required_columns.difference(reader.fieldnames)
+        if missing_columns:
+            missing = ", ".join(sorted(missing_columns))
+            raise ValueError(f"Prompt CSV missing required column(s): {missing}")
+
+        for row_number, row in enumerate(reader, start=2):
+            raw_id = (row.get("audiocap_id") or "").strip()
+            caption = (row.get("caption") or "").strip()
+            if not raw_id:
+                raise ValueError(f"Row {row_number}: audiocap_id is empty.")
+            if not caption:
+                raise ValueError(f"Row {row_number}: caption is empty.")
+
+            try:
+                audiocap_id = int(raw_id)
+            except ValueError as exc:
+                raise ValueError(f"Row {row_number}: invalid audiocap_id '{raw_id}'.") from exc
+            if audiocap_id in seen_ids:
+                raise ValueError(f"Row {row_number}: duplicate audiocap_id {audiocap_id}.")
+
+            seen_ids.add(audiocap_id)
+            output_filenames.append(f"{audiocap_id}.wav")
+            prompts.append(caption)
+
+    if not prompts:
+        raise ValueError("Prompt CSV is empty.")
 
     return output_filenames, prompts
 
@@ -360,10 +364,10 @@ def main():
             local_t5_mask = t5_mask[:0]
     else:
         # Get text prompts
-        if args.prompt_json is not None:
-            print(f"Loading prompt mapping from {args.prompt_json}")
-            global_output_filenames, global_prompts = load_prompt_json_mapping(args.prompt_json)
-            print(f"Loaded {len(global_prompts)} prompt->filename pairs")
+        if args.prompt_csv is not None:
+            print(f"Loading AudioCaps prompts from {args.prompt_csv}")
+            global_output_filenames, global_prompts = load_audiocaps_prompt_csv(args.prompt_csv)
+            print(f"Loaded {len(global_prompts)} AudioCaps row(s)")
         elif args.text is not None:
             global_prompts = [args.text]
             global_output_filenames = None
