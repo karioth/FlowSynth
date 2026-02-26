@@ -5,7 +5,6 @@ import os
 import types
 from pathlib import Path
 
-import numpy as np
 import torch
 from diffusers import AudioLDM2Pipeline
 from scipy.io import wavfile
@@ -220,10 +219,8 @@ def main() -> None:
             raise RuntimeError(f"Pipeline returned {len(audios)} audios for {len(out_paths)} prompts")
 
         for out_path, audio in zip(out_paths, audios):
-            # Diffusers returns float waveform in [-1, 1]. Save as int16 wav.
-            audio_int16 = np.clip(audio, -1.0, 1.0)
-            audio_int16 = (audio_int16 * 32767).astype(np.int16)
-            wavfile.write(out_path, sample_rate, audio_int16)
+            # Match AudioLDM2 examples: write float waveform directly.
+            wavfile.write(out_path, sample_rate, audio)
             generated += 1
 
     print(f"Done. generated={generated} skipped={skipped} output_dir={out_dir}")
