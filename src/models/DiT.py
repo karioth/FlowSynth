@@ -245,7 +245,7 @@ def DiT_Large(**kwargs) -> DiT:
     return DiT(depth=24, hidden_size=1536, num_heads=12, intermediate_size=4096, **kwargs)
 
 def DiT_Medium(**kwargs) -> DiT:
-    return DiT(depth=24, hidden_size=1024, num_heads=16, intermediate_size=2432, **kwargs)
+    return DiT(depth=24, hidden_size=1024, num_heads=16, intermediate_size=2688, **kwargs)
 
 def DiT_Base(**kwargs) -> DiT:
     return DiT(depth=12, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)

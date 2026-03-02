@@ -283,7 +283,7 @@ def AR_DiT_Large(**kwargs) -> AR_DiT:
     return AR_DiT(depth=24, hidden_size=1536, num_heads=12, intermediate_size=4096, **kwargs)
 
 def AR_DiT_Medium(**kwargs) -> AR_DiT:
-    return AR_DiT(depth=24, hidden_size=1024, num_heads=16, intermediate_size=2560, **kwargs)
+    return AR_DiT(depth=24, hidden_size=1024, num_heads=16, intermediate_size=2688, **kwargs)
 
 def AR_DiT_Base(**kwargs) -> AR_DiT:
     return AR_DiT(depth=12, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)

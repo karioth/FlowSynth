@@ -412,8 +412,8 @@ def Transformer_Medium(**kwargs) -> Transformer:
         depth=24,
         hidden_size=1024,
         num_heads=16,
-        intermediate_size=3456,
-        diffusion_intermediate_size=3456,
+        intermediate_size=2688,
+        diffusion_intermediate_size=2688,
         **kwargs,
     )
 
@@ -454,9 +454,9 @@ def Transformer_B(**kwargs) -> Transformer:
         depth=24,
         hidden_size=768,
         num_heads=12,
-        diffusion_depth=4,
+        diffusion_depth=3,
         intermediate_size=2048, ## should be 2048 to match expanding mlps
-        #diffusion_intermediate_size=3072,
+        diffusion_intermediate_size=2048,
         **kwargs,
     )
 

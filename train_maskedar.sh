@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8                   # 8 CPUs per GPU (because 1 task == 1 GPU)
 #SBATCH --mem=350G
 #SBATCH --time=48:00:00
-#SBATCH --job-name=Audio_NTP
+#SBATCH --job-name=Audio_transformer
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
 
@@ -48,7 +48,8 @@ srun python train.py \
   --devices "$TASKS_PER_NODE" \
   --data-root "$DATA_ROOT" \
   --silence-latent-path "$SILENCE_LATENT_PATH" \
-  --results-dir audio_logs/AudioNTP_Transformer_B_125e \
-  --model Transformer-B \
+  --results-dir audio_logs/AUDIO_Transformer_Medium_ag2 \
+  --model Transformer-Medium \
   --batch-size 128 \
-  --epochs 125 
+  --epochs 250 \
+  --gradient-accumulation-steps 2

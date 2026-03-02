@@ -489,8 +489,8 @@ def MaskedAR_Medium(**kwargs) -> MaskedARTransformer:
         depth=24,
         hidden_size=1024,
         num_heads=16,
-        intermediate_size=3456,
-        diffusion_intermediate_size=3456,
+        intermediate_size=2688,
+        diffusion_intermediate_size=2688,
         **kwargs,
     )
 
