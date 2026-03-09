@@ -11,7 +11,7 @@ from .modules.ffn import SwiGLU
 
 class DiTBlock(nn.Module):
     """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    A DiT block with shared time modulation and per-block scale/shift table.
     """
 
     def __init__(
@@ -27,6 +27,7 @@ class DiTBlock(nn.Module):
         rope_scale_base: float | None = None,
     ) -> None:
         super().__init__()
+        self.hidden_size = hidden_size
         self.norm1 = RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
         self.attn = Attention(
@@ -44,12 +45,23 @@ class DiTBlock(nn.Module):
         self.norm2 = RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
         self.mlp = SwiGLU(hidden_size, intermediate_size)
-        self.adaLN_modulation = AdaLNzero(hidden_size=hidden_size, out_mult=6)
-
-    def forward(self, hidden_states: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(conditioning).chunk(6, dim=-1)
+        self.scale_shift_table = nn.Parameter(
+            torch.randn(6, hidden_size) / (hidden_size ** 0.5)
         )
+        self.scale_shift_table._no_weight_decay = True
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        time_modulation: torch.Tensor,
+    ) -> torch.Tensor:
+        biases = (
+            self.scale_shift_table.unsqueeze(0)
+            + time_modulation.reshape(hidden_states.size(0), 6, self.hidden_size)
+        )
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = biases.to(
+            dtype=hidden_states.dtype
+        ).chunk(6, dim=1)
         residual = hidden_states
         hidden_states = self.attn(
             modulate(self.norm1(hidden_states), shift_msa, scale_msa)
@@ -87,6 +99,7 @@ class DiT(nn.Module):
         rope_scale_base: float | None = None,
     ) -> None:
         super().__init__()
+        self.hidden_size = hidden_size
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.num_heads = num_heads
@@ -107,6 +120,8 @@ class DiT(nn.Module):
             dropout_prob=prompt_dropout_prob,
         )
         self.prompt_seq_len = prompt_seq_len
+
+        self.time_modulation = AdaLNzero(hidden_size=hidden_size, out_mult=6)
 
         self.blocks = nn.ModuleList(
             [
@@ -154,6 +169,15 @@ class DiT(nn.Module):
         del kwargs
         hidden_states = self.input_embedder(hidden_states)
         time_emb = self.time_embedder(timesteps)
+        if time_emb.shape != (hidden_states.size(0), self.hidden_size):
+            raise ValueError(
+                f"Expected time_emb shape {(hidden_states.size(0), self.hidden_size)}, got {tuple(time_emb.shape)}"
+            )
+        time_modulation = self.time_modulation(time_emb)
+        if time_modulation.shape != (hidden_states.size(0), 6 * self.hidden_size):
+            raise ValueError(
+                f"Expected time_modulation shape {(hidden_states.size(0), 6 * self.hidden_size)}, got {tuple(time_modulation.shape)}"
+            )
         prompt_seq = self.prompt_embedder(
             prompt,
             self.training,
@@ -163,7 +187,7 @@ class DiT(nn.Module):
         conditioning = time_emb.unsqueeze(1)
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, conditioning)
+            hidden_states = block(hidden_states, time_modulation)
         hidden_states = hidden_states[:, self.prompt_seq_len:, :]
         hidden_states = self.final_layer(hidden_states, conditioning)
         return hidden_states

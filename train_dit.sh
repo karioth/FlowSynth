@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8                   # 8 CPUs per GPU (because 1 task == 1 GPU)
 #SBATCH --mem=350G
 #SBATCH --time=48:00:00
-#SBATCH --job-name=Audio_DiT
+#SBATCH --job-name=Audio_DiT_shared
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
 
@@ -15,6 +15,8 @@ echo "Running in shell: $SHELL"
 PROJECT_ROOT="/share/users/student/f/friverossego/EqSynth"
 DATA_ROOT="/share/users/student/f/friverossego/datasets"
 SILENCE_LATENT_PATH="silence_samples/silence_10s_dacvae.pt"
+RESULTS_DIR="audio_logs/AUDIO_DiT_B_sharedtime_125e"
+RESUME_CKPT="/share/users/student/f/friverossego/EqSynth/audio_logs/AUDIO_DiT_B_sharedtime_125e/checkpoints/last.ckpt"
 
 # Derive from allocation
 NUM_NODES="${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-1}}"
@@ -22,6 +24,7 @@ TPN_RAW="${SLURM_NTASKS_PER_NODE:-${SLURM_TASKS_PER_NODE:-1}}"
 TASKS_PER_NODE="${TPN_RAW%%(*}"
 
 echo "Resolved: num_nodes=$NUM_NODES tasks_per_node=$TASKS_PER_NODE"
+echo "Resuming from checkpoint: $RESUME_CKPT"
 
 SCRATCH_BASE="/share/users/student/f/friverossego/tmp"
 export TMPDIR="${SLURM_TMPDIR:-$SCRATCH_BASE/tmp}"
@@ -48,8 +51,8 @@ srun python train.py \
   --devices "$TASKS_PER_NODE" \
   --data-root "$DATA_ROOT" \
   --silence-latent-path "$SILENCE_LATENT_PATH" \
-  --results-dir audio_logs/AUDIO_DiT_Medium_ag2 \
-  --model DiT-Medium \
+  --results-dir "$RESULTS_DIR" \
+  --model DiT-B \
   --batch-size 128 \
-  --epochs 250 \
-  --gradient-accumulation-steps 2
+  --epochs 125 \
+  --resume "$RESUME_CKPT"
