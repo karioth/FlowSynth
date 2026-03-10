@@ -279,20 +279,23 @@ class Transformer(nn.Module):
         return hidden_states
 
     @staticmethod
-    def cfg_omega_at_token(token_idx: int, seq_len: int, cfg_scale: float) -> float:
+    def cfg_scale_at_token(token_idx: int, seq_len: int, cfg_scale: float) -> float:
         """
-        Position-dependent paper CFG weight omega_i for token index i.
+        Position-dependent standard CFG scale s_i for token index i.
 
-        cfg_scale is interpreted as the initial omega_0.
+        Currently kept constant to match audiontp constant CFG behavior.
         """
-        if seq_len <= 1:
-            return float(cfg_scale)
-        pos = float(token_idx) / float(seq_len - 1)
-        return 1.0 + (float(cfg_scale) - 1.0) * (1.0 - pos)
+        del token_idx, seq_len
+        return float(cfg_scale)
+        # Scheduled behavior disabled for now:
+        # if seq_len <= 1:
+        #     return float(cfg_scale)
+        # pos = float(token_idx) / float(seq_len - 1)
+        # return 1.0 + (float(cfg_scale) - 1.0) * (1.0 - pos)
 
     def sample_with_cfg(self, prompt: dict[str, torch.Tensor], cfg_scale: float, sample_func) -> torch.Tensor:
         """
-        Sample with CFG where cfg_scale is interpreted as paper omega_0.
+        Sample with CFG using a constant standard guidance scale.
         """
         # Build [cond, uncond] prompt batch for classifier-free guidance.
         clap = prompt["clap"]
@@ -348,8 +351,7 @@ class Transformer(nn.Module):
                 inference_params=inference_params,
                 prompt_drop_ids=prompt_drop_ids,
             )
-            omega_i = self.cfg_omega_at_token(token_idx=i, seq_len=self.seq_len, cfg_scale=cfg_scale)
-            guidance_scale = omega_i + 1.0
+            guidance_scale = self.cfg_scale_at_token(token_idx=i, seq_len=self.seq_len, cfg_scale=cfg_scale)
             prev_token = sample_func(
                 functools.partial(
                     self.forward_with_cfg,
@@ -519,23 +521,14 @@ if __name__ == "__main__":
         conditioning = model.forward_parallel(x_start, prompt)
     assert conditioning.shape == (batch_size, seq_len, hidden_size), f"Unexpected conditioning shape: {conditioning.shape}"
 
-    # Paper-style CFG schedule checks (cfg_scale interpreted as omega_0).
+    # Constant CFG checks.
     cfg_scale = 3.0
-    omega_first = model.cfg_omega_at_token(token_idx=0, seq_len=seq_len, cfg_scale=cfg_scale)
-    omega_last = model.cfg_omega_at_token(token_idx=seq_len - 1, seq_len=seq_len, cfg_scale=cfg_scale)
-    omega_single = model.cfg_omega_at_token(token_idx=0, seq_len=1, cfg_scale=cfg_scale)
-    assert omega_first == cfg_scale, f"Expected omega_first={cfg_scale}, got {omega_first}"
-    assert omega_last == 1.0, f"Expected omega_last=1.0, got {omega_last}"
-    assert omega_single == cfg_scale, f"Expected omega_single={cfg_scale}, got {omega_single}"
-
-    # Eq. (4) form and standard CFG form are equivalent when s = omega + 1.
-    cond_eps = torch.tensor([1.25], device=device, dtype=torch.float32)
-    uncond_eps = torch.tensor([-0.75], device=device, dtype=torch.float32)
-    omega = 2.5
-    s = omega + 1.0
-    guided_paper = cond_eps + omega * (cond_eps - uncond_eps)
-    guided_standard = uncond_eps + s * (cond_eps - uncond_eps)
-    assert torch.allclose(guided_paper, guided_standard), "CFG forms are not equivalent"
+    cfg_first = model.cfg_scale_at_token(token_idx=0, seq_len=seq_len, cfg_scale=cfg_scale)
+    cfg_last = model.cfg_scale_at_token(token_idx=seq_len - 1, seq_len=seq_len, cfg_scale=cfg_scale)
+    cfg_single = model.cfg_scale_at_token(token_idx=0, seq_len=1, cfg_scale=cfg_scale)
+    assert cfg_first == cfg_scale, f"Expected cfg_first={cfg_scale}, got {cfg_first}"
+    assert cfg_last == cfg_scale, f"Expected cfg_last={cfg_scale}, got {cfg_last}"
+    assert cfg_single == cfg_scale, f"Expected cfg_single={cfg_scale}, got {cfg_single}"
 
     start_positions = []
     original_forward_recurrent = model.forward_recurrent

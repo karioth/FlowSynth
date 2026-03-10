@@ -246,7 +246,7 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
     def __init__(
         self,
         *args,
-        ardiff_step: int = 0,
+        ardiff_step: int = 1,
         base_num_frames: Optional[int] = None,
         t_start: float = 1.0,
         **kwargs,

@@ -52,6 +52,15 @@ def parse_args():
         help="Initial paper CFG omega_0 (not a constant standard CFG scale).",
     )
     parser.add_argument("--num-inference-steps", type=int, default=100)
+    parser.add_argument(
+        "--ardiff-step",
+        type=int,
+        default=None,
+        help=(
+            "Override AR-Diff sampling lag for AR_DiT checkpoints. "
+            "When omitted, uses the scheduler default."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     prompt_source = parser.add_mutually_exclusive_group()
     prompt_source.add_argument(
@@ -469,6 +478,7 @@ def main():
                 batch_prompt_data,
                 cfg_scale=args.cfg_scale,
                 num_inference_steps=args.num_inference_steps,
+                ardiff_step=args.ardiff_step,
             )
 
         # latents shape: [B, T, D] -> need [B, D, T] for DACVAE
