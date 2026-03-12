@@ -506,7 +506,7 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
                         model_output[:, update_idx],
                         current_sample[:, update_idx],
                         t_prev[:, update_idx],
-                    )
+                    ).to(dtype=model_velocity.dtype)
             else:
                 model_velocity = model_output
 
