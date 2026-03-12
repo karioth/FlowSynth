@@ -51,6 +51,19 @@ def parse_args():
         default=3.0,
         help="Initial paper CFG omega_0 (not a constant standard CFG scale).",
     )
+    parser.add_argument(
+        "--cfg-schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "linear_decay"],
+        help="CFG schedule: 'constant' (default) or 'linear_decay' (ramps from cfg_scale to 1.0).",
+    )
+    parser.add_argument(
+        "--cfg-mask-prob",
+        type=float,
+        default=0.0,
+        help="Probability of masking unconditional branch tokens (autoguidance). 0.0=off, 1.0=always mask.",
+    )
     parser.add_argument("--num-inference-steps", type=int, default=100)
     parser.add_argument(
         "--ardiff-step",
@@ -479,6 +492,8 @@ def main():
                 cfg_scale=args.cfg_scale,
                 num_inference_steps=args.num_inference_steps,
                 ardiff_step=args.ardiff_step,
+                cfg_schedule=args.cfg_schedule,
+                cfg_mask_prob=args.cfg_mask_prob,
             )
 
         # latents shape: [B, T, D] -> need [B, D, T] for DACVAE

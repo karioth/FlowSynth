@@ -305,60 +305,11 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
 
         return (sample - model_output.to(dtype=sample.dtype)) / t
 
-    @torch.compile
-    def sample_monotone_anchor_times(
-        self,
-        B: int,
-        L: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """
-        Continuous monotone timestep sampler (anchor + logit-normal), batched.
-
-        Returns:
-          u: (B, L) tensor with 0 <= u[...,0] <= ... <= u[...,L-1] <= 1
-
-        Main idea:
-          1) Pick an anchor index k uniformly for each batch element.
-          2) Pick an anchor time a from logit-normal.
-          3) Sample exactly k values in [0, a] and L-1-k values in [a, 1].
-          4) Sort the (L-1) values and insert the anchor at position k.
-        """
-        # 1) Anchor positions
-        k = torch.randint(0, L, (B,), device=device)
-
-        # 2) Anchor values (logit-normal)
-        a = torch.sigmoid(torch.randn((B,), device=device, dtype=dtype) * self.t_s + self.t_m)
-
-        Lm1 = L - 1
-        j = torch.arange(Lm1, device=device)[None, :]
-        prefix = j < k[:, None]
-
-        # 3) Prefix in [0, a], suffix in [a, 1]
-        r = torch.rand((B, Lm1), device=device, dtype=dtype)
-        z = torch.where(
-            prefix,
-            r * a[:, None],
-            a[:, None] + r * (1.0 - a)[:, None],
-        )
-
-        # 4) Sort and insert anchor to make the sequence monotone
-        z_sorted, _ = z.sort(dim=1)
-
-        u = torch.empty((B, L), device=device, dtype=dtype)
-        pos = torch.arange(L, device=device)[None, :].expand(B, -1)
-        mask = pos != k[:, None]
-        u[mask] = z_sorted.reshape(-1)
-        u.scatter_(1, k[:, None], a[:, None])
-        
-        return u
-
     def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
         bsz, seq_len = x0_seq.shape[:2]
         noise = torch.randn_like(x0_seq)
-        t_vec = self.sample_monotone_anchor_times(
-            bsz, seq_len, device=x0_seq.device, dtype=x0_seq.dtype
+        t_vec = self.sample_timesteps(
+            (bsz, seq_len), device=x0_seq.device, dtype=x0_seq.dtype
         )
 
         x_noisy = self.add_noise(x0_seq, noise, t_vec)
