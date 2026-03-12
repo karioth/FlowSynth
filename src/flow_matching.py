@@ -277,6 +277,27 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
         if t_start is not None:
             self.t_start = float(t_start)
 
+    def _uses_x_pred(self) -> bool:
+        return self.prediction_type == "x_pred"
+
+    def _convert_model_output_to_velocity(
+        self,
+        model_output: torch.Tensor,
+        sample: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self._uses_x_pred():
+            return model_output
+
+        t = timesteps.to(device=sample.device, dtype=sample.dtype)
+        if torch.any(t <= 0):
+            raise ValueError(
+                "x_pred conversion requires strictly positive timesteps."
+            )
+        t = t.unsqueeze(-1)
+
+        return (sample - model_output.to(dtype=sample.dtype)) / t
+
     @torch.compile
     def sample_monotone_anchor_times(
         self,
@@ -334,8 +355,12 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
         )
 
         x_noisy = self.add_noise(x0_seq, noise, t_vec)
-        velocity = self.get_velocity(x0_seq, noise, t_vec)
         model_output = model(x_noisy, t_vec, prompt=prompt)
+        if self._uses_x_pred():
+            weight = t_vec.clamp(min=0.05).unsqueeze(-1).pow(-2)
+            return (weight * (model_output - x0_seq).pow(2)).float().mean()
+
+        velocity = self.get_velocity(x0_seq, noise, t_vec)
         return F.mse_loss(model_output.float(), velocity.float())
 
     def set_timesteps(
@@ -477,6 +502,11 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
 
             t_prev = t_prev_f.unsqueeze(0).expand(x_slice.shape[0], -1)
             model_output = model_fn(x_slice, t_prev)
+            model_output = self._convert_model_output_to_velocity(
+                model_output,
+                x_slice,
+                t_prev,
+            )
 
             # Freeze frames whose timestep did not change.
             model_output = model_output * update_mask + x_slice * (1 - update_mask)

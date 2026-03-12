@@ -123,6 +123,8 @@ class AR_DiT(nn.Module):
         self.prompt_seq_len = prompt_seq_len
 
         self.time_modulation = AdaLNzero(hidden_size=hidden_size, out_mult=6)
+        self.prompt_time_mod = nn.Parameter(torch.zeros(1, 1, 6 * hidden_size))
+        self.prompt_time_mod._no_weight_decay = True
 
         self.blocks = nn.ModuleList(
             [
@@ -190,14 +192,15 @@ class AR_DiT(nn.Module):
             -1,
         )  # (B, T, D)
         time_modulation = self.time_modulation(time_emb)
-        t_prompt_mod = torch.zeros(
-            hidden_states.size(0),
-            self.prompt_seq_len,
-            time_modulation.size(-1),
+        prompt_time_mod = self.prompt_time_mod.to(
             device=time_modulation.device,
             dtype=time_modulation.dtype,
+        ).expand(
+            hidden_states.size(0),
+            self.prompt_seq_len,
+            -1,
         )
-        time_modulation = torch.cat([t_prompt_mod, time_modulation], dim=1)  # (B, T+P, 6D)
+        time_modulation = torch.cat([prompt_time_mod, time_modulation], dim=1)  # (B, T+P, 6D)
         hidden_states = torch.cat([prompt_seq, hidden_states], dim=1)  # (B, T+P, D)
 
         for block in self.blocks:

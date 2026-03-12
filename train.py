@@ -155,7 +155,15 @@ if __name__ == "__main__":
                    help="T5 hidden state dimension")
     p.add_argument("--prompt-seq-len", type=int, default=69,
                    help="Prompt sequence length (1 CLAP + max T5 tokens)")
-    p.add_argument("--prediction-type", type=str, default="flow")
+    p.add_argument(
+        "--prediction-type",
+        type=str,
+        default="flow",
+        help=(
+            "Training target type. 'flow' keeps velocity prediction. "
+            "'x_pred' supervises clean x only for AR-DiT; other models keep flow behavior."
+        ),
+    )
     p.add_argument("--batch-mul", type=int, default=2)
     p.add_argument("--mask-prob", type=float, default=0.7)
 

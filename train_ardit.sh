@@ -5,8 +5,8 @@
 #SBATCH --ntasks-per-node=2                 # set = GPUs per node
 #SBATCH --cpus-per-task=8                   # 8 CPUs per GPU (because 1 task == 1 GPU)
 #SBATCH --mem=350G
-#SBATCH --time=24:00:00
-#SBATCH --job-name=Audio_ardit
+#SBATCH --time=48:00:00
+#SBATCH --job-name=Audio_ardit_xpred
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
 
@@ -48,8 +48,8 @@ srun python train.py \
   --devices "$TASKS_PER_NODE" \
   --data-root "$DATA_ROOT" \
   --silence-latent-path "$SILENCE_LATENT_PATH" \
-  --results-dir audio_logs/AUDIO_AR_DiT_B_125e \
+  --results-dir audio_logs/AUDIO_AR_DiT_B_125e_xpred \
   --model AR-DiT-B \
   --batch-size 128 \
-  --epochs 125 \
-  --resume /share/users/student/f/friverossego/EqSynth/audio_logs/AUDIO_AR_DiT_B_125e/checkpoints/last.ckpt
+  --prediction-type x_pred \
+  --epochs 125 
