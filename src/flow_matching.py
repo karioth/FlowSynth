@@ -476,9 +476,9 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
 
             t_next_by_frame = self.timestep_matrix[i]
             step_index_by_frame = self.step_index[i]
-            frame_update_mask = self.update_masks[i]
+            frame_update_mask_bool = self.update_masks[i]
 
-            frame_update_mask = frame_update_mask.to(dtype=current_sample.dtype)
+            frame_update_mask = frame_update_mask_bool.to(dtype=current_sample.dtype)
             frame_update_mask = frame_update_mask.view(
                 (1, frame_update_mask.shape[0]) + (1,) * (current_sample.dim() - 2)
             )
@@ -486,14 +486,29 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
             # Map step indices to actual timesteps; newly-activated frames step from t_start.
             prev_index = torch.clamp(step_index_by_frame - 1, min=0)
             t_prev_by_frame = self.step_template_full[prev_index]
+            # Query updated frames at their pre-update timestep, while frozen frames
+            # are queried at their current timestep (e.g., finished frames at t=0).
+            t_model_by_frame = torch.where(
+                frame_update_mask_bool,
+                t_prev_by_frame,
+                t_next_by_frame,
+            )
 
             t_prev = t_prev_by_frame.unsqueeze(0).expand(current_sample.shape[0], -1)
-            model_velocity = model_fn(current_sample, t_prev)
-            model_velocity = self._convert_model_output_to_velocity(
-                model_velocity,
-                current_sample,
-                t_prev,
-            )
+            t_model = t_model_by_frame.unsqueeze(0).expand(current_sample.shape[0], -1)
+            model_output = model_fn(current_sample, t_model)
+
+            if self._uses_x_pred():
+                model_velocity = model_output.clone()
+                update_idx = frame_update_mask_bool
+                if torch.any(update_idx):
+                    model_velocity[:, update_idx] = self._convert_model_output_to_velocity(
+                        model_output[:, update_idx],
+                        current_sample[:, update_idx],
+                        t_prev[:, update_idx],
+                    )
+            else:
+                model_velocity = model_output
 
             # Freeze frames whose timestep did not change.
             model_velocity = (
