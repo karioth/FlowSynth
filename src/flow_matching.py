@@ -237,23 +237,20 @@ class FlowMatchingSchedulerTransformer(FlowMatchingBase):
 
 class FlowMatchingSchedulerARDiff(FlowMatchingBase):
     """
-    AR-Diffusion scheduler with AD + FIFO sampling.
+    AR-Diffusion scheduler with AD-only sampling.
 
-    AD builds a per-frame timestep schedule and an update mask; FIFO limits the
-    active window for efficiency without changing the schedule.
+    AD builds a per-frame timestep schedule and an update mask over the full sequence.
     """
 
     def __init__(
         self,
         *args,
         ardiff_step: int = 1,
-        base_num_frames: Optional[int] = None,
         t_start: float = 1.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.ardiff_step = ardiff_step
-        self.base_num_frames = base_num_frames
         self.t_start = float(t_start)
 
         self.step_template = None
@@ -261,21 +258,31 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
         self.timestep_matrix = None
         self.step_index = None
         self.update_masks = None
-        self.valid_intervals = None
+        self._schedule_frames = None
+
+    def _invalidate_schedule_cache(self) -> None:
+        self.step_template_full = None
+        self.timestep_matrix = None
+        self.step_index = None
+        self.update_masks = None
         self._schedule_frames = None
 
     def configure_sampling(
         self,
         ardiff_step: Optional[int] = None,
-        base_num_frames: Optional[int] = None,
         t_start: Optional[float] = None,
     ) -> None:
+        needs_reset = False
         if ardiff_step is not None:
+            if ardiff_step != self.ardiff_step:
+                needs_reset = True
             self.ardiff_step = ardiff_step
-        if base_num_frames is not None:
-            self.base_num_frames = base_num_frames
         if t_start is not None:
+            if float(t_start) != self.t_start:
+                needs_reset = True
             self.t_start = float(t_start)
+        if needs_reset:
+            self._invalidate_schedule_cache()
 
     def _uses_x_pred(self) -> bool:
         return self.prediction_type == "x_pred"
@@ -370,7 +377,7 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
         timesteps: Optional[torch.Tensor] = None,
     ):
         """
-        Build the base step template and reset the cached AD/FIFO schedule.
+        Build the base step template and reset the cached AD schedule.
         """
         if num_inference_steps is not None and timesteps is not None:
             raise ValueError("Can only pass one of `num_inference_steps` or `timesteps`.")
@@ -393,17 +400,11 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
         self.step_template = step_template
         self.timesteps = step_template
 
-        self.step_template_full = None
-        self.timestep_matrix = None
-        self.step_index = None
-        self.update_masks = None
-        self.valid_intervals = None
-        self._schedule_frames = None
+        self._invalidate_schedule_cache()
 
     def _build_ad_schedule(
         self,
         total_num_frames: int,
-        base_num_frames: int,
         ardiff_step: int,
         step_template: torch.Tensor,
     ):
@@ -414,11 +415,10 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
           - step_matrix: per-iteration per-frame timesteps
           - step_index: integer step indices per iteration
           - step_update_mask: frames whose step index changed this iteration
-          - valid_interval: FIFO window (start, end) per iteration
           - step_template_full: [t_start] + step_template
         """
         step_matrix, step_index = [], []
-        update_mask, valid_interval = [], []
+        update_mask = []
         num_iterations = len(step_template)
 
         t_start = torch.tensor([self.t_start], device=step_template.device, dtype=step_template.dtype)
@@ -442,21 +442,14 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
             step_matrix.append(step_template_full[new_row])
             pre_row = new_row
 
-        terminal_flag = base_num_frames
-        for i in range(0, len(update_mask)):
-            if terminal_flag < total_num_frames and update_mask[i][terminal_flag].item():
-                # When the next frame becomes active, shift the FIFO window.
-                terminal_flag += 1
-            valid_interval.append((terminal_flag - base_num_frames, terminal_flag))
-
         step_update_mask = torch.stack(update_mask, dim=0)
         step_index = torch.stack(step_index, dim=0)
         step_matrix = torch.stack(step_matrix, dim=0)
-        return step_matrix, step_index, step_update_mask, valid_interval, step_template_full
+        return step_matrix, step_index, step_update_mask, step_template_full
 
     def forward(self, model_fn, sample: torch.Tensor) -> torch.Tensor:
         """
-        AD/FIFO sampling loop with per-frame timesteps and update masks.
+        AD sampling loop with per-frame timesteps and update masks.
         """
         if self.step_template is None:
             raise RuntimeError("set_timesteps(...) must be called before sampling.")
@@ -464,59 +457,58 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
             raise ValueError("ardiff_step must be >= 0.")
 
         total_num_frames = sample.shape[1]
-        base_num_frames = self.base_num_frames or total_num_frames
-        if base_num_frames > total_num_frames:
-            raise ValueError("base_num_frames must be <= total_num_frames.")
 
         if self.timestep_matrix is None or self._schedule_frames != total_num_frames:
             (
                 self.timestep_matrix,
                 self.step_index,
                 self.update_masks,
-                self.valid_intervals,
                 self.step_template_full,
             ) = self._build_ad_schedule(
                 total_num_frames,
-                base_num_frames,
                 self.ardiff_step,
                 self.step_template,
             )
             self._schedule_frames = total_num_frames
 
         for i in range(self.timestep_matrix.shape[0]):
-            valid_s, valid_e = self.valid_intervals[i]
-            x_slice = sample[:, valid_s:valid_e, ...]
+            current_sample = sample
 
-            t_cur_f = self.timestep_matrix[i][valid_s:valid_e]
-            step_index = self.step_index[i][valid_s:valid_e]
-            update_mask = self.update_masks[i][valid_s:valid_e]
+            t_next_by_frame = self.timestep_matrix[i]
+            step_index_by_frame = self.step_index[i]
+            frame_update_mask = self.update_masks[i]
 
-            update_mask = update_mask.to(dtype=x_slice.dtype)
-            update_mask = update_mask.view(
-                (1, update_mask.shape[0]) + (1,) * (x_slice.dim() - 2)
+            frame_update_mask = frame_update_mask.to(dtype=current_sample.dtype)
+            frame_update_mask = frame_update_mask.view(
+                (1, frame_update_mask.shape[0]) + (1,) * (current_sample.dim() - 2)
             )
 
             # Map step indices to actual timesteps; newly-activated frames step from t_start.
-            prev_index = torch.clamp(step_index - 1, min=0)
-            t_prev_f = self.step_template_full[prev_index]
+            prev_index = torch.clamp(step_index_by_frame - 1, min=0)
+            t_prev_by_frame = self.step_template_full[prev_index]
 
-            t_prev = t_prev_f.unsqueeze(0).expand(x_slice.shape[0], -1)
-            model_output = model_fn(x_slice, t_prev)
-            model_output = self._convert_model_output_to_velocity(
-                model_output,
-                x_slice,
+            t_prev = t_prev_by_frame.unsqueeze(0).expand(current_sample.shape[0], -1)
+            model_velocity = model_fn(current_sample, t_prev)
+            model_velocity = self._convert_model_output_to_velocity(
+                model_velocity,
+                current_sample,
                 t_prev,
             )
 
             # Freeze frames whose timestep did not change.
-            model_output = model_output * update_mask + x_slice * (1 - update_mask)
+            model_velocity = (
+                model_velocity * frame_update_mask
+                + current_sample * (1 - frame_update_mask)
+            )
 
-            dt = (t_cur_f - t_prev_f).to(dtype=x_slice.dtype)
-            dt = dt.view((1, dt.shape[0]) + (1,) * (x_slice.dim() - 2))
-            dt = dt * update_mask
-            x_slice = x_slice + dt * model_output
+            dt_by_frame = (t_next_by_frame - t_prev_by_frame).to(dtype=current_sample.dtype)
+            dt_by_frame = dt_by_frame.view(
+                (1, dt_by_frame.shape[0]) + (1,) * (current_sample.dim() - 2)
+            )
+            dt_by_frame = dt_by_frame * frame_update_mask
+            current_sample = current_sample + dt_by_frame * model_velocity
 
-            sample[:, valid_s:valid_e, ...] = x_slice
+            sample = current_sample
 
         return sample
 

@@ -98,7 +98,6 @@ class LitModule(L.LightningModule):
         num_inference_steps: int = 250,
         scheduler=None,
         ardiff_step: int | None = None,
-        base_num_frames: int | None = None,
     ):
         self.eval()
         if scheduler is None:
@@ -106,7 +105,6 @@ class LitModule(L.LightningModule):
 
         scheduler.configure_sampling(
             ardiff_step=ardiff_step,
-            base_num_frames=base_num_frames,
         )
         scheduler.set_timesteps(num_inference_steps, device=self.device)
         return self.model.sample_with_cfg(prompt, cfg_scale, scheduler)
