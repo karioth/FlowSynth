@@ -496,7 +496,12 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
 
             t_prev = t_prev_by_frame.unsqueeze(0).expand(current_sample.shape[0], -1)
             t_model = t_model_by_frame.unsqueeze(0).expand(current_sample.shape[0], -1)
-            model_output = model_fn(current_sample, t_model)
+            model_output = model_fn(
+                current_sample,
+                t_model,
+                frame_update_mask_bool=frame_update_mask_bool,
+                step_index_by_frame=step_index_by_frame,
+            )
 
             if self._uses_x_pred():
                 model_velocity = model_output.clone()
