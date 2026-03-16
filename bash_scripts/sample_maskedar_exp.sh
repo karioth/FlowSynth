@@ -4,8 +4,8 @@
 #SBATCH --gpus-per-node=H100.80gb:2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=350G
-#SBATCH --time=48:00:00
+#SBATCH --mem=150G
+#SBATCH --time=24:00:00
 #SBATCH --job-name=maskedar_cfg_sweep
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
@@ -15,7 +15,7 @@ set -e
 NUM_GPUS=2
 STEPS=100
 SEED=0
-BATCH_SIZE=16
+BATCH_SIZE=64
 PRECISION=bf16-mixed
 
 PROMPT_CSV="/share/users/student/f/friverossego/FlowSynth/audiocaps-test.csv"
@@ -52,13 +52,8 @@ RUN_INDEX=0
 cd "$FLOWSYNTH_ROOT"
 
 for schedule in linear_decay constant; do
-    for cfg in 10.0 9.0 8.0 7.0 6.0 5.0 4.0; do
-        for mask_prob in 0.5 0.3 0.1 0.0; do
-            # Already have constant cfg4.0 mask0.0
-            if [[ "$schedule" == "constant" && "$cfg" == "4.0" && "$mask_prob" == "0.0" ]]; then
-                continue
-            fi
-
+    for cfg in 8.0 7.0 6.0 5.0 4.0; do
+        for mask_prob in 0.1 0.0; do
             tag="${schedule}_cfg${cfg}_mask${mask_prob}"
             outdir="${OUT_ROOT}/${tag}"
             mkdir -p "$outdir"

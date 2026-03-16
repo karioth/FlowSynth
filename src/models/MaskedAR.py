@@ -267,7 +267,6 @@ class MaskedARTransformer(nn.Module):
         inference_params: InferenceParams | None = None,
         append_mask: bool = False,
         prompt_drop_ids: torch.Tensor | None = None,
-        mask_uncond_half: bool = False,
     ) -> torch.Tensor:
         """
         Recurrent forward for inference with KV caching.
@@ -277,8 +276,6 @@ class MaskedARTransformer(nn.Module):
             start_pos: Current position in sequence
             inference_params: KV cache container
             append_mask: If True, append a [MASK] token to query the next position in the same pass
-            mask_uncond_half: If True, replace the unconditional (second) half of the batch
-                with [MASK] embeddings after input_embedder (autoguidance).
         """
         start_pos = int(start_pos)
         if start_pos == 0:
@@ -298,9 +295,6 @@ class MaskedARTransformer(nn.Module):
                 # It's a raw latent token (B, C) -> (B, 1, C)
                 hidden_states = hidden_states.unsqueeze(1)
             hidden_states = self.input_embedder(hidden_states)
-            if mask_uncond_half:
-                half = hidden_states.shape[0] // 2
-                hidden_states[half:] = self.mask_token.expand(half, hidden_states.shape[1], -1)
 
         if append_mask:
             # Append [MASK] in hidden space to get the next-position readout in one pass.
@@ -338,35 +332,21 @@ class MaskedARTransformer(nn.Module):
         return hidden_states
 
     @staticmethod
-    def cfg_scale_at_token(
-        token_idx: int, seq_len: int, cfg_scale: float, schedule: str = "constant"
-    ) -> float:
+    def cfg_scale_at_token(token_idx: int, seq_len: int, cfg_scale: float) -> float:
         """
-        Position-dependent standard CFG scale s_i for token index i.
-
-        schedule="constant": same cfg_scale at every position.
-        schedule="linear_decay": linearly ramps from cfg_scale (first token) to 1.0 (last token).
+        Standard constant CFG scale.
         """
-        if schedule == "constant" or seq_len <= 1:
-            return float(cfg_scale)
-        pos = float(token_idx) / float(seq_len - 1)
-        return 1.0 + (float(cfg_scale) - 1.0) * (1.0 - pos)
+        del token_idx, seq_len
+        return float(cfg_scale)
 
     def sample_with_cfg(
         self,
         prompt: dict,
         cfg_scale: float,
         sample_func,
-        cfg_schedule: str = "constant",
-        cfg_mask_prob: float = 0.0,
     ) -> torch.Tensor:
         """
         AR sampling with classifier-free guidance.
-
-        cfg_scale is used as the base CFG guidance scale.
-        cfg_schedule controls how it varies across token positions.
-        cfg_mask_prob: probability of replacing unconditional branch tokens
-            with [MASK] embeddings (autoguidance). 0.0 = off.
 
         For each position:
           1) Pass [MASK] through backbone to get conditioning.
@@ -420,11 +400,9 @@ class MaskedARTransformer(nn.Module):
             if i == 0:
                 # First iteration: pass prompts for both conditional and unconditional batches.
                 recurrent_input = prompt_input
-                do_mask = False
             else:
                 # Cache the previous predicted token (CFG: duplicate batch).
                 recurrent_input = torch.cat([prev_token, prev_token], dim=0)
-                do_mask = cfg_mask_prob > 0.0 and torch.rand(1).item() < cfg_mask_prob
 
             # Single pass: write token_i to KV and append [MASK] at i+1; the mask KV
             # is overwritten by the generated token on the next step.
@@ -434,10 +412,13 @@ class MaskedARTransformer(nn.Module):
                 inference_params=inference_params,
                 append_mask=True,
                 prompt_drop_ids=prompt_drop_ids,
-                mask_uncond_half=do_mask,
             )
             conditioning = conditioning[:, -1:]  # Mask position readout.
-            guidance_scale = self.cfg_scale_at_token(token_idx=i, seq_len=self.seq_len, cfg_scale=cfg_scale, schedule=cfg_schedule)
+            guidance_scale = self.cfg_scale_at_token(
+                token_idx=i,
+                seq_len=self.seq_len,
+                cfg_scale=cfg_scale,
+            )
 
             # Denoise
             prev_token = sample_func(
@@ -620,20 +601,12 @@ if __name__ == "__main__":
 
     # Constant CFG checks.
     cfg_scale = 3.0
-    cfg_first = model.cfg_scale_at_token(token_idx=0, seq_len=seq_len, cfg_scale=cfg_scale, schedule="constant")
-    cfg_last = model.cfg_scale_at_token(token_idx=seq_len - 1, seq_len=seq_len, cfg_scale=cfg_scale, schedule="constant")
-    cfg_single = model.cfg_scale_at_token(token_idx=0, seq_len=1, cfg_scale=cfg_scale, schedule="constant")
+    cfg_first = model.cfg_scale_at_token(token_idx=0, seq_len=seq_len, cfg_scale=cfg_scale)
+    cfg_last = model.cfg_scale_at_token(token_idx=seq_len - 1, seq_len=seq_len, cfg_scale=cfg_scale)
+    cfg_single = model.cfg_scale_at_token(token_idx=0, seq_len=1, cfg_scale=cfg_scale)
     assert cfg_first == cfg_scale, f"Expected cfg_first={cfg_scale}, got {cfg_first}"
     assert cfg_last == cfg_scale, f"Expected cfg_last={cfg_scale}, got {cfg_last}"
     assert cfg_single == cfg_scale, f"Expected cfg_single={cfg_scale}, got {cfg_single}"
-
-    # Linear decay CFG checks.
-    cfg_decay_first = model.cfg_scale_at_token(token_idx=0, seq_len=seq_len, cfg_scale=cfg_scale, schedule="linear_decay")
-    cfg_decay_last = model.cfg_scale_at_token(token_idx=seq_len - 1, seq_len=seq_len, cfg_scale=cfg_scale, schedule="linear_decay")
-    cfg_decay_single = model.cfg_scale_at_token(token_idx=0, seq_len=1, cfg_scale=cfg_scale, schedule="linear_decay")
-    assert cfg_decay_first == cfg_scale, f"Expected cfg_decay_first={cfg_scale}, got {cfg_decay_first}"
-    assert cfg_decay_last == 1.0, f"Expected cfg_decay_last=1.0, got {cfg_decay_last}"
-    assert cfg_decay_single == cfg_scale, f"Expected cfg_decay_single={cfg_scale}, got {cfg_decay_single}"
 
     start_positions = []
     original_forward_recurrent = model.forward_recurrent

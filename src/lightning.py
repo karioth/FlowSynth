@@ -98,8 +98,6 @@ class LitModule(L.LightningModule):
         num_inference_steps: int = 250,
         scheduler=None,
         ardiff_step: int | None = None,
-        cfg_schedule: str = "constant",
-        cfg_mask_prob: float = 0.0,
     ):
         self.eval()
         if scheduler is None:
@@ -109,7 +107,7 @@ class LitModule(L.LightningModule):
             ardiff_step=ardiff_step,
         )
         scheduler.set_timesteps(num_inference_steps, device=self.device)
-        return self.model.sample_with_cfg(prompt, cfg_scale, scheduler, cfg_schedule=cfg_schedule, cfg_mask_prob=cfg_mask_prob)
+        return self.model.sample_with_cfg(prompt, cfg_scale, scheduler)
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
         hparams = cast(Any, self.hparams)

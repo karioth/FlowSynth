@@ -48,7 +48,7 @@ srun python train.py \
   --devices "$TASKS_PER_NODE" \
   --data-root "$DATA_ROOT" \
   --silence-latent-path "$SILENCE_LATENT_PATH" \
-  --results-dir audio_logs/AUDIO_AR_DiT_B_125e_xpred \
+  --results-dir audio_logs/AUDIO_AR_DiT_B_125e_xpred_nonmonotone \
   --model AR-DiT-B \
   --batch-size 128 \
   --prediction-type x_pred \

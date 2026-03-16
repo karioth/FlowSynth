@@ -15,15 +15,15 @@ set -e
 NUM_GPUS=2
 STEPS=100
 SEED=0
-BATCH_SIZE=16
+BATCH_SIZE=64
 PRECISION=bf16-mixed
 
 PROMPT_CSV="/share/users/student/f/friverossego/FlowSynth/audiocaps-test.csv"
-OUT_ROOT="/share/users/student/f/friverossego/FlowSynth/samples_audio_final_per_model/flowsynth"
+OUT_ROOT="/share/users/student/f/friverossego/FlowSynth/samples_ardit_xpred_exp"
 
 FLOWSYNTH_ROOT="/share/users/student/f/friverossego/FlowSynth"
 
-AR_DIT_XPRED_CKPT="/share/users/student/f/friverossego/FlowSynth/audio_logs/AUDIO_AR_DiT_B_125e_xpred/checkpoints/last.ckpt"
+AR_DIT_XPRED_CKPT="/share/users/student/f/friverossego/FlowSynth/audio_logs/AUDIO_AR_DiT_B_125e_xpred_nonmonotone/checkpoints/last.ckpt"
 
 SCRATCH_BASE="/share/users/student/f/friverossego/tmp"
 export TMPDIR="${SLURM_TMPDIR:-$SCRATCH_BASE/tmp}"
@@ -41,6 +41,14 @@ spack load miniconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate jamendo
 
+PYTHON_BIN="$(command -v python)"
+if [[ -z "${PYTHON_BIN}" ]]; then
+    echo "python not found after conda activation."
+    exit 1
+fi
+echo "Using python: ${PYTHON_BIN}"
+"${PYTHON_BIN}" -c "import torch; print('torch', torch.__version__)"
+
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     MASTER_PORT_BASE=$((10000 + SLURM_JOB_ID % 20000))
 else
@@ -51,19 +59,19 @@ mkdir -p "$OUT_ROOT"
 RUN_INDEX=0
 
 run_flowsynth () {
-    local tag="$1"
-    local ckpt="$2"
-    local cfg="$3"
+    local ckpt="$1"
+    local cfg="$2"
+    local ardiff_step="$3"
+    local outdir="$4"
     local port=$((MASTER_PORT_BASE + RUN_INDEX))
     RUN_INDEX=$((RUN_INDEX + 1))
-    local outdir="${OUT_ROOT}/${tag}/cfg${cfg}"
-    mkdir -p "$outdir"
 
     cd "$FLOWSYNTH_ROOT"
-    torchrun --nproc_per_node="${NUM_GPUS}" --master_port "${port}" sample.py \
+    "${PYTHON_BIN}" -m torch.distributed.run --nproc_per_node="${NUM_GPUS}" --master_port "${port}" sample.py \
         --checkpoint "$ckpt" \
         --prompt-csv "$PROMPT_CSV" \
         --cfg-scale "$cfg" \
+        --ardiff-step "$ardiff_step" \
         --num-inference-steps "$STEPS" \
         --batch-size "$BATCH_SIZE" \
         --precision "$PRECISION" \
@@ -71,15 +79,24 @@ run_flowsynth () {
         --output-dir "$outdir"
 }
 
-for cfg in 1 3; do
-    run_flowsynth "AUDIO_AR_DiT_B_125e_xpred" "$AR_DIT_XPRED_CKPT" "$cfg"
-done
-
 cd "$FLOWSYNTH_ROOT"
-for cfg in 1 3; do
-    gen_dir="${OUT_ROOT}/AUDIO_AR_DiT_B_125e_xpred/cfg${cfg}"
-    echo "Evaluating: $gen_dir"
-    python evaluate.py --gen "$gen_dir"
+
+for cfg in 4 5 6 7; do
+    for ardiff_step in 1 3 5 7; do
+        tag="cfg${cfg}_ardiff${ardiff_step}"
+        outdir="${OUT_ROOT}/${tag}"
+        mkdir -p "$outdir"
+
+        if [[ "$cfg" -eq 4 && "$ardiff_step" -eq 1 ]]; then
+            echo "=== Skipping generation (already exists): $tag ==="
+        else
+            echo "=== Running: $tag ==="
+            run_flowsynth "$AR_DIT_XPRED_CKPT" "$cfg" "$ardiff_step" "$outdir"
+        fi
+
+        echo "=== Evaluating: $tag ==="
+        "${PYTHON_BIN}" evaluate.py --gen "$outdir" --workers 1
+    done
 done
 
 echo "Done. Outputs at: $OUT_ROOT"
