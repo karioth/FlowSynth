@@ -4,9 +4,9 @@
 #SBATCH --gpus-per-node=H100.80gb:2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=350G
-#SBATCH --time=48:00:00
-#SBATCH --job-name=flowsynth_sample_xpred_ardit
+#SBATCH --mem=150G
+#SBATCH --time=18:00:00
+#SBATCH --job-name=flowsynth_sample_vpred_ardit
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
 
@@ -19,11 +19,10 @@ BATCH_SIZE=64
 PRECISION=bf16-mixed
 
 PROMPT_CSV="/share/users/student/f/friverossego/FlowSynth/audiocaps-test.csv"
-OUT_ROOT="/share/users/student/f/friverossego/FlowSynth/samples_ardit_xpred_exp"
+OUT_ROOT="/share/users/student/f/friverossego/FlowSynth/samples_ardit_vpred_exp"
 
 FLOWSYNTH_ROOT="/share/users/student/f/friverossego/FlowSynth"
-
-AR_DIT_XPRED_CKPT="/share/users/student/f/friverossego/FlowSynth/audio_logs/AUDIO_AR_DiT_B_125e_xpred_nonmonotone/checkpoints/last.ckpt"
+AR_DIT_XPRED_CKPT="/share/users/student/f/friverossego/FlowSynth/audio_logs/AUDIO_AR_DiT_B_125e_vpred_nonmonotone/checkpoints/last.ckpt"
 
 SCRATCH_BASE="/share/users/student/f/friverossego/tmp"
 export TMPDIR="${SLURM_TMPDIR:-$SCRATCH_BASE/tmp}"
@@ -81,19 +80,16 @@ run_flowsynth () {
 
 cd "$FLOWSYNTH_ROOT"
 
-cfg=6
-ARDIFF_STEPS=(0 1)
-for step in $(seq 5 5 100); do
-    ARDIFF_STEPS+=("$step")
-done
+CFGS=(7 8 9)
+ARDIFF_STEP=1
 
-for ardiff_step in "${ARDIFF_STEPS[@]}"; do
-    tag="cfg${cfg}_ardiff${ardiff_step}"
+for cfg in "${CFGS[@]}"; do
+    tag="cfg${cfg}_ardiff${ARDIFF_STEP}"
     outdir="${OUT_ROOT}/${tag}"
     mkdir -p "$outdir"
 
     echo "=== Running: $tag ==="
-    run_flowsynth "$AR_DIT_XPRED_CKPT" "$cfg" "$ardiff_step" "$outdir"
+    run_flowsynth "$AR_DIT_XPRED_CKPT" "$cfg" "$ARDIFF_STEP" "$outdir"
 
     echo "=== Evaluating: $tag ==="
     "${PYTHON_BIN}" evaluate.py --gen "$outdir" --workers 1

@@ -6,13 +6,13 @@
 #SBATCH --cpus-per-task=8                   # 8 CPUs per GPU (because 1 task == 1 GPU)
 #SBATCH --mem=350G
 #SBATCH --time=48:00:00
-#SBATCH --job-name=Audio_ardit_xpred
+#SBATCH --job-name=Audio_ardit_vpred
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
 
 echo "Running in shell: $SHELL"
 
-PROJECT_ROOT="/share/users/student/f/friverossego/EqSynth"
+PROJECT_ROOT="/share/users/student/f/friverossego/FlowSynth"
 DATA_ROOT="/share/users/student/f/friverossego/datasets"
 SILENCE_LATENT_PATH="silence_samples/silence_10s_dacvae.pt"
 
@@ -48,8 +48,7 @@ srun python train.py \
   --devices "$TASKS_PER_NODE" \
   --data-root "$DATA_ROOT" \
   --silence-latent-path "$SILENCE_LATENT_PATH" \
-  --results-dir audio_logs/AUDIO_AR_DiT_B_125e_xpred_nonmonotone \
+  --results-dir audio_logs/AUDIO_AR_DiT_B_125e_vpred_nonmonotone \
   --model AR-DiT-B \
   --batch-size 128 \
-  --prediction-type x_pred \
   --epochs 125 
