@@ -66,13 +66,13 @@ def main(args):
         clap_dim=args.clap_dim,
         t5_dim=args.t5_dim,
         prompt_seq_len=args.prompt_seq_len,
-        prediction_type=args.prediction_type,
         batch_mul=args.batch_mul,
         mask_prob=args.mask_prob,
         lr=args.lr,
         weight_decay=args.weight_decay,
         lr_scheduler=args.lr_scheduler,
         lr_warmup_steps=args.lr_warmup_steps,
+        is_gated=args.gated_attn,
     )
 
     ckpt_dir = os.path.join(args.results_dir, "checkpoints")
@@ -155,17 +155,10 @@ if __name__ == "__main__":
                    help="T5 hidden state dimension")
     p.add_argument("--prompt-seq-len", type=int, default=69,
                    help="Prompt sequence length (1 CLAP + max T5 tokens)")
-    p.add_argument(
-        "--prediction-type",
-        type=str,
-        default="flow",
-        help=(
-            "Training target type. 'flow' keeps velocity prediction. "
-            "'x_pred' supervises clean x only for AR-DiT; other models keep flow behavior."
-        ),
-    )
     p.add_argument("--batch-mul", type=int, default=2)
     p.add_argument("--mask-prob", type=float, default=0.7)
+    p.add_argument("--gated-attn", action="store_true",
+                   help="Enable gated attention in model blocks.")
 
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--epochs", type=int, default=80)

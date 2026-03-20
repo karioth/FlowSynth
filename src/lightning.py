@@ -27,7 +27,6 @@ class LitModule(L.LightningModule):
         clap_dim: int = 512,
         t5_dim: int = 1024,
         prompt_seq_len: int = 69,
-        prediction_type: str = "flow",
         t_m: float = 0.0,
         t_s: float = 1.0,
         batch_mul: int = 4,
@@ -36,6 +35,8 @@ class LitModule(L.LightningModule):
         weight_decay: float = 0.01,
         lr_scheduler: str = "cosine",
         lr_warmup_steps: int = 1000,
+        is_gated: bool = False,
+        **kwargs,
     ):
         super().__init__()
         if seq_len is None:
@@ -48,31 +49,32 @@ class LitModule(L.LightningModule):
             clap_dim=clap_dim,
             t5_dim=t5_dim,
             prompt_seq_len=prompt_seq_len,
+            is_gated=is_gated,
         )
         self.model = All_models[model_name](**model_kwargs)
 
         if isinstance(self.model, Transformer):
             self.noise_scheduler = FlowMatchingSchedulerTransformer(
-                prediction_type=prediction_type,
+
                 t_m=t_m,
                 t_s=t_s,
                 batch_mul=batch_mul,
             )
         elif isinstance(self.model, DiT):
             self.noise_scheduler = FlowMatchingSchedulerDiT(
-                prediction_type=prediction_type,
+
                 t_m=t_m,
                 t_s=t_s,
             )
         elif isinstance(self.model, AR_DiT):
             self.noise_scheduler = FlowMatchingSchedulerARDiff(
-                prediction_type=prediction_type,
+
                 t_m=t_m,
                 t_s=t_s,
             )
         elif isinstance(self.model, MaskedARTransformer):
             self.noise_scheduler = FlowMatchingSchedulerMaskedAR(
-                prediction_type=prediction_type,
+
                 t_m=t_m,
                 t_s=t_s,
                 mask_prob=mask_prob,

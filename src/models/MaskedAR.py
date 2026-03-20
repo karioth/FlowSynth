@@ -483,9 +483,10 @@ def MaskedAR_Large(**kwargs) -> MaskedARTransformer:
 
 def MaskedAR_Medium(**kwargs) -> MaskedARTransformer:
     return MaskedARTransformer(
-        depth=24,
+        depth=32,
         hidden_size=1024,
         num_heads=16,
+        diffusion_depth=4,
         intermediate_size=2688,
         diffusion_intermediate_size=2688,
         **kwargs,
@@ -539,12 +540,25 @@ def MaskedAR_B(**kwargs) -> MaskedARTransformer:
     )
 
 
+def MaskedAR_H2(**kwargs) -> MaskedARTransformer:
+    return MaskedARTransformer(
+        depth=32,
+        hidden_size=1280,
+        num_heads=20,
+        diffusion_depth=4,
+        intermediate_size=5120,
+        diffusion_intermediate_size=5120,
+        **kwargs,
+    )
+
+
 MaskedAR_models = {
     "MaskedAR-XL": MaskedAR_XL,
     "MaskedAR-Large": MaskedAR_Large,
     "MaskedAR-Medium": MaskedAR_Medium,
     "MaskedAR-Base": MaskedAR_Base,
     "MaskedAR-H": MaskedAR_H,
+    "MaskedAR-H2": MaskedAR_H2,
     "MaskedAR-L": MaskedAR_L,
     "MaskedAR-B": MaskedAR_B,
 }

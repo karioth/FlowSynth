@@ -49,7 +49,6 @@ class FlowMatchingBase(nn.Module):
 
     def __init__(
         self,
-        prediction_type: str = "flow",
         t_m: float = 0.0,
         t_s: float = 1.0,
     ):
@@ -57,7 +56,6 @@ class FlowMatchingBase(nn.Module):
         self.init_noise_sigma = 1.0
         self.num_inference_steps = None
         self.timesteps = None
-        self.prediction_type = prediction_type
         self.t_m = t_m
         self.t_s = t_s
 
@@ -284,27 +282,6 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
         if needs_reset:
             self._invalidate_schedule_cache()
 
-    def _uses_x_pred(self) -> bool:
-        return self.prediction_type == "x_pred"
-
-    def _convert_model_output_to_velocity(
-        self,
-        model_output: torch.Tensor,
-        sample: torch.Tensor,
-        timesteps: torch.Tensor,
-    ) -> torch.Tensor:
-        if not self._uses_x_pred():
-            return model_output
-
-        t = timesteps.to(device=sample.device, dtype=sample.dtype)
-        if torch.any(t <= 0):
-            raise ValueError(
-                "x_pred conversion requires strictly positive timesteps."
-            )
-        t = t.unsqueeze(-1)
-
-        return (sample - model_output.to(dtype=sample.dtype)) / t
-
     def get_losses(self, model, x0_seq, prompt) -> torch.Tensor:
         bsz, seq_len = x0_seq.shape[:2]
         noise = torch.randn_like(x0_seq)
@@ -314,10 +291,6 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
 
         x_noisy = self.add_noise(x0_seq, noise, t_vec)
         model_output = model(x_noisy, t_vec, prompt=prompt)
-        if self._uses_x_pred():
-            weight = t_vec.clamp(min=0.05).unsqueeze(-1).pow(-2)
-            return (weight * (model_output - x0_seq).pow(2)).float().mean()
-
         velocity = self.get_velocity(x0_seq, noise, t_vec)
         return F.mse_loss(model_output.float(), velocity.float())
 
@@ -454,17 +427,7 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
                 step_index_by_frame=step_index_by_frame,
             )
 
-            if self._uses_x_pred():
-                model_velocity = model_output.clone()
-                update_idx = frame_update_mask_bool
-                if torch.any(update_idx):
-                    model_velocity[:, update_idx] = self._convert_model_output_to_velocity(
-                        model_output[:, update_idx],
-                        current_sample[:, update_idx],
-                        t_prev[:, update_idx],
-                    ).to(dtype=model_velocity.dtype)
-            else:
-                model_velocity = model_output
+            model_velocity = model_output
 
             # Freeze frames whose timestep did not change.
             model_velocity = (

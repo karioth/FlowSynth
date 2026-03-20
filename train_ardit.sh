@@ -1,12 +1,13 @@
 #!/bin/bash
 #SBATCH -p gpu
 #SBATCH --nodes=1                           # e.g. 1 for l40s and H100, 2 for A100 
-#SBATCH --gpus-per-node=H100.80gb:2         # e.g. H100.80gb:8, A100:4 or L40S:4
-#SBATCH --ntasks-per-node=2                 # set = GPUs per node
+#SBATCH --gpus-per-node=4                   # e.g. H100.80gb:8, A100:4 or L40S:4
+#SBATCH --ntasks-per-node=4                 # set = GPUs per node
 #SBATCH --cpus-per-task=8                   # 8 CPUs per GPU (because 1 task == 1 GPU)
 #SBATCH --mem=350G
 #SBATCH --time=48:00:00
-#SBATCH --job-name=Audio_ardit_vpred
+#SBATCH --job-name=Audio_ardit_vpred_larger
+#SBATCH -x klpsy-1
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
 
@@ -48,7 +49,8 @@ srun python train.py \
   --devices "$TASKS_PER_NODE" \
   --data-root "$DATA_ROOT" \
   --silence-latent-path "$SILENCE_LATENT_PATH" \
-  --results-dir audio_logs/AUDIO_AR_DiT_B_125e_vpred_nonmonotone \
-  --model AR-DiT-B \
-  --batch-size 128 \
-  --epochs 125 
+  --results-dir audio_logs/AUDIO_AR_DiT_Medium_gated \
+  --model AR-DiT-Medium \
+  --gated-attn \
+  --batch-size 64 \
+  --epochs 250
