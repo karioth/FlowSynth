@@ -53,4 +53,5 @@ srun python train.py \
   --model AR-DiT-Medium \
   --gated-attn \
   --batch-size 64 \
-  --epochs 250
+  --epochs 250 \
+  --resume /share/users/student/f/friverossego/FlowSynth/audio_logs/AUDIO_AR_DiT_Medium_gated/checkpoints/last.ckpt

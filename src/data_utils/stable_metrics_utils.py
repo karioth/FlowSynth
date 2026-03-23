@@ -32,6 +32,7 @@ from src.data_utils.evaluation_utils import (
 
 
 AUDIOCAPS_REQUIRED_COLUMNS = ("audiocap_id", "youtube_id", "caption")
+CLAP_PRE_RESAMPLE_SR = 16000
 
 CLAP_SCORE_REGISTRY_MODELS = (
     "clap-2023",
@@ -205,6 +206,30 @@ def _extract_text_embeddings(model: ModelLoader, texts: list[str]) -> torch.Tens
     return _as_tensor(text_emb).detach().float().cpu()
 
 
+def _load_audio_for_clap_score(path: Path, target_sr: int) -> np.ndarray:
+    wav, sr = torchaudio.load(str(path))
+    if wav.ndim == 1:
+        wav = wav.unsqueeze(0)
+    wav = wav.mean(dim=0, keepdim=True)
+
+    if sr != CLAP_PRE_RESAMPLE_SR:
+        wav = torchaudio.functional.resample(
+            wav,
+            orig_freq=sr,
+            new_freq=CLAP_PRE_RESAMPLE_SR,
+        )
+        sr = CLAP_PRE_RESAMPLE_SR
+
+    if sr != target_sr:
+        wav = torchaudio.functional.resample(
+            wav,
+            orig_freq=sr,
+            new_freq=target_sr,
+        )
+
+    return wav.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
+
+
 def compute_clap_score(
     pairs: Sequence[AudioCapsPair],
     registry: ModelRegistry,
@@ -242,7 +267,7 @@ def compute_clap_score(
     score_sum = 0.0
     count = 0
     for pair in tqdm(pairs, desc="CLAP score", unit="file"):
-        audio = load_audio_with_torchaudio(pair.gen_path, target_sr=model.sr, audio_len=None)
+        audio = _load_audio_for_clap_score(pair.gen_path, target_sr=model.sr)
         with torch.no_grad():
             audio_emb = model.get_embedding(audio)
         audio_emb = np.asarray(audio_emb, dtype=np.float32)

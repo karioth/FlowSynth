@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p gpu
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=H100.80gb:1
+#SBATCH --gpus-per-node=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=150G
@@ -49,18 +49,10 @@ cd "$FLOWSYNTH_ROOT"
 
 python sample_tangoflux.py \
   --prompt-csv "$PROMPT_CSV" \
-  --output-dir "$OUT_ROOT/tangoflux/cfg1" \
+  --output-dir "$OUT_ROOT/tangoflux/cfg4_5" \
   --steps "$STEPS" \
   --audio-length 10 \
-  --guidance-scale 1.0 \
+  --guidance-scale 4.5 \
   --seed "$SEED" \
   --precision "$PRECISION"
 
-python sample_tangoflux.py \
-  --prompt-csv "$PROMPT_CSV" \
-  --output-dir "$OUT_ROOT/tangoflux/cfg3" \
-  --steps "$STEPS" \
-  --audio-length 10 \
-  --guidance-scale 3.0 \
-  --seed "$SEED" \
-  --precision "$PRECISION"

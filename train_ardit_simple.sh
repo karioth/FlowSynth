@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH -p gpu
-#SBATCH --nodes=1                           # e.g. 1 for l40s and H100, 2 for A100 
-#SBATCH --gpus-per-node=4                   # e.g. H100.80gb:8, A100:4 or L40S:4
-#SBATCH --ntasks-per-node=4                 # set = GPUs per node
-#SBATCH --cpus-per-task=8                   # 8 CPUs per GPU (because 1 task == 1 GPU)
+#SBATCH --nodes=1
+#SBATCH --gpus-per-node=2
+#SBATCH --ntasks-per-node=2
+#SBATCH --cpus-per-task=5
 #SBATCH --mem=350G
 #SBATCH --time=48:00:00
-#SBATCH --job-name=Audio_maskedar
+#SBATCH --job-name=Audio_ardit_simple_B
 #SBATCH -x klpsy-1
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
@@ -49,9 +49,7 @@ srun python train.py \
   --devices "$TASKS_PER_NODE" \
   --data-root "$DATA_ROOT" \
   --silence-latent-path "$SILENCE_LATENT_PATH" \
-  --results-dir audio_logs/AUDIO_MaskedAR_Medium_gated \
-  --model MaskedAR-Medium \
-  --gated-attn \
-  --batch-size 64 \
-  --epochs 250 \
-  --resume /share/users/student/f/friverossego/FlowSynth/audio_logs/AUDIO_MaskedAR_Medium_gated/checkpoints/last.ckpt
+  --results-dir audio_logs/AUDIO_AR_DiT_Simple_B \
+  --model AR-DiT-Simple-B \
+  --batch-size 128 \
+  --epochs 125

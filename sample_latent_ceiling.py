@@ -5,8 +5,10 @@ Generate latent-ceiling audio for AudioCaps evaluation.
 For each valid AudioCaps test row:
 - Resolve GT audio from youtube_id in --gt-dir.
 - Group rows by youtube_id.
-- Encode each GT audio once in the selected VAE backend.
-- Draw N posterior samples (default: 5), mapped deterministically to sorted audiocap_id rows.
+- Encode each GT audio once in the selected VAE/VQ backend.
+- For continuous VAEs, draw N posterior samples (default: 5), mapped deterministically to
+  sorted audiocap_id rows.
+- For deterministic VQ codecs, reuse the same reconstruction for each row in the group.
 - Save outputs as {audiocap_id}.wav so evaluate.py can run unchanged.
 """
 
@@ -37,6 +39,7 @@ DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "samples_audio_vae_ceilings"
 DEFAULT_DACVAE_WEIGHTS = "facebook/dacvae-watermarked"
 DEFAULT_AUDIOLDM_MODEL_ID = "cvssp/audioldm2"
 DEFAULT_STABLE_AUDIO_MODEL_ID = "stabilityai/stable-audio-open-1.0"
+DEFAULT_AUDIOGEN_MODEL_ID = "facebook/audiogen-medium"
 
 REQUIRED_COLUMNS = ("audiocap_id", "youtube_id", "caption")
 
@@ -90,14 +93,14 @@ def parse_args() -> argparse.Namespace:
         "--vae",
         type=str,
         default="both",
-        choices=("dacvae", "audioldm2", "stableaudio", "both"),
-        help="Which backend(s) to generate.",
+        choices=("dacvae", "audioldm2", "stableaudio", "audiogen", "both"),
+        help="Which backend(s) to generate. 'both' is kept for backward compatibility and runs all backends.",
     )
     parser.add_argument(
         "--samples-per-audio",
         type=int,
         default=5,
-        help="Number of posterior samples per GT audio/youtube_id group.",
+        help="Number of outputs per GT audio/youtube_id group.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Base random seed.")
     parser.add_argument(
@@ -133,6 +136,25 @@ def parse_args() -> argparse.Namespace:
         "--stable-audio-local-files-only",
         action="store_true",
         help="Load Stable Audio components with local_files_only=True.",
+    )
+    parser.add_argument(
+        "--audiogen-model-id",
+        type=str,
+        default=DEFAULT_AUDIOGEN_MODEL_ID,
+        help=(
+            "AudioGen model id used to load the same EnCodec/VQ compression model as sample_audiogen.py "
+            f"(default: {DEFAULT_AUDIOGEN_MODEL_ID})."
+        ),
+    )
+    parser.add_argument(
+        "--audiogen-num-codebooks",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "AudioGen codebook counts to evaluate. Default: run all available counts for the selected model "
+            "(e.g. 1 2 3 4 for facebook/audiogen-medium)."
+        ),
     )
     parser.add_argument("--local-rank", "--local_rank", type=int, default=None, help=argparse.SUPPRESS)
     limit_group = parser.add_mutually_exclusive_group()
@@ -315,6 +337,32 @@ def _collect_target_filenames(grouped_rows: list[list[PromptRow]]) -> set[str]:
                 raise SystemExit(f"Duplicate output filename target detected: {filename}")
             names.add(filename)
     return names
+
+
+def _resolve_audiogen_num_codebooks(requested: list[int] | None, total_codebooks: int) -> list[int]:
+    if total_codebooks < 1:
+        raise SystemExit(f"AudioGen codec reports invalid total_codebooks={total_codebooks}.")
+
+    if requested is None or len(requested) == 0:
+        return list(range(1, total_codebooks + 1))
+
+    resolved: list[int] = []
+    seen: set[int] = set()
+    for n_q in requested:
+        if n_q < 1 or n_q > total_codebooks:
+            raise SystemExit(
+                f"Invalid AudioGen codebook count {n_q}. Allowed range: [1, {total_codebooks}]"
+            )
+        if n_q not in seen:
+            seen.add(n_q)
+            resolved.append(int(n_q))
+    return resolved
+
+
+def _audiogen_backend_name(num_codebooks: int, total_codebooks: int) -> str:
+    if num_codebooks == total_codebooks:
+        return "audiogen"
+    return f"audiogen_nq{num_codebooks}"
 
 
 def _validate_output_dir_state(output_dir: Path, target_filenames: set[str]) -> None:
@@ -605,6 +653,73 @@ def _generate_stableaudio(
     return generated
 
 
+@torch.no_grad()
+def _generate_audiogen(
+    grouped_rows: list[list[PromptRow]],
+    output_dir: Path,
+    device: torch.device,
+    compression_model,
+    num_codebooks: int,
+) -> int:
+    total_codebooks = int(compression_model.total_codebooks)
+    codec_device = _module_device(compression_model, device)
+    codec_sample_rate = int(compression_model.sample_rate)
+    codec_channels = int(compression_model.channels)
+    compression_model.set_num_codebooks(int(num_codebooks))
+
+    print(
+        f"[audiogen] sample_rate={codec_sample_rate} channels={codec_channels} "
+        f"codebooks={num_codebooks}/{total_codebooks}"
+    )
+
+    generated = 0
+    for rows in tqdm(grouped_rows, desc=f"AudioGen latent ceiling nq={num_codebooks}", unit="group"):
+        gt_path = rows[0].gt_path
+        wav_cpu, sample_rate = _load_mono_wav(gt_path)
+
+        if sample_rate != codec_sample_rate:
+            wav_cpu = torchaudio.functional.resample(
+                wav_cpu,
+                orig_freq=sample_rate,
+                new_freq=codec_sample_rate,
+            )
+
+        wav_input = wav_cpu.unsqueeze(0)  # [1, 1, T]
+        if codec_channels == 1:
+            pass
+        elif codec_channels > 1:
+            wav_input = wav_input.expand(-1, codec_channels, -1).contiguous()
+        else:
+            raise ValueError(f"AudioGen compression model reported invalid channel count: {codec_channels}")
+
+        target_len = int(wav_input.shape[-1])
+        wav_input = wav_input.to(device=codec_device, dtype=torch.float32)
+
+        codes, scale = compression_model.encode(wav_input)
+        decoded = compression_model.decode(codes, scale)
+        if decoded.shape[-1] < target_len:
+            decoded = F.pad(decoded, (0, target_len - decoded.shape[-1]))
+        elif decoded.shape[-1] > target_len:
+            decoded = decoded[..., :target_len]
+
+        out_audio = _to_saveable_audio(decoded)
+        # AudioGen's codec path is deterministic for a fixed waveform and codebook count,
+        # so each caption row for the same youtube_id gets the same reconstruction.
+        for row in rows:
+            out_path = output_dir / f"{row.audiocap_id}.wav"
+            torchaudio.save(str(out_path), out_audio, sample_rate=codec_sample_rate, format="wav")
+            generated += 1
+
+    return generated
+
+
+def _load_audiogen_compression_model(model_id: str, device: torch.device):
+    from audiocraft.models.loaders import load_compression_model
+
+    print(f"[audiogen] Loading compression model from: {model_id}")
+    return load_compression_model(model_id, device=str(device))
+
+
 def _write_summary_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fp:
@@ -626,7 +741,7 @@ def _get_dist_context(local_rank_arg: int | None) -> tuple[int, int, int]:
 
 def _resolve_backends(mode: str) -> list[str]:
     if mode == "both":
-        return ["dacvae", "audioldm2", "stableaudio"]
+        return ["dacvae", "audioldm2", "stableaudio", "audiogen"]
     return [mode]
 
 
@@ -686,8 +801,77 @@ def main() -> None:
 
     backends = _resolve_backends(args.vae)
     for backend in backends:
+        if backend == "audiogen":
+            compression_model = _load_audiogen_compression_model(args.audiogen_model_id, device)
+            total_codebooks = int(compression_model.total_codebooks)
+            audiogen_num_codebooks = _resolve_audiogen_num_codebooks(
+                args.audiogen_num_codebooks,
+                total_codebooks=total_codebooks,
+            )
+
+            for num_codebooks in audiogen_num_codebooks:
+                backend_name = _audiogen_backend_name(num_codebooks, total_codebooks)
+                output_dir = output_root / backend_name / run_tag
+                _validate_output_dir_state(output_dir, target_filenames)
+
+                generated = _generate_audiogen(
+                    grouped_rows=grouped_rows,
+                    output_dir=output_dir,
+                    device=device,
+                    compression_model=compression_model,
+                    num_codebooks=num_codebooks,
+                )
+
+                actual_files = {p.name for p in output_dir.glob("*.wav")}
+                missing_files = shard_target_filenames.difference(actual_files)
+                extra_files = actual_files.difference(target_filenames)  # full set: other ranks' files are fine
+                if missing_files or extra_files:
+                    raise SystemExit(
+                        f"{backend_name}: output verification failed. "
+                        f"missing={len(missing_files)} extra={len(extra_files)}"
+                    )
+                if generated != shard_selected_rows:
+                    raise SystemExit(
+                        f"{backend_name}: generated count mismatch. expected={shard_selected_rows} got={generated}"
+                    )
+
+                summary = {
+                    "backend": backend_name,
+                    "run_tag": run_tag,
+                    "rank": rank,
+                    "world_size": world_size,
+                    "seed": int(args.seed),
+                    "samples_per_audio": int(args.samples_per_audio),
+                    "output_dir": str(output_dir),
+                    "prompts_csv": str(prompts_csv),
+                    "gt_dir": str(gt_dir),
+                    "selected_youtube_groups": int(len(grouped_rows)),
+                    "selected_rows": int(shard_selected_rows),
+                    "generated_files": int(generated),
+                    "limit_youtube": int(args.limit_youtube) if args.limit_youtube is not None else None,
+                    "limit_rows": int(args.limit_rows) if args.limit_rows is not None else None,
+                    "device": str(device),
+                    "prompt_stats": asdict(prompt_stats),
+                    "audiogen_model_id": args.audiogen_model_id,
+                    "audiogen_num_codebooks": int(num_codebooks),
+                    "audiogen_total_codebooks": int(total_codebooks),
+                    "deterministic_decode_per_group": True,
+                    "decode_calls": int(len(grouped_rows)),
+                }
+
+                rank_suffix = f"_rank{rank}" if world_size > 1 else ""
+                summary_path = output_dir.parent / f"{output_dir.name}_generation{rank_suffix}.json"
+                _write_summary_json(summary_path, summary)
+                print(f"[{backend_name}] generated {generated} files at: {output_dir}")
+                print(f"[{backend_name}] summary JSON: {summary_path}")
+
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            continue
+
         output_dir = output_root / backend / run_tag
         _validate_output_dir_state(output_dir, target_filenames)
+        summary_extra: dict[str, object] = {}
 
         if backend == "dacvae":
             generated = _generate_dacvae(
@@ -698,6 +882,7 @@ def main() -> None:
                 device=device,
                 dacvae_weights=args.dacvae_weights,
             )
+            summary_extra["dacvae_weights"] = args.dacvae_weights
         elif backend == "audioldm2":
             generated = _generate_audioldm2(
                 grouped_rows=grouped_rows,
@@ -708,6 +893,8 @@ def main() -> None:
                 model_id=args.audioldm_model_id,
                 local_files_only=args.audioldm_local_files_only,
             )
+            summary_extra["audioldm_model_id"] = args.audioldm_model_id
+            summary_extra["audioldm_local_files_only"] = bool(args.audioldm_local_files_only)
         elif backend == "stableaudio":
             generated = _generate_stableaudio(
                 grouped_rows=grouped_rows,
@@ -718,6 +905,8 @@ def main() -> None:
                 model_id=args.stable_audio_model_id,
                 local_files_only=args.stable_audio_local_files_only,
             )
+            summary_extra["stable_audio_model_id"] = args.stable_audio_model_id
+            summary_extra["stable_audio_local_files_only"] = bool(args.stable_audio_local_files_only)
         else:
             raise SystemExit(f"Unsupported backend: {backend}")
 
@@ -752,14 +941,7 @@ def main() -> None:
             "device": str(device),
             "prompt_stats": asdict(prompt_stats),
         }
-        if backend == "dacvae":
-            summary["dacvae_weights"] = args.dacvae_weights
-        elif backend == "audioldm2":
-            summary["audioldm_model_id"] = args.audioldm_model_id
-            summary["audioldm_local_files_only"] = bool(args.audioldm_local_files_only)
-        elif backend == "stableaudio":
-            summary["stable_audio_model_id"] = args.stable_audio_model_id
-            summary["stable_audio_local_files_only"] = bool(args.stable_audio_local_files_only)
+        summary.update(summary_extra)
 
         rank_suffix = f"_rank{rank}" if world_size > 1 else ""
         summary_path = output_dir.parent / f"{output_dir.name}_generation{rank_suffix}.json"
