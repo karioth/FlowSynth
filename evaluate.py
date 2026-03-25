@@ -38,7 +38,7 @@ from src.data_utils.stable_metrics_utils import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_PROMPTS_CSV = PROJECT_ROOT / "audiocaps-test.csv"
-DEFAULT_GT_DIR = PROJECT_ROOT / "audio_samples" / "audiocaps_test_gt"
+DEFAULT_GT_DIR = PROJECT_ROOT / "samples_audiocaps_test"
 
 
 def parse_args() -> argparse.Namespace:

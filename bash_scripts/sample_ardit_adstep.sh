@@ -1,12 +1,13 @@
 #!/bin/bash
 #SBATCH -p gpu
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=H100.80gb:2
+#SBATCH --gpus-per-node=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=150G
-#SBATCH --time=18:00:00
-#SBATCH --job-name=flowsynth_sample_vpred_ardit
+#SBATCH --time=48:00:00
+#SBATCH --job-name=sample_arditsimple
+#SBATCH -x klpsy-1
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
 
@@ -19,10 +20,10 @@ BATCH_SIZE=64
 PRECISION=bf16-mixed
 
 PROMPT_CSV="/share/users/student/f/friverossego/FlowSynth/audiocaps-test.csv"
-OUT_ROOT="/share/users/student/f/friverossego/FlowSynth/samples_ardit_vpred_exp"
+OUT_ROOT="/share/users/student/f/friverossego/FlowSynth/samples_ardit_adstep_exp"
 
 FLOWSYNTH_ROOT="/share/users/student/f/friverossego/FlowSynth"
-AR_DIT_XPRED_CKPT="/share/users/student/f/friverossego/FlowSynth/audio_logs/AUDIO_AR_DiT_B_125e_vpred_nonmonotone/checkpoints/last.ckpt"
+AR_DIT_CKPT="/share/users/student/f/friverossego/FlowSynth/audio_logs/AUDIO_AR_DiT_B_125e_vpred_nonmonotone/checkpoints/last.ckpt"
 
 SCRATCH_BASE="/share/users/student/f/friverossego/tmp"
 export TMPDIR="${SLURM_TMPDIR:-$SCRATCH_BASE/tmp}"
@@ -40,14 +41,6 @@ spack load miniconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate jamendo
 
-PYTHON_BIN="$(command -v python)"
-if [[ -z "${PYTHON_BIN}" ]]; then
-    echo "python not found after conda activation."
-    exit 1
-fi
-echo "Using python: ${PYTHON_BIN}"
-"${PYTHON_BIN}" -c "import torch; print('torch', torch.__version__)"
-
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     MASTER_PORT_BASE=$((10000 + SLURM_JOB_ID % 20000))
 else
@@ -55,44 +48,35 @@ else
 fi
 
 mkdir -p "$OUT_ROOT"
+
+cd "$FLOWSYNTH_ROOT"
+
+CFG=1
+ARDIFF_STEPS=(0 1 2 3 4 5 7 10 15 20 25 30 35 40 45 50 60 70 80 90 100)
 RUN_INDEX=0
 
-run_flowsynth () {
-    local ckpt="$1"
-    local cfg="$2"
-    local ardiff_step="$3"
-    local outdir="$4"
-    local port=$((MASTER_PORT_BASE + RUN_INDEX))
+for ARDIFF_STEP in "${ARDIFF_STEPS[@]}"; do
+    TAG="cfg${CFG}_ad${ARDIFF_STEP}"
+    OUTDIR="${OUT_ROOT}/${TAG}"
+    MASTER_PORT=$((MASTER_PORT_BASE + RUN_INDEX))
     RUN_INDEX=$((RUN_INDEX + 1))
 
-    cd "$FLOWSYNTH_ROOT"
-    "${PYTHON_BIN}" -m torch.distributed.run --nproc_per_node="${NUM_GPUS}" --master_port "${port}" sample.py \
-        --checkpoint "$ckpt" \
+    mkdir -p "$OUTDIR"
+
+    echo "=== Running: $TAG ==="
+    torchrun --nproc_per_node="${NUM_GPUS}" --master_port "${MASTER_PORT}" sample.py \
+        --checkpoint "$AR_DIT_CKPT" \
         --prompt-csv "$PROMPT_CSV" \
-        --cfg-scale "$cfg" \
-        --ardiff-step "$ardiff_step" \
+        --cfg-scale "$CFG" \
+        --ardiff-step "$ARDIFF_STEP" \
         --num-inference-steps "$STEPS" \
         --batch-size "$BATCH_SIZE" \
         --precision "$PRECISION" \
         --seed "$SEED" \
-        --output-dir "$outdir"
-}
+        --output-dir "$OUTDIR"
 
-cd "$FLOWSYNTH_ROOT"
-
-CFGS=(7 8 9)
-ARDIFF_STEP=1
-
-for cfg in "${CFGS[@]}"; do
-    tag="cfg${cfg}_ardiff${ARDIFF_STEP}"
-    outdir="${OUT_ROOT}/${tag}"
-    mkdir -p "$outdir"
-
-    echo "=== Running: $tag ==="
-    run_flowsynth "$AR_DIT_XPRED_CKPT" "$cfg" "$ARDIFF_STEP" "$outdir"
-
-    echo "=== Evaluating: $tag ==="
-    "${PYTHON_BIN}" evaluate.py --gen "$outdir" --workers 1
+    echo "=== Evaluating: $TAG ==="
+    python evaluate.py --gen "$OUTDIR" --workers 1
 done
 
 echo "Done. Outputs at: $OUT_ROOT"

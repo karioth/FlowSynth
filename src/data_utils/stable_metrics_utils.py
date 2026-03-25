@@ -19,6 +19,7 @@ import pandas as pd
 import pyloudnorm as pyln
 import torch
 import torch.nn.functional as F
+import torchaudio
 from tqdm.auto import tqdm
 
 from kadtk.model_loader import CLAPLaionModel, CLAPModel, ModelLoader, PaSSTModel

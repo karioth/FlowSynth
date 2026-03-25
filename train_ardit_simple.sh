@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=5
 #SBATCH --mem=350G
-#SBATCH --time=48:00:00
+#SBATCH --time=10:00:00
 #SBATCH --job-name=Audio_ardit_simple_B
 #SBATCH -x klpsy-1
 #SBATCH -o %x_%j.out
@@ -52,4 +52,5 @@ srun python train.py \
   --results-dir audio_logs/AUDIO_AR_DiT_Simple_B \
   --model AR-DiT-Simple-B \
   --batch-size 128 \
-  --epochs 125
+  --epochs 125 \
+  --resume /share/users/student/f/friverossego/FlowSynth/audio_logs/AUDIO_AR_DiT_Simple_B/checkpoints/last.ckpt

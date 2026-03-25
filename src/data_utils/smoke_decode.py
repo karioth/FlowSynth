@@ -8,8 +8,8 @@ import torchaudio
 import dacvae
 
 
-DEFAULT_IN_DIR = "/share/users/student/f/friverossego/datasets/AudioCaps/train/latents"
-DEFAULT_OUT_DIR = "/share/users/student/f/friverossego/LatentLM/smoketest"
+DEFAULT_IN_DIR = "/share/users/student/f/friverossego/datasets/AudioCaps/train/latents_bf16/00"
+DEFAULT_OUT_DIR = "/share/users/student/f/friverossego/FlowSynth/smoketest"
 
 
 def _save_audio(path: str, wav: torch.Tensor, sample_rate: int) -> None:
@@ -120,7 +120,8 @@ def main() -> None:
         latent_length = int(payload["latent_length"])
         posterior = posterior[..., :latent_length]
 
-    posterior = posterior.to(device)
+    source_dtype = posterior.dtype
+    posterior = posterior.to(device=device, dtype=torch.float32)
     mean, logvar = torch.chunk(posterior, 2, dim=1)
     std = torch.exp(0.5 * logvar)
     sample = mean + std * torch.randn_like(std)
@@ -151,6 +152,7 @@ def main() -> None:
     else:
         print("caption: <manifest not found>")
 
+    print("posterior_dtype:", source_dtype, "->", posterior.dtype)
     print("saved", mean_path)
     print("saved", sample_path)
 
