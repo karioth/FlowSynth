@@ -130,7 +130,7 @@ if __name__ == "__main__":
     p.add_argument(
         "--data-root",
         type=str,
-        default="/share/users/student/f/friverossego/datasets",
+        default="datasets",
         help=(
             "Manifest mode: base directory for relative manifest entries. "
             "Consolidated mode: recursively searched for 'consolidated_latents_bf16.pt'."

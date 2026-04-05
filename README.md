@@ -1,4 +1,4 @@
-# EqSynth (PyTorch)
+# FlowSynth (PyTorch)
 
 Audio-only research codebase for modeling DACVAE latents as sequences (B, T, C).
 
@@ -65,7 +65,7 @@ python train.py \
 ```
 
 ### 3) Sample
-Run from the repo root (`EqSynth/`).
+Run from the repo root (`FlowSynth/`).
 
 Single-process:
 ```bash

@@ -1,7 +1,7 @@
 """
 AudioCaps-specific CLAP score and PaSST KLD utilities.
 
-These metrics intentionally reuse models from EqSynth's existing evaluation
+These metrics intentionally reuse models from FlowSynth's existing evaluation
 registry (src.data_utils.evaluation_utils.build_model_registry).
 """
 

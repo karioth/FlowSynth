@@ -283,19 +283,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--manifest-paths",
         type=str,
-        default="/share/users/student/f/friverossego/datasets/audio_manifest_train.jsonl",
+        default="datasets/audio_manifest_train.jsonl",
         help="Comma-separated JSONL manifest paths",
     )
     parser.add_argument(
         "--data-root",
         type=str,
-        default="/share/users/student/f/friverossego/datasets",
+        default="datasets",
         help="Base path for relative manifest entries",
     )
     parser.add_argument(
         "--silence-latent-path",
         type=str,
-        default="/share/users/student/f/friverossego/LatentLM/silence_samples/silence_10s_dacvae.pt",
+        default="silence_samples/silence_10s_dacvae.pt",
         help="Path to silence latent",
     )
     parser.add_argument("--seq-len", type=int, default=251)
