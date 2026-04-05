@@ -29,3 +29,10 @@ ardit_animation.py
 # IDE / tools
 ***unset***
 .opencode
+.opencode/
+bash_scripts/
+.gitignore
+AGENTS.md
+
+# Local sampling helpers
+sample_*.py
