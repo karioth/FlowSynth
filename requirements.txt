@@ -1,0 +1,46 @@
+# FlowSynth dependencies for:
+# - preprocess.py
+# - train.py
+# - sample.py
+# - evaluate.py
+#
+# Recommended Python: 3.10 or 3.11.
+# Install torch / torchaudio in a way that matches your local CUDA or CPU setup,
+# then install the rest of this file.
+#
+# `flash-attn` is a real project dependency, but whether it installs cleanly is
+# mostly a local torch/CUDA/toolchain question rather than something specific to
+# this repo.
+
+torch
+torchaudio
+
+lightning
+torchdata
+diffusers
+
+transformers
+datasets
+sentencepiece
+safetensors
+
+numpy<2
+pandas
+scipy
+tqdm
+
+soundfile
+librosa
+pyloudnorm
+descript-audiotools
+
+packaging
+ninja
+flash-attn
+
+laion-clap
+timm
+numba
+kadtk
+
+dacvae @ git+https://github.com/facebookresearch/dacvae.git
