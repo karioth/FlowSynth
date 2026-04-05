@@ -144,7 +144,7 @@ if __name__ == "__main__":
     )
     p.add_argument("--results-dir", type=str, default="results_audio")
 
-    p.add_argument("--model", type=str, default="MaskedAR-L")
+    p.add_argument("--model", type=str, default="MaskSynth-L")
     p.add_argument("--seq-len", type=int, default=251,
                    help="Audio sequence length (fixed at 251 for DACVAE)")
     p.add_argument("--latent-size", type=int, default=128,

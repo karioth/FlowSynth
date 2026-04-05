@@ -55,7 +55,7 @@ python train.py \
   --manifest-paths /path/to/datasets/audio_manifest_train.jsonl \
   --data-root /path/to/datasets \
   --results-dir logs/run_01 \
-  --model MaskedAR-L \
+  --model MaskSynth-L \
   --seq-len 251 \
   --latent-size 128 \
   --batch-size 32 \

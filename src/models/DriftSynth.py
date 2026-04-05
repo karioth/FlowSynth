@@ -10,13 +10,13 @@ from .modules.layers import FinalLayer, TransformerBlock
 
 
 @dataclass
-class ARDiTInferenceState:
+class DriftSynthInferenceState:
     inference_params: InferenceParams
     prompt_cached: bool = False
     cached_frames: int = 0
 
 
-class AR_DiT(nn.Module):
+class DriftSynth(nn.Module):
     """
     Simplified autoregressive DiT without AdaLN modulation.
     Time conditioning is an additive bias applied to latent tokens.
@@ -139,7 +139,7 @@ class AR_DiT(nn.Module):
     ) -> torch.Tensor:
         if timesteps.dim() != 2:
             raise ValueError(
-                f"AR_DiT forward_recurrent expects tokenwise timesteps with shape (B, T), got {tuple(timesteps.shape)}."
+                f"DriftSynth forward_recurrent expects tokenwise timesteps with shape (B, T), got {tuple(timesteps.shape)}."
             )
         if hidden_states.shape[:2] != timesteps.shape:
             raise ValueError(
@@ -181,7 +181,7 @@ class AR_DiT(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         del kwargs
-        assert timesteps.dim() == 2, "AR_DiT expects tokenwise timesteps with shape (B, T)"
+        assert timesteps.dim() == 2, "DriftSynth expects tokenwise timesteps with shape (B, T)"
 
         hidden_states = self.input_embedder(hidden_states)
         prompt_seq = self.prompt_embedder(
@@ -231,7 +231,7 @@ class AR_DiT(nn.Module):
         prompt_drop_ids[batch_size:] = 1
 
         batch_size = prompt["clap"].shape[0]
-        inference_state = ARDiTInferenceState(
+        inference_state = DriftSynthInferenceState(
             inference_params=InferenceParams(
                 max_seqlen=self.prompt_seq_len + self.seq_len,
                 max_batch_size=batch_size,
@@ -264,7 +264,7 @@ class AR_DiT(nn.Module):
         prompt: dict,
         cfg_scale: float,
         prompt_drop_ids: torch.Tensor | None = None,
-        inference_state: ARDiTInferenceState | None = None,
+        inference_state: DriftSynthInferenceState | None = None,
         frame_update_mask_bool: torch.Tensor | None = None,
         step_index_by_frame: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -281,7 +281,7 @@ class AR_DiT(nn.Module):
         else:
             if timesteps.dim() != 2:
                 raise ValueError(
-                    f"AR_DiT inference expects tokenwise timesteps with shape (B, T), got {tuple(timesteps.shape)}."
+                    f"DriftSynth inference expects tokenwise timesteps with shape (B, T), got {tuple(timesteps.shape)}."
                 )
             if timesteps.shape != combined.shape[:2]:
                 raise ValueError(
@@ -359,45 +359,45 @@ class AR_DiT(nn.Module):
 
 
 #################################################################################
-#                                  AR-DiT Configs                               #
+#                                DriftSynth Configs                             #
 #################################################################################
 
 
-def AR_DiT_XL(**kwargs) -> AR_DiT:
-    return AR_DiT(depth=24, hidden_size=2048, num_heads=16, intermediate_size=5440, **kwargs)
+def DriftSynth_XL(**kwargs) -> DriftSynth:
+    return DriftSynth(depth=24, hidden_size=2048, num_heads=16, intermediate_size=5440, **kwargs)
 
 
-def AR_DiT_Large(**kwargs) -> AR_DiT:
-    return AR_DiT(depth=24, hidden_size=1536, num_heads=12, intermediate_size=4096, **kwargs)
+def DriftSynth_Large(**kwargs) -> DriftSynth:
+    return DriftSynth(depth=24, hidden_size=1536, num_heads=12, intermediate_size=4096, **kwargs)
 
 
-def AR_DiT_Medium(**kwargs) -> AR_DiT:
-    return AR_DiT(depth=32, hidden_size=1024, num_heads=16, intermediate_size=2688, **kwargs)
+def DriftSynth_Medium(**kwargs) -> DriftSynth:
+    return DriftSynth(depth=32, hidden_size=1024, num_heads=16, intermediate_size=2688, **kwargs)
 
 
-def AR_DiT_Base(**kwargs) -> AR_DiT:
-    return AR_DiT(depth=12, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)
+def DriftSynth_Base(**kwargs) -> DriftSynth:
+    return DriftSynth(depth=12, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)
 
 
-def AR_DiT_B(**kwargs) -> AR_DiT:
-    return AR_DiT(depth=24, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)
+def DriftSynth_B(**kwargs) -> DriftSynth:
+    return DriftSynth(depth=24, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)
 
 
-def AR_DiT_H(**kwargs) -> AR_DiT:
-    return AR_DiT(depth=32, hidden_size=1280, num_heads=20, intermediate_size=5120, **kwargs)
+def DriftSynth_H(**kwargs) -> DriftSynth:
+    return DriftSynth(depth=32, hidden_size=1280, num_heads=20, intermediate_size=5120, **kwargs)
 
 
-AR_DiT_models = {
-    "AR-DiT-XL": AR_DiT_XL,
-    "AR-DiT-Large": AR_DiT_Large,
-    "AR-DiT-Medium": AR_DiT_Medium,
-    "AR-DiT-Base": AR_DiT_Base,
-    "AR-DiT-B": AR_DiT_B,
-    "AR-DiT-H": AR_DiT_H,
-    "AR-DiT-Simple-XL": AR_DiT_XL,
-    "AR-DiT-Simple-Large": AR_DiT_Large,
-    "AR-DiT-Simple-Medium": AR_DiT_Medium,
-    "AR-DiT-Simple-Base": AR_DiT_Base,
-    "AR-DiT-Simple-B": AR_DiT_B,
-    "AR-DiT-Simple-H": AR_DiT_H,
+DriftSynth_models = {
+    "DriftSynth-XL": DriftSynth_XL,
+    "DriftSynth-Large": DriftSynth_Large,
+    "DriftSynth-Medium": DriftSynth_Medium,
+    "DriftSynth-Base": DriftSynth_Base,
+    "DriftSynth-B": DriftSynth_B,
+    "DriftSynth-H": DriftSynth_H,
+    "DriftSynth-Simple-XL": DriftSynth_XL,
+    "DriftSynth-Simple-Large": DriftSynth_Large,
+    "DriftSynth-Simple-Medium": DriftSynth_Medium,
+    "DriftSynth-Simple-Base": DriftSynth_Base,
+    "DriftSynth-Simple-B": DriftSynth_B,
+    "DriftSynth-Simple-H": DriftSynth_H,
 }

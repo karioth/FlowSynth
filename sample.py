@@ -57,7 +57,7 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "Override AR-Diff sampling lag for AR_DiT checkpoints. "
+            "Override AR-Diff sampling lag for DriftSynth checkpoints. "
             "When omitted, uses the scheduler default."
         ),
     )

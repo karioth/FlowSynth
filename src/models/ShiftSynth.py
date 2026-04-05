@@ -9,14 +9,9 @@ from .modules.embeddings import TimestepEmbedder, PromptEmbedder
 from .modules.layers import AdaLNMLPBlock, FinalLayer, TransformerBlock
 
 
-class MaskedARTransformer(nn.Module):
+class ShiftSynth(nn.Module):
     """
-    Masked AR Transformer with a causal backbone and diffusion head.
-
-    Key difference from vanilla Transformer:
-    - Same-position readout (position t predicts token t, not t+1)
-    - Uses [MASK] token replacement instead of shifting to prevent leakage
-    - Loss computed only at masked positions (handled by scheduler)
+    ShiftSynth with a causal conditioning stack and a diffusion head.
     """
 
     def __init__(
@@ -66,9 +61,6 @@ class MaskedARTransformer(nn.Module):
         )
         self.prompt_seq_len = prompt_seq_len
 
-        # Learnable [MASK] token
-        self.mask_token = nn.Parameter(torch.empty(1, 1, hidden_size))
-
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
@@ -111,132 +103,76 @@ class MaskedARTransformer(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
-        nn.init.normal_(self.mask_token, std=0.02)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         timesteps: torch.Tensor,
         x_start: torch.Tensor,
-        prompt: dict,
-        mask: torch.Tensor,
-        flat_mask_indices: torch.Tensor,
+        prompt: dict[str, torch.Tensor],
         batch_mul: int = 1,
         **kwargs,
     ) -> torch.Tensor:
         """
-        Forward pass of MaskedARTransformer (optimized).
-
-        Args:
-            hidden_states: (num_masked * batch_mul, C) noisy tokens at masked positions
-            timesteps: (num_masked * batch_mul,) diffusion timesteps
-            x_start: (B, T, C) clean latent tokens (full sequences for backbone)
+        Forward pass of ShiftSynth.
+        hidden_states: (B, T, C) tensor of noisy latent tokens
+        x_start: (B, T, C) tensor of clean latent tokens
+        timesteps: (B, T) or (B,) tensor of diffusion timesteps
         prompt: dict with clap/t5 embeddings
-            mask: (B, T) boolean tensor, True = masked position
-            flat_mask_indices: (num_masked,) indices into flattened B*T
-            batch_mul: batch multiplier for multiple timestep samples
         """
         del kwargs
-        bsz, seq_len, _ = x_start.shape
+        conditioning = self.forward_parallel(x_start, prompt)
+        conditioning = conditioning.repeat_interleave(batch_mul, dim=0)
+        return self.forward_diffusion(hidden_states, timesteps, conditioning)
 
-        # 1. Run backbone on full sequences
-        conditioning = self.forward_backbone(x_start, prompt, mask)  # (B, T, hidden)
-
-        # 2. Gather conditioning at masked positions
-        cond_flat = conditioning.reshape(bsz * seq_len, -1)  # (B*T, hidden)
-        cond_masked = cond_flat[flat_mask_indices]  # (num_masked, hidden)
-
-        # 3. Repeat for batch_mul
-        cond_masked = cond_masked.repeat_interleave(batch_mul, dim=0)  # (num_masked * batch_mul, hidden)
-
-        # 4. Run diffusion head on packed tokens (seq_len=1 per token)
-        return self.forward_diffusion(
-            hidden_states.unsqueeze(1),  # (N, 1, C)
-            timesteps.unsqueeze(1),       # (N, 1)
-            cond_masked.unsqueeze(1),     # (N, 1, hidden)
-        ).squeeze(1)  # (N, C)
-
-    def forward_backbone(
+    def forward_parallel(
         self,
         hidden_states: torch.Tensor,
-        prompt: dict,
-        mask: torch.Tensor,
+        prompt: dict[str, torch.Tensor],
+        prompt_drop_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Causal backbone with masked input.
-
-        Unlike vanilla Transformer which shifts tokens, we replace masked positions
-        with the [MASK] token. Position t outputs conditioning for predicting token t.
-        """
         hidden_states = self.input_embedder(hidden_states)
-
-        # Replace masked positions with [MASK] token
-        mask_expanded = mask.unsqueeze(-1).expand_as(hidden_states)
-        hidden_states = torch.where(
-            mask_expanded,
-            self.mask_token.expand_as(hidden_states),
-            hidden_states,
+        prompt_seq = self.prompt_embedder(
+            prompt,
+            self.training,
+            force_drop_ids=prompt_drop_ids,
         )
-
-        # Prepend prompt embedding (no shift needed - same position readout)
-        prompt_seq = self.prompt_embedder(prompt, self.training)
-        hidden_states = torch.cat((prompt_seq, hidden_states), dim=1)
-
+        hidden_states = torch.cat((prompt_seq, hidden_states[:, :-1]), dim=1)
         for block in self.blocks:
             hidden_states = block(hidden_states)
-
-        hidden_states = hidden_states[:, self.prompt_seq_len :, :]
-        return self.condition_layer(hidden_states)
+        hidden_states = self.condition_layer(hidden_states)
+        return hidden_states[:, self.prompt_seq_len - 1 :, :]
 
     def forward_recurrent(
         self,
-        hidden_states: dict | torch.Tensor | None,
+        hidden_states: dict[str, torch.Tensor] | torch.Tensor,
         start_pos: int = 0,
         inference_params: InferenceParams | None = None,
-        append_mask: bool = False,
         prompt_drop_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Recurrent forward for inference with KV caching.
-
-        Args:
-            hidden_states: Either prompt ids/embeddings (at start_pos=0), predicted tokens, or None to use mask_token
-            start_pos: Current position in sequence
-            inference_params: KV cache container
-            append_mask: If True, append a [MASK] token to query the next position in the same pass
-        """
         start_pos = int(start_pos)
         if start_pos == 0:
-            # First position: embed the prompt
-            hidden_states = self.prompt_embedder(
-                hidden_states,
+            if not isinstance(hidden_states, dict):
+                raise ValueError("Prompt data is required when start_pos is 0.")
+            prompt_data = hidden_states
+            token_states = self.prompt_embedder(
+                prompt_data,
                 self.training,
                 force_drop_ids=prompt_drop_ids,
             )
-        elif hidden_states is None:
-            # Query with mask token (matches training)
-            batch_size = inference_params.max_batch_size
-            hidden_states = self.mask_token.expand(batch_size, 1, -1)
         else:
-            # Subsequent positions: embed the predicted token
-            if hidden_states.dim() == 2:
-                # It's a raw latent token (B, C) -> (B, 1, C)
-                hidden_states = hidden_states.unsqueeze(1)
-            hidden_states = self.input_embedder(hidden_states)
-
-        if append_mask:
-            # Append [MASK] in hidden space to get the next-position readout in one pass.
-            batch_size = hidden_states.shape[0]
-            mask_token = self.mask_token.expand(batch_size, 1, -1)
-            hidden_states = torch.cat((hidden_states, mask_token), dim=1)
+            if not torch.is_tensor(hidden_states):
+                raise ValueError("Latent tokens are required when start_pos is not 0.")
+            token_states = self.input_embedder(hidden_states)
 
         if inference_params is not None:
             inference_params.seqlen_offset = start_pos
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, inference_params=inference_params)
+            token_states = block(token_states, inference_params=inference_params)
 
-        return self.condition_layer(hidden_states)
+        token_states = self.condition_layer(token_states[:, -1:])
+        return token_states
 
     def forward_diffusion(
         self,
@@ -244,10 +180,6 @@ class MaskedARTransformer(nn.Module):
         timesteps: torch.Tensor,
         conditioning: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Diffusion head for denoising.
-        Same as vanilla Transformer.
-        """
         bsz, seq_len = timesteps.shape if timesteps.dim() > 1 else (timesteps.shape[0], 1)
         time_emb = self.time_embedder(timesteps.view(-1)).view(bsz, seq_len, -1)
         conditioning = conditioning + time_emb
@@ -262,24 +194,21 @@ class MaskedARTransformer(nn.Module):
     @staticmethod
     def cfg_scale_at_token(token_idx: int, seq_len: int, cfg_scale: float) -> float:
         """
-        Standard constant CFG scale.
+        Position-dependent standard CFG scale s_i for token index i.
+
+        Currently kept constant to match audiontp constant CFG behavior.
         """
         del token_idx, seq_len
         return float(cfg_scale)
+        # Scheduled behavior disabled for now:
+        # if seq_len <= 1:
+        #     return float(cfg_scale)
+        # pos = float(token_idx) / float(seq_len - 1)
+        # return 1.0 + (float(cfg_scale) - 1.0) * (1.0 - pos)
 
-    def sample_with_cfg(
-        self,
-        prompt: dict,
-        cfg_scale: float,
-        sample_func,
-    ) -> torch.Tensor:
+    def sample_with_cfg(self, prompt: dict[str, torch.Tensor], cfg_scale: float, sample_func) -> torch.Tensor:
         """
-        AR sampling with classifier-free guidance.
-
-        For each position:
-          1) Pass [MASK] through backbone to get conditioning.
-          2) Denoise via diffusion head.
-          3) Cache the predicted token for the next iteration.
+        Sample with CFG using a constant standard guidance scale.
         """
         # Build [cond, uncond] prompt batch for classifier-free guidance.
         clap = prompt["clap"]
@@ -310,12 +239,11 @@ class MaskedARTransformer(nn.Module):
 
         batch_size = prompt["clap"].shape[0]
         inference_params = InferenceParams(
-            max_seqlen=self.seq_len + self.prompt_seq_len,
+            max_seqlen=self.seq_len + self.prompt_seq_len - 1,
             max_batch_size=batch_size,
         )
-
+        prev_token = None
         samples = []
-
         for i in range(self.seq_len):
             noise = torch.randn(
                 batch_size,
@@ -324,31 +252,19 @@ class MaskedARTransformer(nn.Module):
                 device=self.device,
                 dtype=self.dtype,
             )
-
             if i == 0:
-                # First iteration: pass prompts for both conditional and unconditional batches.
                 recurrent_input = prompt_input
             else:
-                # Cache the previous predicted token (CFG: duplicate batch).
+                if prev_token is None:
+                    raise RuntimeError("Expected prev_token to be set before recurrent steps.")
                 recurrent_input = torch.cat([prev_token, prev_token], dim=0)
-
-            # Single pass: write token_i to KV and append [MASK] at i+1; the mask KV
-            # is overwritten by the generated token on the next step.
             conditioning = self.forward_recurrent(
                 recurrent_input,
-                start_pos=0 if i == 0 else self.prompt_seq_len + i - 1,
+                start_pos=0 if i == 0 else self.prompt_seq_len - 1 + i,
                 inference_params=inference_params,
-                append_mask=True,
                 prompt_drop_ids=prompt_drop_ids,
             )
-            conditioning = conditioning[:, -1:]  # Mask position readout.
-            guidance_scale = self.cfg_scale_at_token(
-                token_idx=i,
-                seq_len=self.seq_len,
-                cfg_scale=cfg_scale,
-            )
-
-            # Denoise
+            guidance_scale = self.cfg_scale_at_token(token_idx=i, seq_len=self.seq_len, cfg_scale=cfg_scale)
             prev_token = sample_func(
                 functools.partial(
                     self.forward_with_cfg,
@@ -359,8 +275,7 @@ class MaskedARTransformer(nn.Module):
             )
             prev_token, _ = prev_token.chunk(2, dim=0)
             samples.append(prev_token)
-
-        return torch.cat(samples, dim=1)
+        return torch.cat(samples, 1)
 
     def forward_with_cfg(
         self,
@@ -370,7 +285,7 @@ class MaskedARTransformer(nn.Module):
         guidance_scale: float,
     ) -> torch.Tensor:
         """
-        Forward pass with classifier-free guidance.
+        Forward pass of ShiftSynth, batching unconditional and conditional paths for CFG.
         guidance_scale follows standard CFG form:
             eps = eps_u + guidance_scale * (eps_c - eps_u).
         """
@@ -383,12 +298,12 @@ class MaskedARTransformer(nn.Module):
 
 
 #################################################################################
-#                           MaskedAR Transformer Configs                        #
+#                                ShiftSynth Configs                             #
 #################################################################################
 
 
-def MaskedAR_XL(**kwargs) -> MaskedARTransformer:
-    return MaskedARTransformer(
+def ShiftSynth_XL(**kwargs) -> ShiftSynth:
+    return ShiftSynth(
         depth=24,
         hidden_size=2048,
         num_heads=16,
@@ -397,9 +312,8 @@ def MaskedAR_XL(**kwargs) -> MaskedARTransformer:
         **kwargs,
     )
 
-
-def MaskedAR_Large(**kwargs) -> MaskedARTransformer:
-    return MaskedARTransformer(
+def ShiftSynth_Large(**kwargs) -> ShiftSynth:
+    return ShiftSynth(
         depth=24,
         hidden_size=1536,
         num_heads=12,
@@ -408,21 +322,18 @@ def MaskedAR_Large(**kwargs) -> MaskedARTransformer:
         **kwargs,
     )
 
-
-def MaskedAR_Medium(**kwargs) -> MaskedARTransformer:
-    return MaskedARTransformer(
-        depth=32,
+def ShiftSynth_Medium(**kwargs) -> ShiftSynth:
+    return ShiftSynth(
+        depth=24,
         hidden_size=1024,
         num_heads=16,
-        diffusion_depth=4,
         intermediate_size=2688,
         diffusion_intermediate_size=2688,
         **kwargs,
     )
 
-
-def MaskedAR_Base(**kwargs) -> MaskedARTransformer:
-    return MaskedARTransformer(
+def ShiftSynth_Base(**kwargs) -> ShiftSynth:
+    return ShiftSynth(
         depth=12,
         hidden_size=768,
         num_heads=12,
@@ -431,9 +342,8 @@ def MaskedAR_Base(**kwargs) -> MaskedARTransformer:
         **kwargs,
     )
 
-
-def MaskedAR_H(**kwargs) -> MaskedARTransformer:
-    return MaskedARTransformer(
+def ShiftSynth_H(**kwargs) -> ShiftSynth:
+    return ShiftSynth(
         depth=40,
         hidden_size=1280,
         num_heads=20,
@@ -443,9 +353,8 @@ def MaskedAR_H(**kwargs) -> MaskedARTransformer:
         **kwargs,
     )
 
-
-def MaskedAR_L(**kwargs) -> MaskedARTransformer:
-    return MaskedARTransformer(
+def ShiftSynth_L(**kwargs) -> ShiftSynth:
+    return ShiftSynth(
         depth=32,
         hidden_size=1024,
         num_heads=16,
@@ -455,40 +364,26 @@ def MaskedAR_L(**kwargs) -> MaskedARTransformer:
         **kwargs,
     )
 
-
-def MaskedAR_B(**kwargs) -> MaskedARTransformer:
-    return MaskedARTransformer(
+def ShiftSynth_B(**kwargs) -> ShiftSynth:
+    return ShiftSynth(
         depth=24,
         hidden_size=768,
         num_heads=12,
         diffusion_depth=3,
-        intermediate_size=2048,
+        intermediate_size=2048, ## should be 2048 to match expanding mlps
         diffusion_intermediate_size=2048,
         **kwargs,
     )
 
 
-def MaskedAR_H2(**kwargs) -> MaskedARTransformer:
-    return MaskedARTransformer(
-        depth=32,
-        hidden_size=1280,
-        num_heads=20,
-        diffusion_depth=4,
-        intermediate_size=5120,
-        diffusion_intermediate_size=5120,
-        **kwargs,
-    )
-
-
-MaskedAR_models = {
-    "MaskedAR-XL": MaskedAR_XL,
-    "MaskedAR-Large": MaskedAR_Large,
-    "MaskedAR-Medium": MaskedAR_Medium,
-    "MaskedAR-Base": MaskedAR_Base,
-    "MaskedAR-H": MaskedAR_H,
-    "MaskedAR-H2": MaskedAR_H2,
-    "MaskedAR-L": MaskedAR_L,
-    "MaskedAR-B": MaskedAR_B,
+ShiftSynth_models = {
+    "ShiftSynth-XL": ShiftSynth_XL,
+    "ShiftSynth-Large": ShiftSynth_Large,
+    "ShiftSynth-Medium": ShiftSynth_Medium,
+    "ShiftSynth-Base": ShiftSynth_Base,
+    "ShiftSynth-H": ShiftSynth_H,
+    "ShiftSynth-L": ShiftSynth_L,
+    "ShiftSynth-B": ShiftSynth_B,
 }
 
 
@@ -496,7 +391,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
-        raise SystemExit("CUDA required for MaskedAR flash-attn test")
+        raise SystemExit("CUDA required for ShiftSynth flash-attn test")
     batch_size = 2
     seq_len = 3
     in_channels = 6
@@ -507,7 +402,7 @@ if __name__ == "__main__":
     t5_dim = 12
     max_t5_tokens = prompt_seq_len - 1
 
-    model = MaskedARTransformer(
+    model = ShiftSynth(
         seq_len=seq_len,
         in_channels=in_channels,
         hidden_size=hidden_size,
@@ -534,11 +429,9 @@ if __name__ == "__main__":
         "t5_mask": t5_mask,
     }
 
-    hidden_states = torch.randn(batch_size, seq_len, in_channels, device=device, dtype=torch.bfloat16)
-    mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
-    mask[0, 0] = True
+    x_start = torch.randn(batch_size, seq_len, in_channels, device=device, dtype=torch.bfloat16)
     with autocast:
-        conditioning = model.forward_backbone(hidden_states, prompt, mask)
+        conditioning = model.forward_parallel(x_start, prompt)
     assert conditioning.shape == (batch_size, seq_len, hidden_size), f"Unexpected conditioning shape: {conditioning.shape}"
 
     # Constant CFG checks.
@@ -553,13 +446,12 @@ if __name__ == "__main__":
     start_positions = []
     original_forward_recurrent = model.forward_recurrent
 
-    def _record_forward_recurrent(hidden_states, start_pos=0, inference_params=None, append_mask=False, prompt_drop_ids=None):
+    def _record_forward_recurrent(hidden_states, start_pos=0, inference_params=None, prompt_drop_ids=None):
         start_positions.append(int(start_pos))
         return original_forward_recurrent(
             hidden_states,
             start_pos=start_pos,
             inference_params=inference_params,
-            append_mask=append_mask,
             prompt_drop_ids=prompt_drop_ids,
         )
 
@@ -571,10 +463,10 @@ if __name__ == "__main__":
 
     with autocast:
         samples = model.sample_with_cfg(prompt, cfg_scale=1.0, sample_func=sample_func)
-    expected_positions = [0] + [model.prompt_seq_len + i - 1 for i in range(1, seq_len)]
+    expected_positions = [0] + [model.prompt_seq_len - 1 + i for i in range(1, seq_len)]
     assert start_positions == expected_positions, f"Unexpected start_pos trace: {start_positions}"
     assert samples.shape == (batch_size, seq_len, in_channels), f"Unexpected sample shape: {samples.shape}"
 
-    print("PASS: MaskedAR conditioning shapes OK")
-    print("PASS: MaskedAR start_pos offsets OK")
-    print("PASS: MaskedAR sample_with_cfg OK")
+    print("PASS: ShiftSynth conditioning shapes OK")
+    print("PASS: ShiftSynth start_pos offsets OK")
+    print("PASS: ShiftSynth sample_with_cfg OK")

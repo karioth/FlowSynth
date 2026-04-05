@@ -21,7 +21,7 @@ This file guides agentic coding in this repository.
 - `preprocess.py`: Unified audio + caption preprocessing entry point.
 - `src/lightning.py`: `LitModule` and optimizer/scheduler setup.
 - `src/utils.py`: Posterior sampling helper.
-- `src/models/`: Transformer/DiT/AR_DiT/MaskedAR implementations.
+- `src/models/`: ShiftSynth/DiT/DriftSynth/MaskSynth implementations.
 - `src/data_utils/`: datamodule (`datamodule.py`), helpers (`utils.py`), preprocessing helpers.
 
 ## Build / lint / test
@@ -30,7 +30,7 @@ This file guides agentic coding in this repository.
 - Preprocess (AudioCaps + WavCaps, builds merged manifest):
   `python preprocess.py --data-root /path/to/datasets --wavcaps-json-root /path/to/jsons --wavcaps-audio-root /path/to/audio --device cpu --processes 8`
 - Audio training:
-  `python train.py --manifest-paths /path/to/manifest.jsonl --data-root /path/to/datasets --results-dir logs/... --model MaskedAR-L --seq-len 251 --latent-size 128 ...`
+  `python train.py --manifest-paths /path/to/manifest.jsonl --data-root /path/to/datasets --results-dir logs/... --model MaskSynth-L --seq-len 251 --latent-size 128 ...`
 - Audio sampling:
   `python sample.py --checkpoint logs/.../last.ckpt --output-dir audio_samples --text "Prompt"`
 
@@ -79,7 +79,7 @@ This file guides agentic coding in this repository.
 - Annotate public functions/classes and non-trivial helpers; avoid over-annotating small local variables.
 
 ### Naming
-- Classes: `PascalCase` (e.g., `MaskedARTransformer`).
+- Classes: `PascalCase` (e.g., `MaskSynth`).
 - Functions/variables: `snake_case`.
 - Constants: `UPPER_SNAKE_CASE` (e.g., `DEFAULT_CLASS_LABELS`).
 - Keep argument names consistent with CLI flags (e.g., `seq_len`, `latent_size`).

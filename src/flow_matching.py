@@ -196,7 +196,7 @@ class FlowMatchingSchedulerDiT(FlowMatchingBase):
         return F.mse_loss(model_output.float(), velocity.float())
 
 
-class FlowMatchingSchedulerTransformer(FlowMatchingBase):
+class FlowMatchingSchedulerShiftSynth(FlowMatchingBase):
     def __init__(self, *args, batch_mul: int = 1, **kwargs):
         super().__init__(*args, **kwargs)
         self.batch_mul = batch_mul
@@ -233,7 +233,7 @@ class FlowMatchingSchedulerTransformer(FlowMatchingBase):
         return F.mse_loss(model_output.float(), velocity.float())
 
 
-class FlowMatchingSchedulerARDiff(FlowMatchingBase):
+class FlowMatchingSchedulerDriftSynth(FlowMatchingBase):
     """
     AR-Diffusion scheduler with AD-only sampling.
 
@@ -447,9 +447,9 @@ class FlowMatchingSchedulerARDiff(FlowMatchingBase):
         return sample
 
 
-class FlowMatchingSchedulerMaskedAR(FlowMatchingBase):
+class FlowMatchingSchedulerMaskSynth(FlowMatchingBase):
     """
-    Scheduler for MaskedARTransformer.
+    Scheduler for MaskSynth.
 
     Samples per-sequence empirical mask probabilities from a bounded beta
     prior parameterized by mean + concentration (kappa), then selects an

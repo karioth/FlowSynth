@@ -8,12 +8,12 @@ from torch.optim.swa_utils import get_ema_avg_fn
 
 from diffusers.optimization import get_scheduler
 
-from .models import All_models, DiT, Transformer, AR_DiT, MaskedARTransformer
+from .models import All_models, DiT, ShiftSynth, DriftSynth, MaskSynth
 from .flow_matching import (
     FlowMatchingSchedulerDiT,
-    FlowMatchingSchedulerTransformer,
-    FlowMatchingSchedulerARDiff,
-    FlowMatchingSchedulerMaskedAR,
+    FlowMatchingSchedulerShiftSynth,
+    FlowMatchingSchedulerDriftSynth,
+    FlowMatchingSchedulerMaskSynth,
 )
 from .utils import sample_posterior
 
@@ -21,7 +21,7 @@ from .utils import sample_posterior
 class LitModule(L.LightningModule):
     def __init__(
         self,
-        model_name: str = "Transformer-L",
+        model_name: str = "ShiftSynth-L",
         seq_len: int | None = None,
         latent_size: int = 16,
         clap_dim: int = 512,
@@ -53,8 +53,8 @@ class LitModule(L.LightningModule):
         )
         self.model = All_models[model_name](**model_kwargs)
 
-        if isinstance(self.model, Transformer):
-            self.noise_scheduler = FlowMatchingSchedulerTransformer(
+        if isinstance(self.model, ShiftSynth):
+            self.noise_scheduler = FlowMatchingSchedulerShiftSynth(
 
                 t_m=t_m,
                 t_s=t_s,
@@ -66,14 +66,14 @@ class LitModule(L.LightningModule):
                 t_m=t_m,
                 t_s=t_s,
             )
-        elif isinstance(self.model, AR_DiT):
-            self.noise_scheduler = FlowMatchingSchedulerARDiff(
+        elif isinstance(self.model, DriftSynth):
+            self.noise_scheduler = FlowMatchingSchedulerDriftSynth(
 
                 t_m=t_m,
                 t_s=t_s,
             )
-        elif isinstance(self.model, MaskedARTransformer):
-            self.noise_scheduler = FlowMatchingSchedulerMaskedAR(
+        elif isinstance(self.model, MaskSynth):
+            self.noise_scheduler = FlowMatchingSchedulerMaskSynth(
 
                 t_m=t_m,
                 t_s=t_s,
