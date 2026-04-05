@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Consolidate one subset's latents_bf16/*.pt files into a single ragged cache .pt.
+Consolidate one subset's cached per-item latents into a single ragged cache .pt.
 
 Expected subset layout:
   <subset_path>/
     manifest.jsonl
-    latents_bf16/**/*.pt
+    latents/**/*.pt
 
-The consolidated file stores variable-length tensors via concatenation + offsets.
-Use --confirm to re-load source files and verify exact tensor equality by slice.
+The consolidated file stores variable-length tensors via concatenation + offsets
+and converts the source tensors to bfloat16 while writing. Use --confirm to
+re-load the source files, apply the same conversion, and verify slice equality.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ REQUIRED_KEYS = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Consolidate one subset's bf16 latents into a single .pt cache")
+    parser = argparse.ArgumentParser("Consolidate one subset's cached latents into a single .pt cache")
     parser.add_argument(
         "--subset-path",
         type=str,
@@ -59,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--latents-dir-name",
         type=str,
-        default="latents_bf16",
-        help="Latents directory inside subset path",
+        default="latents",
+        help="Per-item latents directory inside subset path",
     )
     parser.add_argument(
         "--workers",
@@ -180,7 +181,7 @@ def _resolve_paths(keys: list[str], file_index: dict[str, Path]) -> list[Path]:
     if missing:
         preview = ", ".join(missing[:10])
         suffix = "" if len(missing) <= 10 else f" ... ({len(missing)} missing total)"
-        raise FileNotFoundError(f"Missing bf16 latent files for keys: {preview}{suffix}")
+        raise FileNotFoundError(f"Missing latent files for keys: {preview}{suffix}")
     return paths
 
 
@@ -363,7 +364,7 @@ def _confirm_payload(
 
     if mismatch_count > 0:
         raise RuntimeError(f"Confirm failed with {mismatch_count} mismatched tensor comparisons")
-    print("PASS: consolidated slices are identical to source bf16 tensors.")
+    print("PASS: consolidated slices match the source tensors after bf16 conversion.")
 
 
 def main() -> None:
