@@ -20,7 +20,7 @@ BATCH_SIZE=64
 PRECISION=bf16-mixed
 
 PROMPT_CSV="/share/users/student/f/friverossego/FlowSynth/audiocaps-test.csv"
-OUT_ROOT="/share/users/student/f/friverossego/FlowSynth/samples_ardit_adstep_exp"
+OUT_ROOT="/share/users/student/f/friverossego/FlowSynth/samples_ardit_base_adstep_exp"
 
 FLOWSYNTH_ROOT="/share/users/student/f/friverossego/FlowSynth"
 AR_DIT_CKPT="/share/users/student/f/friverossego/FlowSynth/audio_logs/AUDIO_AR_DiT_B_125e_vpred_nonmonotone/checkpoints/last.ckpt"
@@ -52,7 +52,7 @@ mkdir -p "$OUT_ROOT"
 cd "$FLOWSYNTH_ROOT"
 
 CFG=1
-ARDIFF_STEPS=(0 1 2 3 4 5 7 10 15 20 25 30 35 40 45 50 60 70 80 90 100)
+ARDIFF_STEPS=(80 90 100)
 RUN_INDEX=0
 
 for ARDIFF_STEP in "${ARDIFF_STEPS[@]}"; do

@@ -18,11 +18,11 @@ STEPS=100
 SEED=0
 BATCH_SIZE=64
 PRECISION=bf16-mixed
-CFGS=(3 4 5 6 7 8)
-ARDIFF_STEPS=(0 1 5 10 25 50 100)
+CFGS=(6 7 8)
+ARDIFF_STEPS=(0 1 5 7 10 12 15)
 
 PROMPT_CSV="/share/users/student/f/friverossego/FlowSynth/audiocaps-test.csv"
-OUT_ROOT="/share/users/student/f/friverossego/FlowSynth/samples_ardit_medium_sweep_exp/"
+OUT_ROOT="/share/users/student/f/friverossego/FlowSynth/samples_ardit_medium_sweep_exp"
 
 FLOWSYNTH_ROOT="/share/users/student/f/friverossego/FlowSynth"
 AR_DIT_CKPT="/share/users/student/f/friverossego/FlowSynth/audio_logs/AUDIO_AR_DiT_Medium_gated/checkpoints/step=0210000.ckpt"
