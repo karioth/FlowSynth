@@ -5,11 +5,8 @@ import torch
 import torch.nn as nn
 from flash_attn.utils.generation import InferenceParams
 
-from .modules.attention import Attention
-from .modules.norms import RMSNorm
-from .modules.adaln import AdaLNzero, modulate, gate, FinalLayer
-from .modules.embeddings import TimestepEmbedder, PromptEmbedder
-from .modules.ffn import SwiGLU
+from .modules.embeddings import PromptEmbedder, TimestepEmbedder
+from .modules.layers import FinalLayer, TransformerBlock
 
 
 @dataclass
@@ -19,74 +16,10 @@ class ARDiTInferenceState:
     cached_frames: int = 0
 
 
-class AR_DiTBlock(nn.Module):
-    """
-    An autoregressive DiT block with adaLN-Zero conditioning.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        intermediate_size: int,
-        layer_idx: int,
-        is_gated: bool = False,
-        rope_theta: float = 10000.0,
-        rope_interleaved: bool = True,
-        rope_scale_base: float | None = None,
-    ) -> None:
-        super().__init__()
-        self.norm1 = RMSNorm(hidden_size, elementwise_affine=True, eps=1e-6)
-        self.attn = Attention(
-            hidden_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            layer_idx=layer_idx,
-            is_causal=True,
-            is_gated=is_gated,
-            rope_theta=rope_theta,
-            rope_interleaved=rope_interleaved,
-            rope_scale_base=rope_scale_base,
-        )
-        self.norm2 = RMSNorm(hidden_size, elementwise_affine=True, eps=1e-6)
-        self.mlp = SwiGLU(hidden_size, intermediate_size)
-        self.scale_shift_table = nn.Parameter(
-            torch.randn(6, hidden_size) / (hidden_size ** 0.5)
-        )
-        self.scale_shift_table._no_weight_decay = True
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        time_modulation: torch.Tensor,
-        inference_params=None,
-    ) -> torch.Tensor:
-
-        # time_modulation: (B, T, 6D) bf16 under autocast
-        bias = self.scale_shift_table.reshape(1, 1, -1)  # (1,1,6D) bf16
-        biases = time_modulation + bias                                                  # (B,T,6D) bf16
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = biases.to(dtype=hidden_states.dtype).chunk(6, dim=-1)
-
-        residual = hidden_states
-        hidden_states = self.attn(
-            modulate(self.norm1(hidden_states), shift_msa, scale_msa),
-            inference_params=inference_params,
-        )
-        hidden_states = residual + gate(hidden_states, gate_msa)
-
-        residual = hidden_states
-        hidden_states = self.mlp(
-            modulate(self.norm2(hidden_states), shift_mlp, scale_mlp)
-        )
-        hidden_states = residual + gate(hidden_states, gate_mlp)
-        
-        return hidden_states
-
-
 class AR_DiT(nn.Module):
     """
-    Diffusion model with an autoregressive Transformer backbone.
+    Simplified autoregressive DiT without AdaLN modulation.
+    Time conditioning is an additive bias applied to latent tokens.
     """
 
     def __init__(
@@ -109,19 +42,20 @@ class AR_DiT(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.hidden_size = hidden_size
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_dim = hidden_size // num_heads
         self.seq_len = seq_len
+        self.prompt_seq_len = prompt_seq_len
 
         if intermediate_size is None:
-            intermediate_size = int(hidden_size * 7 / 3 / 64) * 64 # roughly 4x ratio in regular MLP but 2.6ish for swiglu
+            intermediate_size = int(hidden_size * 7 / 3 / 64) * 64
 
         self.input_embedder = nn.Linear(in_channels, hidden_size, bias=False)
         self.time_embedder = TimestepEmbedder(hidden_size)
-
         self.prompt_embedder = PromptEmbedder(
             clap_dim=clap_dim,
             t5_dim=t5_dim,
@@ -129,20 +63,20 @@ class AR_DiT(nn.Module):
             prompt_seq_len=prompt_seq_len,
             dropout_prob=prompt_dropout_prob,
         )
-        self.prompt_seq_len = prompt_seq_len
-
-        self.time_modulation = AdaLNzero(hidden_size=hidden_size, out_mult=6)
-        self.prompt_time_mod = nn.Parameter(torch.zeros(1, 1, 6 * hidden_size))
-        self.prompt_time_mod._no_weight_decay = True
+        self.time_bias_proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=False),
+        )
 
         self.blocks = nn.ModuleList(
             [
-                AR_DiTBlock(
+                TransformerBlock(
                     hidden_size=hidden_size,
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
                     intermediate_size=intermediate_size,
                     layer_idx=idx,
+                    is_causal=True,
                     is_gated=is_gated,
                     rope_theta=rope_theta,
                     rope_interleaved=rope_interleaved,
@@ -164,10 +98,11 @@ class AR_DiT(nn.Module):
 
     def initialize_weights(self) -> None:
         def _basic_init(module: nn.Module) -> None:
-            if isinstance(module, nn.Linear):
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
         self.apply(_basic_init)
+        nn.init.constant_(self.time_bias_proj[1].weight, 0)
 
     @staticmethod
     def _prefix_length(mask: torch.Tensor, *, name: str) -> int:
@@ -191,18 +126,9 @@ class AR_DiT(nn.Module):
             self.training,
             force_drop_ids=prompt_drop_ids,
         )
-        prompt_time_mod = self.prompt_time_mod.to(
-            device=prompt_seq.device,
-            dtype=prompt_seq.dtype,
-        ).expand(
-            prompt_seq.size(0),
-            self.prompt_seq_len,
-            -1,
-        )
-
         inference_params.seqlen_offset = 0
         for block in self.blocks:
-            prompt_seq = block(prompt_seq, prompt_time_mod, inference_params=inference_params)
+            prompt_seq = block(prompt_seq, inference_params=inference_params)
 
     def forward_recurrent(
         self,
@@ -237,12 +163,12 @@ class AR_DiT(nn.Module):
             token_states.size(1),
             -1,
         )
-        time_modulation = self.time_modulation(time_emb)
+        token_states = token_states + self.time_bias_proj(time_emb)
 
         inference_params.seqlen_offset = self.prompt_seq_len + start_pos
         for block in self.blocks:
-            token_states = block(token_states, time_modulation, inference_params=inference_params)
-        return self.final_layer(token_states, time_emb)
+            token_states = block(token_states, inference_params=inference_params)
+        return self.final_layer(token_states)
 
     def forward(
         self,
@@ -254,16 +180,10 @@ class AR_DiT(nn.Module):
         prompt_drop_ids: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        Forward pass of AR_DiT.
-        hidden_states: (B, T, C) tensor of noisy latent tokens
-        timesteps: (B, T) tensor of diffusion timesteps
-        prompt: dict with clap/t5 embeddings
-        """
         del kwargs
         assert timesteps.dim() == 2, "AR_DiT expects tokenwise timesteps with shape (B, T)"
 
-        hidden_states = self.input_embedder(hidden_states)  # (B, T, D)
+        hidden_states = self.input_embedder(hidden_states)
         prompt_seq = self.prompt_embedder(
             prompt,
             self.training,
@@ -274,29 +194,17 @@ class AR_DiT(nn.Module):
             hidden_states.size(0),
             hidden_states.size(1),
             -1,
-        )  # (B, T, D)
-        time_modulation = self.time_modulation(time_emb)
-        prompt_time_mod = self.prompt_time_mod.to(
-            device=time_modulation.device,
-            dtype=time_modulation.dtype,
-        ).expand(
-            hidden_states.size(0),
-            self.prompt_seq_len,
-            -1,
         )
-        time_modulation = torch.cat([prompt_time_mod, time_modulation], dim=1)  # (B, T+P, 6D)
-        hidden_states = torch.cat([prompt_seq, hidden_states], dim=1)  # (B, T+P, D)
+        hidden_states = hidden_states + self.time_bias_proj(time_emb)
+        hidden_states = torch.cat([prompt_seq, hidden_states], dim=1)
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, time_modulation, inference_params=inference_params)
+            hidden_states = block(hidden_states, inference_params=inference_params)
 
-        # Remove conditioning token before the final layer.
         hidden_states = hidden_states[:, self.prompt_seq_len :, :]
-        hidden_states = self.final_layer(hidden_states, time_emb)
-        return hidden_states
+        return self.final_layer(hidden_states)
 
     def sample_with_cfg(self, prompt: dict, cfg_scale: float, sample_func) -> torch.Tensor:
-        # Build [cond, uncond] prompt batch for classifier-free guidance.
         clap = prompt["clap"]
         t5 = prompt["t5"]
         t5_mask = prompt["t5_mask"]
@@ -360,9 +268,6 @@ class AR_DiT(nn.Module):
         frame_update_mask_bool: torch.Tensor | None = None,
         step_index_by_frame: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Forward pass of AR_DiT, batching unconditional and conditional paths for CFG.
-        """
         half = hidden_states[: len(hidden_states) // 2]
         combined = torch.cat([half, half], dim=0)
 
@@ -457,23 +362,30 @@ class AR_DiT(nn.Module):
 #                                  AR-DiT Configs                               #
 #################################################################################
 
+
 def AR_DiT_XL(**kwargs) -> AR_DiT:
     return AR_DiT(depth=24, hidden_size=2048, num_heads=16, intermediate_size=5440, **kwargs)
+
 
 def AR_DiT_Large(**kwargs) -> AR_DiT:
     return AR_DiT(depth=24, hidden_size=1536, num_heads=12, intermediate_size=4096, **kwargs)
 
+
 def AR_DiT_Medium(**kwargs) -> AR_DiT:
     return AR_DiT(depth=32, hidden_size=1024, num_heads=16, intermediate_size=2688, **kwargs)
+
 
 def AR_DiT_Base(**kwargs) -> AR_DiT:
     return AR_DiT(depth=12, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)
 
+
 def AR_DiT_B(**kwargs) -> AR_DiT:
     return AR_DiT(depth=24, hidden_size=768, num_heads=12, intermediate_size=2048, **kwargs)
 
+
 def AR_DiT_H(**kwargs) -> AR_DiT:
     return AR_DiT(depth=32, hidden_size=1280, num_heads=20, intermediate_size=5120, **kwargs)
+
 
 AR_DiT_models = {
     "AR-DiT-XL": AR_DiT_XL,
@@ -482,62 +394,10 @@ AR_DiT_models = {
     "AR-DiT-Base": AR_DiT_Base,
     "AR-DiT-B": AR_DiT_B,
     "AR-DiT-H": AR_DiT_H,
+    "AR-DiT-Simple-XL": AR_DiT_XL,
+    "AR-DiT-Simple-Large": AR_DiT_Large,
+    "AR-DiT-Simple-Medium": AR_DiT_Medium,
+    "AR-DiT-Simple-Base": AR_DiT_Base,
+    "AR-DiT-Simple-B": AR_DiT_B,
+    "AR-DiT-Simple-H": AR_DiT_H,
 }
-
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type != "cuda":
-        raise SystemExit("CUDA required for AR_DiT flash-attn test")
-    batch_size = 2
-    seq_len = 4
-    in_channels = 6
-    hidden_size = 32
-    num_heads = 4
-    prompt_seq_len = 5
-    clap_dim = 8
-    t5_dim = 12
-    max_t5_tokens = prompt_seq_len - 1
-
-    model = AR_DiT(
-        seq_len=seq_len,
-        in_channels=in_channels,
-        hidden_size=hidden_size,
-        depth=2,
-        num_heads=num_heads,
-        num_kv_heads=num_heads,
-        intermediate_size=64,
-        clap_dim=clap_dim,
-        t5_dim=t5_dim,
-        prompt_seq_len=prompt_seq_len,
-    ).to(device, dtype=torch.bfloat16)
-    model.eval()
-
-    autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-
-    t5_mask = torch.zeros(batch_size, max_t5_tokens, dtype=torch.bool, device=device)
-    t5_mask[0, :2] = True
-    t5_mask[1, :max_t5_tokens] = True
-    prompt = {
-        "clap": torch.randn(batch_size, clap_dim, device=device, dtype=torch.bfloat16),
-        "t5": torch.randn(batch_size, max_t5_tokens, t5_dim, device=device, dtype=torch.bfloat16),
-        "t5_mask": t5_mask,
-    }
-
-    hidden_states = torch.randn(batch_size, seq_len, in_channels, device=device, dtype=torch.bfloat16)
-    timesteps = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
-    with autocast:
-        out = model(hidden_states, timesteps, prompt)
-    assert out.shape == (batch_size, seq_len, in_channels), f"Unexpected output shape: {out.shape}"
-
-    def sample_func(model_fn, noise):
-        ts = torch.zeros(noise.shape[0], noise.shape[1], device=noise.device, dtype=torch.float32)
-        return model_fn(noise, ts)
-
-    with autocast:
-        samples = model.sample_with_cfg(prompt, cfg_scale=1.0, sample_func=sample_func)
-    assert samples.shape == (batch_size, seq_len, in_channels), f"Unexpected sample shape: {samples.shape}"
-
-    print("PASS: AR_DiT continuous prompt shapes OK")
-    print("PASS: AR_DiT sample_with_cfg OK")

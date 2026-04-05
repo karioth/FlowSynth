@@ -31,7 +31,7 @@ class AdaLNzero(nn.Module):
         return self.proj(self.act(conditioning))
 
 
-class FinalLayer(nn.Module):
+class AdaLNFinalLayer(nn.Module):
     """
     The final layer of AdaLNzero modules.
     """
